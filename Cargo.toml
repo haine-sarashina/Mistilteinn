@@ -1,0 +1,40 @@
+[package]
+name = "mistilteinn"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight desktop browser with custom HTML/CSS rendering engine"
+
+[dependencies]
+# Window management
+winit = "0.30"
+
+# GPU rendering
+wgpu = "0.20"
+
+# HTML parsing
+html5ever = "0.29"
+markup5ever = "0.14"
+rustc-hash = "2.0"
+
+# CSS parsing
+cssparser = "0.34"
+cssparser-color = "0.3"
+
+# Async HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Image loading
+image = "0.25"
+
+# Text layout
+parley = "0.3"
+fontdb = "0.23"
+
+# Utility
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2.0"
+smallvec = "1.13"
+hashbrown = "0.15"

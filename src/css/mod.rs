@@ -150,6 +150,189 @@ pub fn compute_styles(_properties: FxHashMap<String, String>) -> FxHashMap<Strin
     FxHashMap::default()
 }
 
+// ------ Display Type ------
+
+/// The computed `display` CSS property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayType {
+    Block,
+    Inline,
+    InlineBlock,
+    None,
+}
+
+// ------ Computed Values ------
+
+/// Fully resolved CSS property values for a single element.
+#[derive(Debug, Clone)]
+pub struct ComputedValues {
+    pub display: DisplayType,
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    /// Margin: [top, right, bottom, left]
+    pub margin: [f32; 4],
+    /// Padding: [top, right, bottom, left]
+    pub padding: [f32; 4],
+    /// Background color as RGBA (None = transparent)
+    pub background_color: Option<[u8; 4]>,
+    /// Text color as RGBA (None = not set)
+    pub color: Option<[u8; 4]>,
+    pub font_size: f32,
+    pub font_family: String,
+}
+
+impl Default for ComputedValues {
+    /// CSS initial values per the CSS specification.
+    fn default() -> Self {
+        Self {
+            display: DisplayType::Inline,
+            width: None,
+            height: None,
+            margin: [0.0; 4],
+            padding: [0.0; 4],
+            background_color: None,
+            color: None,
+            font_size: 16.0,
+            font_family: String::new(),
+        }
+    }
+}
+
+impl ComputedValues {
+    /// Parse a single [`Declaration`] and apply it to a clone of `self`.
+    ///
+    /// Returns a new `ComputedValues` with the declaration applied on top
+    /// of the current values (or defaults if called on `Default::default()`).
+    pub fn from_declaration(mut self, decl: &Declaration) -> Self {
+        let prop = decl.property.to_lowercase();
+        let val = decl.value.trim();
+
+        match prop.as_str() {
+            "display" => {
+                self.display = match val {
+                    "block" => DisplayType::Block,
+                    "inline" => DisplayType::Inline,
+                    "inline-block" => DisplayType::InlineBlock,
+                    "none" => DisplayType::None,
+                    _ => self.display,
+                };
+            }
+            "width" => {
+                self.width = parse_length(val);
+            }
+            "height" => {
+                self.height = parse_length(val);
+            }
+            "margin" => {
+                self.margin = parse_box_four(val, self.margin);
+            }
+            "margin-top" => {
+                if let Some(v) = parse_length(val) {
+                    self.margin[0] = v;
+                }
+            }
+            "margin-right" => {
+                if let Some(v) = parse_length(val) {
+                    self.margin[1] = v;
+                }
+            }
+            "margin-bottom" => {
+                if let Some(v) = parse_length(val) {
+                    self.margin[2] = v;
+                }
+            }
+            "margin-left" => {
+                if let Some(v) = parse_length(val) {
+                    self.margin[3] = v;
+                }
+            }
+            "padding" => {
+                self.padding = parse_box_four(val, self.padding);
+            }
+            "padding-top" => {
+                if let Some(v) = parse_length(val) {
+                    self.padding[0] = v;
+                }
+            }
+            "padding-right" => {
+                if let Some(v) = parse_length(val) {
+                    self.padding[1] = v;
+                }
+            }
+            "padding-bottom" => {
+                if let Some(v) = parse_length(val) {
+                    self.padding[2] = v;
+                }
+            }
+            "padding-left" => {
+                if let Some(v) = parse_length(val) {
+                    self.padding[3] = v;
+                }
+            }
+            "background-color" | "background" => {
+                if let Some(color) = parse_color_value(val) {
+                    let (r, g, b, a) = color.to_rgba();
+                    self.background_color = Some([r, g, b, a]);
+                }
+            }
+            "color" => {
+                if let Some(color) = parse_color_value(val) {
+                    let (r, g, b, a) = color.to_rgba();
+                    self.color = Some([r, g, b, a]);
+                }
+            }
+            "font-size" => {
+                if let Some(v) = parse_length(val) {
+                    self.font_size = v;
+                }
+            }
+            "font-family" => {
+                // Strip quotes if present
+                self.font_family = val.trim_matches(|c| c == '"' || c == '\'').to_string();
+            }
+            _ => {}
+        }
+
+        self
+    }
+}
+
+/// Parse a CSS length value (pixels) from a string like `"10px"` or `"10"`.
+/// Returns `None` for `"auto"`, `"inherit"`, or unparseable values.
+fn parse_length(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("inherit") {
+        return None;
+    }
+    // Strip common unit suffixes and parse as pixels
+    let num = s.trim_end_matches(|c: char| c.is_alphabetic());
+    if num.is_empty() {
+        return None;
+    }
+    num.parse::<f32>().ok()
+}
+
+/// Parse a box model shorthand (margin/padding) into four values.
+///
+/// Supports 1, 2, 3, or 4 space-separated values:
+/// - 1 value: all sides
+/// - 2 values: vertical, horizontal
+/// - 3 values: top, horizontal, bottom
+/// - 4 values: top, right, bottom, left
+fn parse_box_four(s: &str, fallback: [f32; 4]) -> [f32; 4] {
+    let parts: Vec<f32> = s.split_whitespace()
+        .filter_map(|p| parse_length(p))
+        .collect();
+
+    match parts.len() {
+        1 => [parts[0]; 4],
+        2 => [parts[0], parts[1], parts[0], parts[1]],
+        3 => [parts[0], parts[1], parts[2], parts[1]],
+        4 => [parts[0], parts[1], parts[2], parts[3]],
+        _ => fallback,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

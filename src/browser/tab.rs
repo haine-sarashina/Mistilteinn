@@ -100,7 +100,7 @@ mod tests {
     fn switch_active_tab() {
         let mut manager = TabManager::new();
         let tab1 = manager.create_tab();
-        let tab2 = manager.create_tab();
+        let _tab2 = manager.create_tab();
         manager.activate_tab(tab1);
         assert_eq!(manager.active_tab().map(|t| t.id), Some(tab1));
     }

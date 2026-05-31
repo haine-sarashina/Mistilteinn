@@ -40,7 +40,9 @@ pub fn parse_color_value(color_str: &str) -> Option<(u8, u8, u8)> {
         ("blue", (0, 0, 255)),
         ("white", (255, 255, 255)),
         ("black", (0, 0, 0)),
-    ].into_iter().collect();
+    ]
+    .into_iter()
+    .collect();
 
     if let Some(&rgb) = named_colors.get(color.as_str()) {
         return Some(rgb);

@@ -12,10 +12,7 @@ pub enum NetworkError {
 
 /// Fetches the content of a URL.
 pub async fn fetch(url: &str) -> Result<String, NetworkError> {
-    let response = reqwest::get(url)
-        .await?
-        .text()
-        .await?;
+    let response = reqwest::get(url).await?.text().await?;
     Ok(response)
 }
 

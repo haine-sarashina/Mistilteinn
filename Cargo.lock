@@ -2035,6 +2035,7 @@ dependencies = [
 name = "mistilteinn"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "cssparser 0.34.0",
  "cssparser-color",
  "env_logger",

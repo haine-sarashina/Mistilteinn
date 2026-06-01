@@ -83,6 +83,33 @@ impl Selector {
         self.complex.push((combinator, sel));
     }
 
+    /// Compute the CSS specificity of this selector as (id_count, class_count, type_count).
+    ///
+    /// Per CSS spec:
+    /// - ID selectors (`#id`) contribute (1, 0, 0)
+    /// - Class selectors (`.class`), attribute selectors (`[attr]`), and pseudo-classes (`:hover`) contribute (0, 1, 0)
+    /// - Type selectors (`div`) and pseudo-elements (`::before`) contribute (0, 0, 1)
+    /// - Universal selector (`*`) contributes (0, 0, 0)
+    /// Specificity tuples compare lexicographically: IDs > classes > types.
+    pub fn specificity(&self) -> (u32, u32, u32) {
+        let mut ids = 0u32;
+        let mut classes = 0u32;
+        let mut types = 0u32;
+
+        for (_, sel) in &self.complex {
+            match sel {
+                SimpleSelector::Id(_) => ids += 1,
+                SimpleSelector::Class(_) => classes += 1,
+                SimpleSelector::Attribute { .. } => classes += 1,
+                SimpleSelector::PseudoClass { .. } => classes += 1,
+                SimpleSelector::Type(_) => types += 1,
+                SimpleSelector::PseudoElement(_) => types += 1,
+                SimpleSelector::Universal => {}
+            }
+        }
+        (ids, classes, types)
+    }
+
     /// Check if this selector matches a DOM node (by tag/class/id lookup).
     ///
     /// Simplified — does not handle combinators fully (only checks the last

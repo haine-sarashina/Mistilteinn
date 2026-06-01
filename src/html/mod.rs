@@ -49,6 +49,11 @@ impl DomNode {
         matches!(self.node_type, DomNodeType::Element { .. })
     }
 
+    /// Get the parent node's ID, if one exists.
+    pub fn parent_id(&self) -> Option<u32> {
+        self.parent.map(|p| p.0)
+    }
+
     pub fn is_text(&self) -> bool {
         matches!(self.node_type, DomNodeType::Text(_))
     }
@@ -121,8 +126,13 @@ pub struct NodeId(u32);
 impl NodeId {
     pub const DOCUMENT: Self = Self(0);
 
-    fn index(&self) -> usize {
+    pub fn index(&self) -> usize {
         self.0 as usize
+    }
+
+    /// Create a NodeId from a raw u32 index.
+    pub fn from_raw(id: u32) -> Self {
+        Self(id)
     }
 }
 

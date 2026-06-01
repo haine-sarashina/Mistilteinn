@@ -21,7 +21,13 @@ impl CSSColor {
         match self {
             CSSColor::Hex { r, g, b } => (*r, *g, *b, 255),
             CSSColor::Rgba { r, g, b, a } => (*r, *g, *b, (*a * 255.0) as u8),
-            CSSColor::Named(_) => (0, 0, 0, 255), // fallback
+            CSSColor::Named(name) => {
+                if let Some((r, g, b)) = parse_named_color(name) {
+                    (r, g, b, 255)
+                } else {
+                    (0, 0, 0, 255)
+                }
+            }
         }
     }
 }
@@ -145,9 +151,195 @@ pub fn parse_declarations(source: &str) -> Vec<Declaration> {
 }
 
 /// Computes styles for a node (placeholder — cascade implementation TBD).
+#[deprecated(since = "0.1.0", note = "Use compute_styles_for_tree instead")]
 pub fn compute_styles(_properties: FxHashMap<String, String>) -> FxHashMap<String, String> {
-    // TODO: implement cascade, inheritance, computed values
     FxHashMap::default()
+}
+
+// ------ Cascade & Inheritance ------
+
+/// CSS properties that inherit from the parent element.
+///
+/// Per CSS spec: most typography-related properties inherit,
+/// but most box-model properties do not.
+const INHERITABLE_PROPERTIES: &[&str] = &[
+    "color",
+    "font-size",
+    "font-family",
+    "font-weight",
+    "font-style",
+    "font-variant",
+    "font",
+    "letter-spacing",
+    "line-height",
+    "list-style-type",
+    "list-style-position",
+    "list-style-image",
+    "list-style",
+    "text-align",
+    "text-decoration-color",
+    "text-indent",
+    "text-transform",
+    "word-spacing",
+    "direction",
+    "visibility",
+    "cursor",
+];
+
+/// Check if a CSS property name is inheritable.
+fn is_inheritable(property: &str) -> bool {
+    let lower = property.to_lowercase();
+    INHERITABLE_PROPERTIES.iter().any(|&p| p == lower)
+}
+
+/// Clone only the inheritable properties from `parent` into `child`.
+/// Non-inheritable properties use CSS initial (default) values.
+fn inherit_properties(parent: &ComputedValues, mut child: ComputedValues) -> ComputedValues {
+    // `color` inherits
+    if parent.color.is_some() && child.color.is_none() {
+        child.color = parent.color;
+    }
+    // `font-size` inherits
+    if child.font_size == 16.0 && parent.font_size != 16.0 {
+        child.font_size = parent.font_size;
+    }
+    // `font-family` inherits
+    if child.font_family.is_empty() && !parent.font_family.is_empty() {
+        child.font_family = parent.font_family.clone();
+    }
+    // `background_color` does NOT inherit (CSS initial = transparent)
+    child
+}
+
+/// Look up a node's CSS `id` attribute.
+fn node_get_id(node: &crate::html::DomNode) -> Option<&str> {
+    node.get_attr("id")
+}
+
+/// Check if a node has a given CSS class.
+fn node_has_class(node: &crate::html::DomNode, class: &str) -> bool {
+    node.get_attr("class")
+        .map(|c| c.split_whitespace().any(|cls| cls == class))
+        .unwrap_or(false)
+}
+
+/// Compute the resolved styles for every element node in the DOM tree.
+///
+/// Takes the parsed DOM arena and a `Stylesheet` (from `parse_css`),
+/// applies the CSS cascade (specificity → source order → `!important`),
+/// then propagates inheritable properties from parent to child.
+///
+/// Returns a map of `NodeId(u32)` → `ComputedValues` for every element node.
+pub fn compute_styles_for_tree(
+    arena: &crate::html::DomArena,
+    stylesheet: &parser::Stylesheet,
+) -> FxHashMap<u32, ComputedValues> {
+    let mut result = FxHashMap::default();
+
+    // Collect all element node IDs by iterating the arena in index order.
+    // html5ever assigns IDs in document order (0 = document, then children).
+    let nodes_ref = arena.nodes.borrow();
+    let element_ids: Vec<u32> = nodes_ref
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, node)| {
+            if node.is_element() {
+                Some(idx as u32)
+            } else {
+                None
+            }
+        })
+        .collect();
+    drop(nodes_ref);
+
+    // Phase 1: Cascade — for each element, find matching rules and apply
+    for &node_id in &element_ids {
+        let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(node_id));
+        let node = match arena.get(handle) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let tag: String = match node.tag_name() {
+            Some(t) => (*t).to_string(),
+            None => continue,
+        };
+
+        // Collect all matching rules with their specificity
+        let mut matched: Vec<(&parser::CSSRule, (u32, u32, u32))> = Vec::new();
+
+        for rule in &stylesheet.rules {
+            for selector in &rule.selectors {
+                if selector.matches_element(&tag, |c| node_has_class(&node, c), |i| {
+                    node_get_id(&node) == Some(i)
+                }) {
+                    matched.push((rule, selector.specificity()));
+                }
+            }
+        }
+
+        // CSS Cascade order (author origin only):
+        // 1. Normal declarations (applied first — can be overridden)
+        // 2. !important declarations (applied last — override normal)
+        // Within each group: sort by specificity ascending (lower first, higher overwrites).
+        // Stable sort preserves source order within same specificity (later rule wins).
+
+        let mut computed = ComputedValues::default();
+
+        // Collect !important and normal declarations
+        let mut important_decls: Vec<(&Declaration, (u32, u32, u32))> = Vec::new();
+        let mut normal_decls: Vec<(&Declaration, (u32, u32, u32))> = Vec::new();
+        for (rule, spec) in &matched {
+            for decl in &rule.declarations {
+                if decl.important {
+                    important_decls.push((decl, *spec));
+                } else {
+                    normal_decls.push((decl, *spec));
+                }
+            }
+        }
+
+        // Pass 1: Normal declarations (ascending specificity — higher wins by overwriting)
+        normal_decls.sort_by(|a, b| a.1.cmp(&b.1));
+        for (decl, _) in normal_decls {
+            computed = computed.from_declaration(decl);
+        }
+
+        // Pass 2: !important declarations (override normal, ascending specificity)
+        important_decls.sort_by(|a, b| a.1.cmp(&b.1));
+        for (decl, _) in important_decls {
+            computed = computed.from_declaration(decl);
+        }
+
+        result.insert(node_id, computed);
+    }
+
+    // Phase 2: Inheritance — BFS from root to propagate inheritable properties
+    // Build parent map using the public parent_id() accessor
+    let mut parent_map = FxHashMap::default();
+    for &nid in &element_ids {
+        let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(nid));
+        if let Some(node) = arena.get(handle) {
+            if let Some(pid) = node.parent_id() {
+                parent_map.insert(nid, pid);
+            }
+        }
+    }
+
+    // Topological sort: process nodes in document order (BFS-ish)
+    // Since arena assigns IDs in document order, processing in ascending ID order
+    // ensures parents are processed before children.
+    for &node_id in &element_ids {
+        if let Some(&parent_id) = parent_map.get(&node_id) {
+            if let Some(parent_styles) = result.get(&parent_id) {
+                let child_styles = result.get(&node_id).cloned().unwrap_or_default();
+                let inherited = inherit_properties(parent_styles, child_styles);
+                result.insert(node_id, inherited);
+            }
+        }
+    }
+
+    result
 }
 
 // ------ Display Type ------
@@ -386,5 +578,174 @@ mod tests {
     #[test]
     fn parse_color_invalid() {
         assert!(parse_color_value("invalid").is_none());
+    }
+
+    // ------ Cascade & Inheritance Tests ------
+
+    #[test]
+    fn specificity_type_selector() {
+        use crate::css::parser::{Selector, SimpleSelector};
+        let sel = Selector::simple(SimpleSelector::Type("div".to_string()));
+        assert_eq!(sel.specificity(), (0, 0, 1));
+    }
+
+    #[test]
+    fn specificity_class_selector() {
+        use crate::css::parser::{Selector, SimpleSelector};
+        let sel = Selector::simple(SimpleSelector::Class("btn".to_string()));
+        assert_eq!(sel.specificity(), (0, 1, 0));
+    }
+
+    #[test]
+    fn specificity_id_selector() {
+        use crate::css::parser::{Selector, SimpleSelector};
+        let sel = Selector::simple(SimpleSelector::Id("main".to_string()));
+        assert_eq!(sel.specificity(), (1, 0, 0));
+    }
+
+    #[test]
+    fn specificity_universal() {
+        use crate::css::parser::{Selector, SimpleSelector};
+        let sel = Selector::simple(SimpleSelector::Universal);
+        assert_eq!(sel.specificity(), (0, 0, 0));
+    }
+
+    #[test]
+    fn specificity_complex_selector() {
+        use crate::css::parser::{Selector, SimpleSelector, Combinator};
+        let mut sel = Selector::simple(SimpleSelector::Type("div".to_string()));
+        sel.push(
+            Combinator::Descendant,
+            SimpleSelector::Class("highlight".to_string()),
+        );
+        sel.push(
+            Combinator::Child,
+            SimpleSelector::Id("content".to_string()),
+        );
+        // 1 ID + 1 class + 1 type
+        assert_eq!(sel.specificity(), (1, 1, 1));
+    }
+
+    #[test]
+    fn cascade_basic_match() {
+        let arena = crate::html::parse_html("<div>Hello</div>");
+        let stylesheet = parser::parse_stylesheet("div { color: red; }");
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        // The <div> should have a computed style entry
+        assert!(!styles.is_empty());
+
+        // Find the <div> (it's the body's child at index 0, but we check by ID)
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element() && n.tag_name().map(|t| t.to_string() == "div").unwrap_or(false)
+        });
+        assert!(div_id.is_some(), "Expected to find a <div> node");
+
+        let div_styles = styles.get(&(div_id.unwrap() as u32)).expect("div has styles");
+        assert_eq!(div_styles.color, Some([255, 0, 0, 255])); // red as RGBA
+    }
+
+    #[test]
+    fn cascade_specificity_wins() {
+        // ID selector (#mydiv) has higher specificity than type selector (div)
+        let arena = crate::html::parse_html(r#"<div id="mydiv">Test</div>"#);
+        let stylesheet = parser::parse_stylesheet("div { color: blue; } #mydiv { color: red; }");
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element() && n.tag_name().map(|t| t.to_string() == "div").unwrap_or(false)
+        });
+        let div_styles = styles.get(&(div_id.unwrap() as u32)).expect("div has styles");
+        // ID selector (#mydiv) wins → red
+        assert_eq!(div_styles.color, Some([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn cascade_important_wins() {
+        // !important declaration overrides higher specificity
+        let arena = crate::html::parse_html(r#"<div id="x">Test</div>"#);
+        let stylesheet = parser::parse_stylesheet(
+            "div { color: blue !important; } #x { color: red; }",
+        );
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element() && n.tag_name().map(|t| t.to_string() == "div").unwrap_or(false)
+        });
+        let div_styles = styles.get(&(div_id.unwrap() as u32)).expect("div has styles");
+        // !important wins regardless of specificity → blue
+        assert_eq!(div_styles.color, Some([0, 0, 255, 255]));
+    }
+
+    #[test]
+    fn cascade_source_order() {
+        // Same specificity: later rule wins
+        let arena = crate::html::parse_html(r#"<div class="a">Test</div>"#);
+        let stylesheet = parser::parse_stylesheet(".a { color: red; } .a { color: blue; }");
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element() && n.tag_name().map(|t| t.to_string() == "div").unwrap_or(false)
+        });
+        let div_styles = styles.get(&(div_id.unwrap() as u32)).expect("div has styles");
+        // Later rule wins → blue
+        assert_eq!(div_styles.color, Some([0, 0, 255, 255]));
+    }
+
+    #[test]
+    fn inheritance_color_propagates() {
+        // color property should inherit from parent to child
+        let arena = crate::html::parse_html("<div style='color:red'><span>child</span></div>");
+        // Style only on <div>; <span> should inherit
+        let stylesheet = parser::parse_stylesheet("div { color: red; }");
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let span_id = nodes.iter().position(|n| {
+            n.is_element() && n.tag_name().map(|t| t.to_string() == "span").unwrap_or(false)
+        });
+        if let Some(sid) = span_id {
+            let span_styles = styles.get(&(sid as u32)).expect("span has styles");
+            assert_eq!(span_styles.color, Some([255, 0, 0, 255]), "color should inherit");
+        } else {
+            // html5ever may or may not create a <span> node depending on parsing
+            assert!(false, "Expected to find a <span> node");
+        }
+    }
+
+    #[test]
+    fn inheritance_font_size_propagates() {
+        let arena = crate::html::parse_html("<div><p>text</p></div>");
+        let stylesheet = parser::parse_stylesheet("div { font-size: 24px; }");
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let p_id = nodes.iter().position(|n| {
+            n.is_element() && n.tag_name().map(|t| t.to_string() == "p").unwrap_or(false)
+        });
+        if let Some(pid) = p_id {
+            let p_styles = styles.get(&(pid as u32)).expect("p has styles");
+            assert_eq!(p_styles.font_size, 24.0, "font-size should inherit");
+        } else {
+            assert!(false, "Expected to find a <p> node");
+        }
+    }
+
+    #[test]
+    fn defaults_applied() {
+        let arena = crate::html::parse_html("<div></div>");
+        let stylesheet = parser::parse_stylesheet(""); // empty stylesheet
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        assert!(!styles.is_empty());
+        // All element nodes should have default ComputedValues
+        for (_id, values) in &styles {
+            assert_eq!(values.font_size, 16.0, "Default font-size is 16px");
+            assert_eq!(values.margin, [0.0; 4], "Default margin is 0");
+        }
     }
 }

@@ -162,20 +162,32 @@ where
     root_layout.margin = root_styles.margin;
 
     if let Some(ref node) = root_dom {
-        build_layout_children(&mut root_layout, &node.children_ids(), styles, get_node);
+        build_layout_children(&mut root_layout, &node.children_ids(), styles, get_node, 0);
     }
 
     root_layout
 }
+
+/// Maximum nesting depth for layout tree traversal.
+/// Real-world pages rarely exceed 50 levels; 512 provides a large safety margin
+/// while preventing stack overflow on pathologically deep DOM trees.
+const MAX_LAYOUT_DEPTH: usize = 512;
 
 fn build_layout_children<N>(
     parent: &mut LayoutNode,
     child_ids: &[u32],
     styles: &std::collections::HashMap<u32, ComputedValues>,
     get_node: impl Fn(u32) -> Option<N>,
+    depth: usize,
 ) where
     N: LayoutDomNode,
 {
+    if depth > MAX_LAYOUT_DEPTH {
+        // Safety: prevent stack overflow on deeply nested DOM trees.
+        // Silently stop building — the page will render partially rather than crash.
+        return;
+    }
+
     for &child_id in child_ids {
         if let Some(node) = get_node(child_id) {
             let child_styles = styles.get(&child_id).cloned().unwrap_or_default();
@@ -199,6 +211,7 @@ fn build_layout_children<N>(
                             &node.children_ids(),
                             styles,
                             &get_node,
+                            depth + 1,
                         );
                     }
                     parent.add_child(layout_node);
@@ -220,6 +233,7 @@ fn build_layout_children<N>(
                             &node.children_ids(),
                             styles,
                             &get_node,
+                            depth + 1,
                         );
                     }
                     parent.add_child(layout_node);
@@ -243,6 +257,7 @@ pub fn compute_layout(root: &mut LayoutNode, page_width: f32) {
         root.padding[3] + root.border[3],
         root.padding[0] + root.border[0],
         available_width,
+        0,
     );
 }
 
@@ -252,13 +267,18 @@ fn compute_block_children(
     parent_x: f32,
     mut y: f32,
     available_width: f32,
+    depth: usize,
 ) {
+    if depth > MAX_LAYOUT_DEPTH {
+        return;
+    }
+
     for child in &mut parent.children {
         // Apply margins
         let child_x = parent_x + child.margin[3];
         let child_y = y + child.margin[0];
         let child_width = available_width - child.margin[3] - child.margin[1];
-        let child_height = compute_block_height(child) + child.padding[0] + child.padding[2]
+        let child_height = compute_block_height(child, depth + 1) + child.padding[0] + child.padding[2]
             + child.border[0] + child.border[2];
 
         child.rect = Rect::new(child_x, child_y, child_width, child_height);
@@ -267,11 +287,14 @@ fn compute_block_children(
 }
 
 /// Compute the height of a block node (content + inner children).
-fn compute_block_height(node: &LayoutNode) -> f32 {
+fn compute_block_height(node: &LayoutNode, depth: usize) -> f32 {
+    if depth > MAX_LAYOUT_DEPTH {
+        return 0.0;
+    }
     let mut height = 0.0;
     for child in &node.children {
         let inner_height = if child.display == DisplayType::Block {
-            compute_block_height(child) + child.padding[0] + child.padding[2]
+            compute_block_height(child, depth + 1) + child.padding[0] + child.padding[2]
                 + child.border[0] + child.border[2]
         } else {
             compute_inline_height(child)

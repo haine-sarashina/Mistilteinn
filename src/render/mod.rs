@@ -1,11 +1,13 @@
 /// GPU rendering pipeline using wgpu.
 ///
-/// Renders colored rectangles (layout boxes) to the window surface.
+/// Renders colored rectangles (layout boxes) and text to the window surface.
 ///
 /// Pipeline stages:
 /// 1. Initialize wgpu (instance, adapter, device, surface)
 /// 2. Create render pipeline (vertex + fragment shaders)
-/// 3. For each frame: clear → draw rectangles → present
+/// 3. For each frame: clear → draw rectangles → draw text → present
+
+pub mod text;
 
 /// Wgpu rendering context.
 pub struct Renderer {

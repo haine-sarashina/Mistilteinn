@@ -350,7 +350,47 @@ pub enum DisplayType {
     Block,
     Inline,
     InlineBlock,
+    Flex,
+    InlineFlex,
     None,
+}
+
+// ------ Flexbox Enums ------
+
+/// The computed `flex-direction` CSS property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexDirection {
+    Row,
+    Column,
+    RowReverse,
+    ColumnReverse,
+}
+
+/// The computed `flex-wrap` CSS property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexWrap {
+    NoWrap,
+    Wrap,
+    WrapReverse,
+}
+
+/// The computed `justify-content` CSS property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JustifyContent {
+    FlexStart,
+    FlexEnd,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+}
+
+/// The computed `align-items` CSS property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignItems {
+    Stretch,
+    FlexStart,
+    FlexEnd,
+    Center,
 }
 
 // ------ Computed Values ------
@@ -371,6 +411,16 @@ pub struct ComputedValues {
     pub color: Option<[u8; 4]>,
     pub font_size: f32,
     pub font_family: String,
+    /// Flex container properties
+    pub flex_direction: FlexDirection,
+    pub flex_wrap: FlexWrap,
+    pub justify_content: JustifyContent,
+    pub align_items: AlignItems,
+    /// Flex item properties
+    pub flex_grow: f32,
+    pub flex_shrink: f32,
+    /// Flex basis (None = auto)
+    pub flex_basis: Option<f32>,
 }
 
 impl Default for ComputedValues {
@@ -386,6 +436,13 @@ impl Default for ComputedValues {
             color: None,
             font_size: 16.0,
             font_family: String::new(),
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::NoWrap,
+            justify_content: JustifyContent::FlexStart,
+            align_items: AlignItems::Stretch,
+            flex_grow: 0.0,
+            flex_shrink: 1.0,
+            flex_basis: None,
         }
     }
 }
@@ -405,6 +462,8 @@ impl ComputedValues {
                     "block" => DisplayType::Block,
                     "inline" => DisplayType::Inline,
                     "inline-block" => DisplayType::InlineBlock,
+                    "flex" => DisplayType::Flex,
+                    "inline-flex" => DisplayType::InlineFlex,
                     "none" => DisplayType::None,
                     _ => self.display,
                 };
@@ -482,6 +541,58 @@ impl ComputedValues {
                 // Strip quotes if present
                 self.font_family = val.trim_matches(|c| c == '"' || c == '\'').to_string();
             }
+            "flex-direction" => {
+                self.flex_direction = match val {
+                    "row" => FlexDirection::Row,
+                    "column" => FlexDirection::Column,
+                    "row-reverse" => FlexDirection::RowReverse,
+                    "column-reverse" => FlexDirection::ColumnReverse,
+                    _ => self.flex_direction,
+                };
+            }
+            "flex-wrap" => {
+                self.flex_wrap = match val {
+                    "nowrap" => FlexWrap::NoWrap,
+                    "wrap" => FlexWrap::Wrap,
+                    "wrap-reverse" => FlexWrap::WrapReverse,
+                    _ => self.flex_wrap,
+                };
+            }
+            "justify-content" => {
+                self.justify_content = match val {
+                    "flex-start" => JustifyContent::FlexStart,
+                    "flex-end" => JustifyContent::FlexEnd,
+                    "center" => JustifyContent::Center,
+                    "space-between" => JustifyContent::SpaceBetween,
+                    "space-around" => JustifyContent::SpaceAround,
+                    _ => self.justify_content,
+                };
+            }
+            "align-items" => {
+                self.align_items = match val {
+                    "stretch" => AlignItems::Stretch,
+                    "flex-start" => AlignItems::FlexStart,
+                    "flex-end" => AlignItems::FlexEnd,
+                    "center" => AlignItems::Center,
+                    _ => self.align_items,
+                };
+            }
+            "flex-grow" => {
+                if let Ok(v) = val.parse::<f32>() {
+                    self.flex_grow = v;
+                }
+            }
+            "flex-shrink" => {
+                if let Ok(v) = val.parse::<f32>() {
+                    self.flex_shrink = v;
+                }
+            }
+            "flex-basis" => {
+                self.flex_basis = parse_flex_basis(val);
+            }
+            "flex" => {
+                parse_flex_shorthand(&mut self, val);
+            }
             _ => {}
         }
 
@@ -522,6 +633,78 @@ fn parse_box_four(s: &str, fallback: [f32; 4]) -> [f32; 4] {
         3 => [parts[0], parts[1], parts[2], parts[1]],
         4 => [parts[0], parts[1], parts[2], parts[3]],
         _ => fallback,
+    }
+}
+
+/// Parse flex-basis value: "auto" -> None, numeric length -> Some(px).
+fn parse_flex_basis(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("content") {
+        return None;
+    }
+    // Percentages treated as auto for now (simplification)
+    if s.ends_with('%') {
+        return None;
+    }
+    parse_length(s)
+}
+
+/// Parse the flex shorthand property: "flex: <grow> <shrink>? <basis>?"
+fn parse_flex_shorthand(self_vals: &mut ComputedValues, val: &str) {
+    let parts: Vec<&str> = val.trim().split_whitespace().collect();
+
+    if parts.is_empty() {
+        return;
+    }
+
+    // Special case: "flex: none" -> grow=0, shrink=0, basis=0px
+    if parts.len() == 1 && parts[0].eq_ignore_ascii_case("none") {
+        self_vals.flex_grow = 0.0;
+        self_vals.flex_shrink = 0.0;
+        self_vals.flex_basis = Some(0.0);
+        return;
+    }
+
+    // "flex: auto" -> grow=1, shrink=1, basis=auto
+    if parts.len() == 1 && parts[0].eq_ignore_ascii_case("auto") {
+        self_vals.flex_grow = 1.0;
+        self_vals.flex_shrink = 1.0;
+        self_vals.flex_basis = None;
+        return;
+    }
+
+    // Single number: only grow is set (shrink stays default 1, basis stays auto)
+    if parts.len() == 1 {
+        if let Ok(v) = parts[0].parse::<f32>() {
+            self_vals.flex_grow = v;
+        }
+        return;
+    }
+
+    // Two numbers: grow shrink (or grow basis if second is a length)
+    if parts.len() == 2 {
+        // First part is always flex-grow
+        if let Ok(grow) = parts[0].parse::<f32>() {
+            self_vals.flex_grow = grow;
+        }
+        // Second part: try as number (shrink), else try as length (basis)
+        if let Ok(shrink) = parts[1].parse::<f32>() {
+            self_vals.flex_shrink = shrink;
+        } else {
+            self_vals.flex_basis = parse_flex_basis(parts[1]);
+        }
+        return;
+    }
+
+    // Three parts: grow shrink basis
+    if parts.len() == 3 {
+        if let Ok(grow) = parts[0].parse::<f32>() {
+            self_vals.flex_grow = grow;
+        }
+        if let Ok(shrink) = parts[1].parse::<f32>() {
+            self_vals.flex_shrink = shrink;
+        }
+        self_vals.flex_basis = parse_flex_basis(parts[2]);
     }
 }
 
@@ -747,5 +930,117 @@ mod tests {
             assert_eq!(values.font_size, 16.0, "Default font-size is 16px");
             assert_eq!(values.margin, [0.0; 4], "Default margin is 0");
         }
+    }
+
+    // ------ Flexbox Property Parsing Tests ------
+
+    #[test]
+    fn test_parse_display_flex() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "display".to_string(),
+            value: "flex".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.display, DisplayType::Flex);
+    }
+
+    #[test]
+    fn test_parse_display_inline_flex() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "display".to_string(),
+            value: "inline-flex".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.display, DisplayType::InlineFlex);
+    }
+
+    #[test]
+    fn test_parse_flex_direction_column() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "flex-direction".to_string(),
+            value: "column".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.flex_direction, FlexDirection::Column);
+    }
+
+    #[test]
+    fn test_parse_justify_content_space_between() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "justify-content".to_string(),
+            value: "space-between".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.justify_content, JustifyContent::SpaceBetween);
+    }
+
+    #[test]
+    fn test_parse_align_items_center() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "align-items".to_string(),
+            value: "center".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.align_items, AlignItems::Center);
+    }
+
+    #[test]
+    fn test_parse_flex_shorthand_full() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "flex".to_string(),
+            value: "2 1 100px".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.flex_grow, 2.0);
+        assert_eq!(computed.flex_shrink, 1.0);
+        assert_eq!(computed.flex_basis, Some(100.0));
+    }
+
+    #[test]
+    fn test_parse_flex_shorthand_none() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "flex".to_string(),
+            value: "none".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.flex_grow, 0.0);
+        assert_eq!(computed.flex_shrink, 0.0);
+        assert_eq!(computed.flex_basis, Some(0.0));
+    }
+
+    #[test]
+    fn test_parse_flex_shorthand_auto() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "flex".to_string(),
+            value: "auto".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.flex_grow, 1.0);
+        assert_eq!(computed.flex_shrink, 1.0);
+        assert_eq!(computed.flex_basis, None);
+    }
+
+    #[test]
+    fn test_parse_flex_shorthand_grow_only() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "flex".to_string(),
+            value: "3".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.flex_grow, 3.0);
+        assert_eq!(computed.flex_shrink, 1.0); // default
+        assert_eq!(computed.flex_basis, None); // default
+    }
+
+    #[test]
+    fn test_flex_defaults() {
+        let computed = ComputedValues::default();
+        assert_eq!(computed.flex_direction, FlexDirection::Row);
+        assert_eq!(computed.flex_wrap, FlexWrap::NoWrap);
+        assert_eq!(computed.justify_content, JustifyContent::FlexStart);
+        assert_eq!(computed.align_items, AlignItems::Stretch);
+        assert_eq!(computed.flex_grow, 0.0);
+        assert_eq!(computed.flex_shrink, 1.0);
+        assert_eq!(computed.flex_basis, None);
     }
 }

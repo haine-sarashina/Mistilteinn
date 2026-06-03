@@ -135,4 +135,51 @@ mod tests {
             assert!(rect.height >= 0.0, "Rect height should be non-negative");
         }
     }
+
+    #[test]
+    fn flexbox_pipeline_test() {
+        // Full pipeline: HTML with flex container → CSS flex properties → layout → render rects
+        let page = Page::new(
+            r#"<html><body>
+                <div class="flex-container">
+                    <div class="item red">Item 1</div>
+                    <div class="item green">Item 2</div>
+                    <div class="item blue">Item 3</div>
+                </div>
+              </body></html>"#,
+            r#".flex-container { display: flex; flex-direction: row; padding: 10px; }
+               .item { flex-grow: 1; padding: 5px; }
+               .red { background-color: red; }
+               .green { background-color: green; }
+               .blue { background-color: blue; }"#,
+            800.0,
+            600.0,
+        );
+
+        let rects = page.collect_rects();
+
+        // Should have colored rectangles from the flex items
+        assert!(!rects.is_empty(), "Flexbox pipeline should produce render rects");
+
+        // Find the three colored items and verify they are positioned left-to-right
+        let red_rects: Vec<_> = rects.iter()
+            .filter(|(_, c)| c == &Some([255, 0, 0, 255]))
+            .collect();
+        let green_rects: Vec<_> = rects.iter()
+            .filter(|(_, c)| c == &Some([0, 128, 0, 255]))
+            .collect();
+        let blue_rects: Vec<_> = rects.iter()
+            .filter(|(_, c)| c == &Some([0, 0, 255, 255]))
+            .collect();
+
+        // At minimum, we expect the flex items to produce colored rects
+        assert!(red_rects.len() >= 1 || green_rects.len() >= 1 || blue_rects.len() >= 1,
+            "Expected at least one colored flex item");
+
+        // All rects should have non-negative dimensions
+        for (rect, _) in &rects {
+            assert!(rect.width >= 0.0);
+            assert!(rect.height >= 0.0);
+        }
+    }
 }

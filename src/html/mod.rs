@@ -115,6 +115,39 @@ impl DomNode {
             template_content: None,
         }
     }
+
+    /// Get the text content of this node if it is a text node.
+    pub fn text_content(&self) -> Option<&str> {
+        match &self.node_type {
+            DomNodeType::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Bridge between the layout engine and DOM nodes.
+impl crate::layout::LayoutDomNode for DomNode {
+    fn tag_name(&self) -> String {
+        match &self.node_type {
+            DomNodeType::Element { name, .. } => name.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn get_attr(&self, name: &str) -> Option<String> {
+        self.attrs.get(&LocalName::from(name)).cloned()
+    }
+
+    fn children_ids(&self) -> Vec<u32> {
+        self.children.iter().map(|nid| nid.0).collect()
+    }
+
+    fn text_content(&self) -> Option<&str> {
+        match &self.node_type {
+            DomNodeType::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
 }
 
 // ------ Handle / Id ------

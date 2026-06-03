@@ -464,6 +464,16 @@ pub fn layout_to_clip(
     }
 }
 
+/// Convert CSS RGBA [u8;4] (0-255 range) to render ColorF (0.0-1.0 range).
+pub fn color_u8_to_f32(color: [u8; 4]) -> ColorF {
+    ColorF {
+        r: color[0] as f32 / 255.0,
+        g: color[1] as f32 / 255.0,
+        b: color[2] as f32 / 255.0,
+        a: color[3] as f32 / 255.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +506,29 @@ mod tests {
         assert!((rect.y - (1.0)).abs() < 0.001);
         assert!((rect.width - 0.2).abs() < 0.001);
         assert!((rect.height - 0.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn color_u8_to_f32_red() {
+        let color = color_u8_to_f32([255, 0, 0, 255]);
+        assert!((color.r - 1.0).abs() < 0.001);
+        assert!((color.g - 0.0).abs() < 0.001);
+        assert!((color.b - 0.0).abs() < 0.001);
+        assert!((color.a - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn color_u8_to_f32_transparent() {
+        let color = color_u8_to_f32([0, 0, 0, 0]);
+        assert!((color.r - 0.0).abs() < 0.001);
+        assert!((color.a - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn color_u8_to_f32_white() {
+        let color = color_u8_to_f32([255, 255, 255, 255]);
+        assert!((color.r - 1.0).abs() < 0.001);
+        assert!((color.g - 1.0).abs() < 0.001);
+        assert!((color.b - 1.0).abs() < 0.001);
     }
 }

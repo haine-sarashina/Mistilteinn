@@ -4,6 +4,7 @@ mod css;
 mod html;
 mod layout;
 mod network;
+mod page;
 mod render;
 
 #[cfg(test)]

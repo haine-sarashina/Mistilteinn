@@ -31,26 +31,59 @@ impl ApplicationHandler for MistilteinnApp {
             let renderer = rt.block_on(async {
                 match Renderer::new(window).await {
                     Ok(mut renderer) => {
-                        // Set up demo rectangles: red, green, blue, yellow
+                        // Build page through the full pipeline: HTML → CSS → Layout → Render
                         let (w, h) = (1280.0, 800.0);
-                        let rects = vec![
-                            layout_to_clip(100.0, 100.0, 400.0, 300.0, w, h),
-                            layout_to_clip(600.0, 100.0, 300.0, 200.0, w, h),
-                            layout_to_clip(200.0, 500.0, 500.0, 200.0, w, h),
-                            layout_to_clip(750.0, 400.0, 200.0, 250.0, w, h),
-                        ];
-                        let colors = vec![
-                            ColorF { r: 1.0, g: 0.0, b: 0.0, a: 1.0 },
-                            ColorF { r: 0.0, g: 1.0, b: 0.0, a: 1.0 },
-                            ColorF { r: 0.0, g: 0.0, b: 1.0, a: 1.0 },
-                            ColorF { r: 1.0, g: 1.0, b: 0.0, a: 1.0 },
-                        ];
-                        renderer.set_rects(&rects, &colors);
+                        let page = crate::page::Page::new(
+                            r#"<html><body>
+                                <div id="header" class="header">Header</div>
+                                <div class="content">
+                                    <p class="box green">Green box</p>
+                                    <p class="box red">Red box</p>
+                                </div>
+                                <div id="footer" class="footer">Footer</div>
+                              </body></html>"#,
+                            r#".header { display: block; background-color: blue; padding: 20px; }
+                               .content { display: block; }
+                               .box { display: block; padding: 15px; }
+                               .green { background-color: green; }
+                               .red { background-color: red; }
+                               .footer { display: block; background-color: orange; padding: 10px; }"#,
+                            w,
+                            h,
+                        );
+
+                        // Collect render rectangles from layout tree and convert to clip space
+                        let rects = page.collect_rects();
+                        let clip_rects: Vec<_> = rects
+                            .iter()
+                            .take(4)
+                            .filter_map(|(r, c)| {
+                                if r.width > 0.0 && r.height > 0.0 {
+                                    Some((layout_to_clip(r.x, r.y, r.width, r.height, w, h), c))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        let render_rects: Vec<_> = clip_rects.iter().map(|(r, _)| *r).collect();
+                        let render_colors: Vec<_> = clip_rects
+                            .iter()
+                            .map(|(_, c)| {
+                                if let Some(col) = c {
+                                    crate::render::color_u8_to_f32(*col)
+                                } else {
+                                    ColorF { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+                                }
+                            })
+                            .collect();
+
+                        renderer.set_rects(&render_rects, &render_colors);
 
                         if let Err(e) = renderer.render() {
                             log::error!("Initial render failed: {:?}", e);
                         } else {
-                            log::info!("First frame rendered — 4 colored rectangles");
+                            log::info!("First frame rendered — pipeline output (HTML→CSS→Layout→Render)");
                         }
 
                         Some(renderer)

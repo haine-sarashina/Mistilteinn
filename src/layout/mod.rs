@@ -7,6 +7,7 @@
 /// - Render tree construction
 
 use crate::css::{ComputedValues, DisplayType};
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Rect {
@@ -81,6 +82,8 @@ pub struct LayoutNode {
     pub children: Vec<LayoutNode>,
     /// Text content for leaf nodes (inline text runs).
     pub text: Option<String>,
+    /// Background color as RGBA (None = transparent/no background).
+    pub background_color: Option<[u8; 4]>,
 }
 
 impl LayoutNode {
@@ -93,6 +96,7 @@ impl LayoutNode {
             border: [0.0; 4],
             children: Vec::new(),
             text: None,
+            background_color: None,
         }
     }
 
@@ -129,7 +133,7 @@ impl LayoutNode {
 /// Trait for DOM nodes so the layout engine can query them without depending
 /// on the internal `DomNode` struct directly.
 pub trait LayoutDomNode {
-    fn tag_name(&self) -> &str;
+    fn tag_name(&self) -> String;
     fn get_attr(&self, name: &str) -> Option<String>;
     fn children_ids(&self) -> Vec<u32>;
     fn text_content(&self) -> Option<&str>;
@@ -139,14 +143,15 @@ pub trait LayoutDomNode {
 ///
 /// Takes a root node ID, a map of node_id -> ComputedValues,
 /// and a way to look up DOM nodes by ID.
-pub fn build_layout_tree<N>(
+pub fn build_layout_tree<N, F>(
     root_id: u32,
-    styles: &std::collections::HashMap<u32, ComputedValues>,
-    get_node: &impl Fn(u32) -> Option<N>,
+    styles: &FxHashMap<u32, ComputedValues>,
+    get_node: F,
     _page_width: f32,
 ) -> LayoutNode
 where
     N: LayoutDomNode,
+    F: Copy + Fn(u32) -> Option<N>,
 {
     let root_styles = styles
         .get(&root_id)
@@ -161,7 +166,7 @@ where
     root_layout.padding = root_styles.padding;
     root_layout.margin = root_styles.margin;
 
-    if let Some(ref node) = root_dom {
+    if let Some(node) = root_dom {
         build_layout_children(&mut root_layout, &node.children_ids(), styles, get_node, 0);
     }
 
@@ -173,14 +178,15 @@ where
 /// while preventing stack overflow on pathologically deep DOM trees.
 const MAX_LAYOUT_DEPTH: usize = 512;
 
-fn build_layout_children<N>(
+fn build_layout_children<N, F>(
     parent: &mut LayoutNode,
     child_ids: &[u32],
-    styles: &std::collections::HashMap<u32, ComputedValues>,
-    get_node: impl Fn(u32) -> Option<N>,
+    styles: &FxHashMap<u32, ComputedValues>,
+    get_node: F,
     depth: usize,
 ) where
     N: LayoutDomNode,
+    F: Copy + Fn(u32) -> Option<N>,
 {
     if depth > MAX_LAYOUT_DEPTH {
         // Safety: prevent stack overflow on deeply nested DOM trees.
@@ -201,6 +207,7 @@ fn build_layout_children<N>(
                     );
                     layout_node.padding = child_styles.padding;
                     layout_node.margin = child_styles.margin;
+                    layout_node.background_color = child_styles.background_color;
 
                     let text = node.text_content().map(|t| t.to_string());
                     if text.is_some() && node.children_ids().is_empty() {
@@ -210,7 +217,7 @@ fn build_layout_children<N>(
                             &mut layout_node,
                             &node.children_ids(),
                             styles,
-                            &get_node,
+                            get_node,
                             depth + 1,
                         );
                     }
@@ -223,6 +230,7 @@ fn build_layout_children<N>(
                     );
                     layout_node.padding = child_styles.padding;
                     layout_node.margin = child_styles.margin;
+                    layout_node.background_color = child_styles.background_color;
 
                     let text = node.text_content().map(|t| t.to_string());
                     if text.is_some() && node.children_ids().is_empty() {
@@ -232,7 +240,7 @@ fn build_layout_children<N>(
                             &mut layout_node,
                             &node.children_ids(),
                             styles,
-                            &get_node,
+                            get_node,
                             depth + 1,
                         );
                     }
@@ -311,6 +319,30 @@ fn compute_inline_height(node: &LayoutNode) -> f32 {
     let font_size = 16.0; // default CSS initial value
     let line_height = font_size * 1.2;
     line_height + node.padding[0] + node.padding[2]
+}
+
+/// Flatten the layout tree into renderable rectangles with colors.
+///
+/// Collects all nodes that have a background color, plus leaf text nodes
+/// that have computed dimensions. Used to bridge layout tree to renderer.
+pub fn collect_render_rects(node: &LayoutNode) -> Vec<(Rect, Option<[u8; 4]>)> {
+    let mut rects = Vec::new();
+
+    if node.background_color.is_some() {
+        rects.push((node.rect, node.background_color));
+    }
+
+    for child in &node.children {
+        rects.extend(collect_render_rects(child));
+    }
+
+    if node.text.is_some() && node.background_color.is_none() {
+        if node.rect.width > 0.0 && node.rect.height > 0.0 {
+            rects.push((node.rect, Some([0, 0, 0, 255])));
+        }
+    }
+
+    rects
 }
 
 #[cfg(test)]
@@ -409,5 +441,41 @@ mod tests {
         assert!(root.children[0].rect.y >= 10.0);
         // child2 should be below child1
         assert!(root.children[1].rect.y >= root.children[0].rect.y);
+    }
+
+    #[test]
+    fn collect_render_rects_returns_colored_nodes() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.padding = [10.0; 4];
+
+        let mut child1 = LayoutNode::new(Rect::new(10.0, 10.0, 780.0, 50.0));
+        child1.background_color = Some([255, 0, 0, 255]);
+
+        let child2 = LayoutNode::new(Rect::new(10.0, 70.0, 780.0, 50.0));
+
+        root.add_child(child1);
+        root.add_child(child2);
+
+        let rects = collect_render_rects(&root);
+        // Should only include the colored child (child1)
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].1, Some([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn collect_render_rects_recurses() {
+        let mut grandchild = LayoutNode::new(Rect::new(20.0, 20.0, 100.0, 100.0));
+        grandchild.background_color = Some([0, 0, 255, 255]);
+
+        let mut child = LayoutNode::new(Rect::new(10.0, 10.0, 200.0, 200.0));
+        child.add_child(grandchild);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(child);
+
+        let rects = collect_render_rects(&root);
+        // Should find the grandchild through recursion
+        assert!(!rects.is_empty());
+        assert_eq!(rects[0].1, Some([0, 0, 255, 255]));
     }
 }

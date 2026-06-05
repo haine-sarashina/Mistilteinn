@@ -222,7 +222,10 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
                 let selectors = parse_selectors_from_string(selector_text);
                 let declarations = crate::css::parse_declarations(decl_text);
                 if !selectors.is_empty() {
-                    rules.push(CSSRule { selectors, declarations });
+                    rules.push(CSSRule {
+                        selectors,
+                        declarations,
+                    });
                 }
                 pos += brace_pos + 1 + block_end + 1; // skip past `}`
             } else {
@@ -458,8 +461,7 @@ fn try_parse_simple_selector<'t>(
         }
         Token::Delim('.') => {
             *i += 1;
-            if let Token::Ident(name) =
-                tokens.get(*i).copied().unwrap_or(&Token::CloseCurlyBracket)
+            if let Token::Ident(name) = tokens.get(*i).copied().unwrap_or(&Token::CloseCurlyBracket)
             {
                 *i += 1;
                 return Some(SimpleSelector::Class(cow_to_string(name)));
@@ -471,10 +473,7 @@ fn try_parse_simple_selector<'t>(
 }
 
 /// Parses an attribute selector `[...]`.
-fn parse_attribute_selector<'t>(
-    tokens: &[&Token<'_>],
-    i: &mut usize,
-) -> Option<SimpleSelector> {
+fn parse_attribute_selector<'t>(tokens: &[&Token<'_>], i: &mut usize) -> Option<SimpleSelector> {
     let mut name = String::new();
     let mut operator = AttrOperator::Existence;
     let mut value = None;
@@ -570,7 +569,9 @@ pub fn parse_selector_str(source: &str) -> Vec<Selector> {
     if let Some(rule) = stylesheet.rules.first() {
         return rule.selectors.clone();
     }
-    vec![Selector::simple(SimpleSelector::Type(source.trim().to_string()))]
+    vec![Selector::simple(SimpleSelector::Type(
+        source.trim().to_string(),
+    ))]
 }
 
 // ------ Tests ------
@@ -620,18 +621,22 @@ mod tests {
     fn parse_type_selector() {
         let ss = parse_stylesheet("div { color: red }");
         let sel = &ss.rules[0].selectors[0];
-        assert!(sel.complex
-            .iter()
-            .any(|(_, s)| matches!(s, SimpleSelector::Type(t) if t == "div")));
+        assert!(
+            sel.complex
+                .iter()
+                .any(|(_, s)| matches!(s, SimpleSelector::Type(t) if t == "div"))
+        );
     }
 
     #[test]
     fn parse_id_selector() {
         let ss = parse_stylesheet("#header { color: red }");
         let sel = &ss.rules[0].selectors[0];
-        assert!(sel.complex
-            .iter()
-            .any(|(_, s)| matches!(s, SimpleSelector::Id(i) if i == "header")));
+        assert!(
+            sel.complex
+                .iter()
+                .any(|(_, s)| matches!(s, SimpleSelector::Id(i) if i == "header"))
+        );
     }
 
     #[test]
@@ -639,9 +644,11 @@ mod tests {
         let ss = parse_stylesheet("* { margin: 0 }");
         assert!(!ss.rules.is_empty());
         let sel = &ss.rules[0].selectors[0];
-        assert!(sel.complex
-            .iter()
-            .any(|(_, s)| matches!(s, SimpleSelector::Universal)));
+        assert!(
+            sel.complex
+                .iter()
+                .any(|(_, s)| matches!(s, SimpleSelector::Universal))
+        );
     }
 
     #[test]
@@ -655,10 +662,11 @@ mod tests {
     fn parse_adjacent_sibling_combinator() {
         let ss = parse_stylesheet("div + span { color: red }");
         let sel = &ss.rules[0].selectors[0];
-        assert!(sel
-            .complex
-            .iter()
-            .any(|(c, _)| *c == Combinator::AdjacentSibling));
+        assert!(
+            sel.complex
+                .iter()
+                .any(|(c, _)| *c == Combinator::AdjacentSibling)
+        );
     }
 
     #[test]
@@ -690,18 +698,20 @@ mod tests {
     fn parse_pseudo_class() {
         let ss = parse_stylesheet("a:hover { color: red }");
         let sel = &ss.rules[0].selectors[0];
-        assert!(sel.complex
-            .iter()
-            .any(|(_, s)| matches!(s, SimpleSelector::PseudoClass { name, .. } if name == "hover")));
+        assert!(sel.complex.iter().any(
+            |(_, s)| matches!(s, SimpleSelector::PseudoClass { name, .. } if name == "hover")
+        ));
     }
 
     #[test]
     fn parse_attribute_selector() {
         let ss = parse_stylesheet("[href] { color: blue }");
         let sel = &ss.rules[0].selectors[0];
-        assert!(sel.complex
-            .iter()
-            .any(|(_, s)| matches!(s, SimpleSelector::Attribute { .. })));
+        assert!(
+            sel.complex
+                .iter()
+                .any(|(_, s)| matches!(s, SimpleSelector::Attribute { .. }))
+        );
     }
 
     #[test]

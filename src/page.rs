@@ -2,11 +2,10 @@
 ///
 /// Connects HTML parsing, CSS computation, layout building, and rendering
 /// into a single pipeline: HTML → CSS → Layout → Render.
-
 use rustc_hash::FxHashMap;
 
-use crate::html::{self, DomArena, DomHandle, NodeId};
 use crate::css;
+use crate::html::{self, DomArena, DomHandle, NodeId};
 use crate::layout::Rect;
 
 /// A fully parsed and laid-out page ready for rendering.
@@ -78,7 +77,10 @@ mod tests {
             600.0,
         );
 
-        assert!(page.layout_root.children.len() > 0, "Layout root should have children");
+        assert!(
+            page.layout_root.children.len() > 0,
+            "Layout root should have children"
+        );
     }
 
     #[test]
@@ -95,7 +97,11 @@ mod tests {
         );
 
         let rects = page.collect_rects();
-        assert!(rects.len() >= 2, "Should have at least 2 colored rects, got {}", rects.len());
+        assert!(
+            rects.len() >= 2,
+            "Should have at least 2 colored rects, got {}",
+            rects.len()
+        );
 
         // Verify colors are set
         for (_, color) in &rects {
@@ -127,7 +133,10 @@ mod tests {
         let rects = page.collect_rects();
 
         // Should have multiple colored rectangles from the styled divs/ps
-        assert!(!rects.is_empty(), "Pipeline should produce at least one render rect");
+        assert!(
+            !rects.is_empty(),
+            "Pipeline should produce at least one render rect"
+        );
 
         // All collected rects should have valid dimensions
         for (rect, _) in &rects {
@@ -159,22 +168,30 @@ mod tests {
         let rects = page.collect_rects();
 
         // Should have colored rectangles from the flex items
-        assert!(!rects.is_empty(), "Flexbox pipeline should produce render rects");
+        assert!(
+            !rects.is_empty(),
+            "Flexbox pipeline should produce render rects"
+        );
 
         // Find the three colored items and verify they are positioned left-to-right
-        let red_rects: Vec<_> = rects.iter()
+        let red_rects: Vec<_> = rects
+            .iter()
             .filter(|(_, c)| c == &Some([255, 0, 0, 255]))
             .collect();
-        let green_rects: Vec<_> = rects.iter()
+        let green_rects: Vec<_> = rects
+            .iter()
             .filter(|(_, c)| c == &Some([0, 128, 0, 255]))
             .collect();
-        let blue_rects: Vec<_> = rects.iter()
+        let blue_rects: Vec<_> = rects
+            .iter()
             .filter(|(_, c)| c == &Some([0, 0, 255, 255]))
             .collect();
 
         // At minimum, we expect the flex items to produce colored rects
-        assert!(red_rects.len() >= 1 || green_rects.len() >= 1 || blue_rects.len() >= 1,
-            "Expected at least one colored flex item");
+        assert!(
+            red_rects.len() >= 1 || green_rects.len() >= 1 || blue_rects.len() >= 1,
+            "Expected at least one colored flex item"
+        );
 
         // All rects should have non-negative dimensions
         for (rect, _) in &rects {

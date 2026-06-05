@@ -270,9 +270,11 @@ pub fn compute_styles_for_tree(
 
         for rule in &stylesheet.rules {
             for selector in &rule.selectors {
-                if selector.matches_element(&tag, |c| node_has_class(&node, c), |i| {
-                    node_get_id(&node) == Some(i)
-                }) {
+                if selector.matches_element(
+                    &tag,
+                    |c| node_has_class(&node, c),
+                    |i| node_get_id(&node) == Some(i),
+                ) {
                     matched.push((rule, selector.specificity()));
                 }
             }
@@ -393,6 +395,18 @@ pub enum AlignItems {
     Center,
 }
 
+/// The computed `align-content` CSS property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignContent {
+    Normal,
+    FlexStart,
+    FlexEnd,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    Stretch,
+}
+
 // ------ Computed Values ------
 
 /// Fully resolved CSS property values for a single element.
@@ -416,6 +430,10 @@ pub struct ComputedValues {
     pub flex_wrap: FlexWrap,
     pub justify_content: JustifyContent,
     pub align_items: AlignItems,
+    pub align_content: AlignContent,
+    /// Gap between flex lines (row_gap = space between rows, column_gap = space between columns)
+    pub row_gap: f32,
+    pub column_gap: f32,
     /// Flex item properties
     pub flex_grow: f32,
     pub flex_shrink: f32,
@@ -440,6 +458,9 @@ impl Default for ComputedValues {
             flex_wrap: FlexWrap::NoWrap,
             justify_content: JustifyContent::FlexStart,
             align_items: AlignItems::Stretch,
+            align_content: AlignContent::Normal,
+            row_gap: 0.0,
+            column_gap: 0.0,
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: None,
@@ -593,6 +614,36 @@ impl ComputedValues {
             "flex" => {
                 parse_flex_shorthand(&mut self, val);
             }
+            "align-content" => {
+                self.align_content = parse_align_content(val);
+            }
+            "gap" => {
+                let gaps: Vec<f32> = val
+                    .split_whitespace()
+                    .filter_map(|p| parse_length(p))
+                    .collect();
+                match gaps.len() {
+                    1 => {
+                        self.row_gap = gaps[0];
+                        self.column_gap = gaps[0];
+                    }
+                    2 => {
+                        self.row_gap = gaps[0];
+                        self.column_gap = gaps[1];
+                    }
+                    _ => {}
+                }
+            }
+            "row-gap" => {
+                if let Some(v) = parse_length(val) {
+                    self.row_gap = v;
+                }
+            }
+            "column-gap" => {
+                if let Some(v) = parse_length(val) {
+                    self.column_gap = v;
+                }
+            }
             _ => {}
         }
 
@@ -623,7 +674,8 @@ fn parse_length(s: &str) -> Option<f32> {
 /// - 3 values: top, horizontal, bottom
 /// - 4 values: top, right, bottom, left
 fn parse_box_four(s: &str, fallback: [f32; 4]) -> [f32; 4] {
-    let parts: Vec<f32> = s.split_whitespace()
+    let parts: Vec<f32> = s
+        .split_whitespace()
         .filter_map(|p| parse_length(p))
         .collect();
 
@@ -708,6 +760,20 @@ fn parse_flex_shorthand(self_vals: &mut ComputedValues, val: &str) {
     }
 }
 
+/// Parse align-content value.
+fn parse_align_content(s: &str) -> AlignContent {
+    match s.trim() {
+        "normal" => AlignContent::Normal,
+        "flex-start" => AlignContent::FlexStart,
+        "flex-end" => AlignContent::FlexEnd,
+        "center" => AlignContent::Center,
+        "space-between" => AlignContent::SpaceBetween,
+        "space-around" => AlignContent::SpaceAround,
+        "stretch" => AlignContent::Stretch,
+        _ => AlignContent::Normal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,12 +816,18 @@ mod tests {
 
     #[test]
     fn parse_color_hex() {
-        assert_eq!(parse_color_value("#ff0000"), Some(CSSColor::Hex { r: 255, g: 0, b: 0 }));
+        assert_eq!(
+            parse_color_value("#ff0000"),
+            Some(CSSColor::Hex { r: 255, g: 0, b: 0 })
+        );
     }
 
     #[test]
     fn parse_color_hex_short() {
-        assert_eq!(parse_color_value("#f00"), Some(CSSColor::Hex { r: 255, g: 0, b: 0 }));
+        assert_eq!(
+            parse_color_value("#f00"),
+            Some(CSSColor::Hex { r: 255, g: 0, b: 0 })
+        );
     }
 
     #[test]
@@ -795,16 +867,13 @@ mod tests {
 
     #[test]
     fn specificity_complex_selector() {
-        use crate::css::parser::{Selector, SimpleSelector, Combinator};
+        use crate::css::parser::{Combinator, Selector, SimpleSelector};
         let mut sel = Selector::simple(SimpleSelector::Type("div".to_string()));
         sel.push(
             Combinator::Descendant,
             SimpleSelector::Class("highlight".to_string()),
         );
-        sel.push(
-            Combinator::Child,
-            SimpleSelector::Id("content".to_string()),
-        );
+        sel.push(Combinator::Child, SimpleSelector::Id("content".to_string()));
         // 1 ID + 1 class + 1 type
         assert_eq!(sel.specificity(), (1, 1, 1));
     }
@@ -821,11 +890,16 @@ mod tests {
         // Find the <div> (it's the body's child at index 0, but we check by ID)
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
-            n.is_element() && n.tag_name().map(|t| t.to_string() == "div").unwrap_or(false)
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
         });
         assert!(div_id.is_some(), "Expected to find a <div> node");
 
-        let div_styles = styles.get(&(div_id.unwrap() as u32)).expect("div has styles");
+        let div_styles = styles
+            .get(&(div_id.unwrap() as u32))
+            .expect("div has styles");
         assert_eq!(div_styles.color, Some([255, 0, 0, 255])); // red as RGBA
     }
 
@@ -838,9 +912,14 @@ mod tests {
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
-            n.is_element() && n.tag_name().map(|t| t.to_string() == "div").unwrap_or(false)
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
         });
-        let div_styles = styles.get(&(div_id.unwrap() as u32)).expect("div has styles");
+        let div_styles = styles
+            .get(&(div_id.unwrap() as u32))
+            .expect("div has styles");
         // ID selector (#mydiv) wins → red
         assert_eq!(div_styles.color, Some([255, 0, 0, 255]));
     }
@@ -849,16 +928,20 @@ mod tests {
     fn cascade_important_wins() {
         // !important declaration overrides higher specificity
         let arena = crate::html::parse_html(r#"<div id="x">Test</div>"#);
-        let stylesheet = parser::parse_stylesheet(
-            "div { color: blue !important; } #x { color: red; }",
-        );
+        let stylesheet =
+            parser::parse_stylesheet("div { color: blue !important; } #x { color: red; }");
         let styles = compute_styles_for_tree(&arena, &stylesheet);
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
-            n.is_element() && n.tag_name().map(|t| t.to_string() == "div").unwrap_or(false)
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
         });
-        let div_styles = styles.get(&(div_id.unwrap() as u32)).expect("div has styles");
+        let div_styles = styles
+            .get(&(div_id.unwrap() as u32))
+            .expect("div has styles");
         // !important wins regardless of specificity → blue
         assert_eq!(div_styles.color, Some([0, 0, 255, 255]));
     }
@@ -872,9 +955,14 @@ mod tests {
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
-            n.is_element() && n.tag_name().map(|t| t.to_string() == "div").unwrap_or(false)
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
         });
-        let div_styles = styles.get(&(div_id.unwrap() as u32)).expect("div has styles");
+        let div_styles = styles
+            .get(&(div_id.unwrap() as u32))
+            .expect("div has styles");
         // Later rule wins → blue
         assert_eq!(div_styles.color, Some([0, 0, 255, 255]));
     }
@@ -889,11 +977,18 @@ mod tests {
 
         let nodes = arena.nodes.borrow();
         let span_id = nodes.iter().position(|n| {
-            n.is_element() && n.tag_name().map(|t| t.to_string() == "span").unwrap_or(false)
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "span")
+                    .unwrap_or(false)
         });
         if let Some(sid) = span_id {
             let span_styles = styles.get(&(sid as u32)).expect("span has styles");
-            assert_eq!(span_styles.color, Some([255, 0, 0, 255]), "color should inherit");
+            assert_eq!(
+                span_styles.color,
+                Some([255, 0, 0, 255]),
+                "color should inherit"
+            );
         } else {
             // html5ever may or may not create a <span> node depending on parsing
             assert!(false, "Expected to find a <span> node");
@@ -1039,8 +1134,95 @@ mod tests {
         assert_eq!(computed.flex_wrap, FlexWrap::NoWrap);
         assert_eq!(computed.justify_content, JustifyContent::FlexStart);
         assert_eq!(computed.align_items, AlignItems::Stretch);
+        assert_eq!(computed.align_content, AlignContent::Normal);
+        assert_eq!(computed.row_gap, 0.0);
+        assert_eq!(computed.column_gap, 0.0);
         assert_eq!(computed.flex_grow, 0.0);
         assert_eq!(computed.flex_shrink, 1.0);
         assert_eq!(computed.flex_basis, None);
+    }
+
+    #[test]
+    fn test_parse_align_content_center() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "align-content".to_string(),
+            value: "center".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.align_content, AlignContent::Center);
+    }
+
+    #[test]
+    fn test_parse_align_content_space_between() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "align-content".to_string(),
+            value: "space-between".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.align_content, AlignContent::SpaceBetween);
+    }
+
+    #[test]
+    fn test_parse_gap_single_value() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "gap".to_string(),
+            value: "16px".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.row_gap, 16.0);
+        assert_eq!(computed.column_gap, 16.0);
+    }
+
+    #[test]
+    fn test_parse_gap_two_values() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "gap".to_string(),
+            value: "10px 20px".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.row_gap, 10.0);
+        assert_eq!(computed.column_gap, 20.0);
+    }
+
+    #[test]
+    fn test_parse_row_gap() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "row-gap".to_string(),
+            value: "8px".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.row_gap, 8.0);
+        assert_eq!(computed.column_gap, 0.0); // column_gap stays default
+    }
+
+    #[test]
+    fn test_parse_column_gap() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "column-gap".to_string(),
+            value: "12px".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.row_gap, 0.0); // row_gap stays default
+        assert_eq!(computed.column_gap, 12.0);
+    }
+
+    #[test]
+    fn test_parse_flex_wrap_wrap() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "flex-wrap".to_string(),
+            value: "wrap".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.flex_wrap, FlexWrap::Wrap);
+    }
+
+    #[test]
+    fn test_parse_flex_wrap_reverse() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "flex-wrap".to_string(),
+            value: "wrap-reverse".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.flex_wrap, FlexWrap::WrapReverse);
     }
 }

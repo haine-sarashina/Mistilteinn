@@ -83,40 +83,85 @@ impl ApplicationHandler for MistilteinnApp {
 
                         // Collect text nodes from layout tree and rasterize into a bitmap
                         let text_nodes = crate::layout::collect_text_nodes(&page.layout_root);
-                        if !text_nodes.is_empty() {
-                            let mut text_renderer = TextRenderer::new();
+
+                        // Collect image nodes from layout tree
+                        let image_nodes = crate::layout::collect_image_nodes(&page.layout_root);
+
+                        if !text_nodes.is_empty() || !image_nodes.is_empty() {
                             let view_width = page.view_width as u32;
                             let view_height = page.view_height as u32;
 
                             // Allocate RGBA buffer (transparent background)
-                            let mut text_buffer = vec![0u8; (view_width * view_height * 4) as usize];
+                            let mut composite_buffer = vec![0u8; (view_width * view_height * 4) as usize];
 
-                            // Rasterize each text node into the composite buffer
-                            for text_info in &text_nodes {
-                                let color_f32: [f32; 4] = [
-                                    text_info.color[0] as f32 / 255.0,
-                                    text_info.color[1] as f32 / 255.0,
-                                    text_info.color[2] as f32 / 255.0,
-                                    text_info.color[3] as f32 / 255.0,
-                                ];
+                            // Rasterize text nodes into the composite buffer
+                            if !text_nodes.is_empty() {
+                                let mut text_renderer = TextRenderer::new();
 
-                                text_renderer.rasterize_to_bitmap(
-                                    &text_info.text,
-                                    text_info.font_size,
-                                    "sans-serif",
-                                    color_f32,
-                                    text_info.x,
-                                    text_info.y,
-                                    text_info.width,
-                                    &mut text_buffer,
-                                    view_width,
-                                    view_height,
-                                );
+                                for text_info in &text_nodes {
+                                    let color_f32: [f32; 4] = [
+                                        text_info.color[0] as f32 / 255.0,
+                                        text_info.color[1] as f32 / 255.0,
+                                        text_info.color[2] as f32 / 255.0,
+                                        text_info.color[3] as f32 / 255.0,
+                                    ];
+
+                                    text_renderer.rasterize_to_bitmap(
+                                        &text_info.text,
+                                        text_info.font_size,
+                                        "sans-serif",
+                                        color_f32,
+                                        text_info.x,
+                                        text_info.y,
+                                        text_info.width,
+                                        &mut composite_buffer,
+                                        view_width,
+                                        view_height,
+                                    );
+                                }
+
+                                log::info!("Rasterized {} text nodes at {}x{}", text_nodes.len(), view_width, view_height);
                             }
 
-                            // Upload the composite text bitmap to GPU
-                            renderer.set_text_bitmap(view_width, view_height, &text_buffer);
-                            log::info!("Text overlay uploaded: {} glyphs at {}x{}", text_nodes.len(), view_width, view_height);
+                            // Fetch and composite image nodes into the buffer
+                            for img_info in &image_nodes {
+                                match reqwest::get(&img_info.src).await {
+                                    Ok(response) => {
+                                        let bytes = match response.bytes().await {
+                                            Ok(b) => b,
+                                            Err(e) => {
+                                                log::warn!("Failed to read image bytes for {}: {:?}", img_info.src, e);
+                                                continue;
+                                            }
+                                        };
+
+                                        if let Ok(img) = image::load_from_memory(&bytes) {
+                                            let rgba = img.to_rgba8();
+                                            let (iw, ih) = rgba.dimensions();
+                                            crate::render::composite_image(
+                                                rgba.as_raw(),
+                                                iw,
+                                                ih,
+                                                &mut composite_buffer,
+                                                view_width,
+                                                view_height,
+                                                img_info.x,
+                                                img_info.y,
+                                            );
+                                            log::info!("Loaded image: {} ({}x{}) at ({}, {})", img_info.src, iw, ih, img_info.x, img_info.y);
+                                        } else {
+                                            log::warn!("Failed to decode image: {}", img_info.src);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Failed to fetch image {}: {:?}", img_info.src, e);
+                                    }
+                                }
+                            }
+
+                            // Upload the composite bitmap to GPU
+                            renderer.set_text_bitmap(view_width, view_height, &composite_buffer);
+                            log::info!("Composite overlay uploaded: {} text + {} images at {}x{}", text_nodes.len(), image_nodes.len(), view_width, view_height);
                         }
 
                         if let Err(e) = renderer.render() {

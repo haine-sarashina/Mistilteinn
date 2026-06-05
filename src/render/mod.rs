@@ -721,6 +721,66 @@ pub fn color_u8_to_f32(color: [u8; 4]) -> ColorF {
     }
 }
 
+/// Composite a decoded RGBA image into an RGBA buffer at the specified position.
+///
+/// Performs alpha blending: each source pixel is blended over the destination
+/// using `src * alpha + dst * (1 - alpha)`.
+///
+/// Pixels that fall outside the destination buffer are silently clipped.
+/// Negative offsets are supported — they shift the image so the top-left
+/// of the source maps to a negative coordinate, and only pixels whose
+/// mapped position falls within the destination are written.
+///
+/// # Arguments
+/// * `src_rgba` - Source RGBA pixel data (4 bytes per pixel, row-major).
+/// * `src_width` - Width of the source image in pixels.
+/// * `src_height` - Height of the source image in pixels.
+/// * `dest` - Destination RGBA buffer (mutable, 4 bytes per pixel).
+/// * `dest_width` - Width of the destination buffer in pixels.
+/// * `dest_height` - Height of the destination buffer in pixels.
+/// * `dest_x` - X position (in layout space) to place the top-left of the image.
+/// * `dest_y` - Y position (in layout space) to place the top-left of the image.
+pub fn composite_image(
+    src_rgba: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    dest_x: f32,
+    dest_y: f32,
+) {
+    let dx_base = dest_x as i32;
+    let dy_base = dest_y as i32;
+
+    for src_y in 0..src_height as i32 {
+        let d_y = dy_base + src_y;
+        if d_y < 0 || d_y >= dest_height as i32 {
+            continue;
+        }
+
+        for src_x in 0..src_width as i32 {
+            let d_x = dx_base + src_x;
+            if d_x < 0 || d_x >= dest_width as i32 {
+                continue;
+            }
+
+            let src_idx = ((src_y as usize) * src_width as usize + (src_x as usize)) * 4;
+            let dst_idx = ((d_y as usize) * dest_width as usize + (d_x as usize)) * 4;
+
+            if src_idx + 3 < src_rgba.len() && dst_idx + 3 < dest.len() {
+                // Alpha blend: src * a + dst * (1 - a)
+                let a = src_rgba[src_idx + 3] as f32 / 255.0;
+                for c in 0..4 {
+                    let src_val = src_rgba[src_idx + c] as f32;
+                    let dst_val = dest[dst_idx + c] as f32;
+                    dest[dst_idx + c] = (src_val * a + dst_val * (1.0 - a)) as u8;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,5 +837,79 @@ mod tests {
         assert!((color.r - 1.0).abs() < 0.001);
         assert!((color.g - 1.0).abs() < 0.001);
         assert!((color.b - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn composite_image_basic() {
+        // 4x4 destination buffer, all zeros
+        let mut dest = vec![0u8; 4 * 4 * 4];
+        // 2x2 source image: solid red
+        let src = [
+            255, 0, 0, 255, 255, 0, 0, 255,
+            255, 0, 0, 255, 255, 0, 0, 255,
+        ];
+
+        composite_image(&src, 2, 2, &mut dest, 4, 4, 1.0, 1.0);
+
+        let idx = (1 * 4 + 1) * 4;
+        assert_eq!(dest[idx], 255);
+        assert_eq!(dest[idx + 1], 0);
+        assert_eq!(dest[idx + 2], 0);
+        assert_eq!(dest[idx + 3], 255);
+
+        let idx = (0 * 4 + 0) * 4;
+        assert_eq!(dest[idx], 0);
+    }
+
+    #[test]
+    fn composite_image_alpha_blend() {
+        let mut dest = vec![0u8; 2 * 2 * 4];
+        // Semi-transparent green (alpha = 128 ~ 0.5)
+        let src = [
+            0, 255, 0, 128, 0, 255, 0, 128,
+            0, 255, 0, 128, 0, 255, 0, 128,
+        ];
+
+        composite_image(&src, 2, 2, &mut dest, 2, 2, 0.0, 0.0);
+
+        // G = 255 * 0.5 + 0 * 0.5 ~ 127
+        assert_eq!(dest[0], 0);
+        assert!((dest[1] as i32 - 127).abs() <= 1);
+    }
+
+    #[test]
+    fn composite_image_clips_out_of_bounds() {
+        let mut dest = vec![0u8; 2 * 2 * 4];
+        let src = vec![255u8; 4 * 4 * 4];
+
+        composite_image(&src, 4, 4, &mut dest, 2, 2, 0.0, 0.0);
+
+        for chunk in dest.chunks(4) {
+            assert_eq!(chunk[0], 255);
+        }
+    }
+
+    #[test]
+    fn composite_image_negative_offset_clips() {
+        let mut dest = vec![0u8; 4 * 4 * 4];
+        let src = vec![255u8; 4 * 4 * 4];
+
+        composite_image(&src, 4, 4, &mut dest, 4, 4, -1.0, -1.0);
+
+        // Source pixel (1,1) maps to dest(0,0) — should be painted
+        let idx = (0 * 4 + 0) * 4;
+        assert_eq!(dest[idx], 255, "dest(0,0) gets source(1,1)");
+
+        // Source pixel (3,3) maps to dest(2,2) — should be painted
+        let idx = (2 * 4 + 2) * 4;
+        assert_eq!(dest[idx], 255, "dest(2,2) gets source(3,3)");
+
+        // The last row (dest y=3) has no mapped source — should remain 0
+        let idx = (3 * 4 + 0) * 4;
+        assert_eq!(dest[idx], 0, "dest(3,0) is out of image bounds");
+
+        // The last column (dest x=3) has no mapped source — should remain 0
+        let idx = (0 * 4 + 3) * 4;
+        assert_eq!(dest[idx], 0, "dest(0,3) is out of image bounds");
     }
 }

@@ -99,6 +99,8 @@ pub struct LayoutNode {
     pub flex_shrink: f32,
     /// Flex basis (None = auto)
     pub flex_basis: Option<f32>,
+    /// URL of an image source for <img> tags (None = not an image).
+    pub image_src: Option<String>,
 }
 
 impl LayoutNode {
@@ -122,6 +124,7 @@ impl LayoutNode {
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: None,
+            image_src: None,
         }
     }
 
@@ -263,6 +266,11 @@ fn build_layout_children<N, F>(
                     layout_node.flex_shrink = child_styles.flex_shrink;
                     layout_node.flex_basis = child_styles.flex_basis;
 
+                    // Extract image src from <img> tags
+                    if node.tag_name() == "img" {
+                        layout_node.image_src = node.get_attr("src");
+                    }
+
                     let text = node.text_content().map(|t| t.to_string());
                     if text.is_some() && node.children_ids().is_empty() {
                         layout_node.text = text;
@@ -285,6 +293,11 @@ fn build_layout_children<N, F>(
                     layout_node.padding = child_styles.padding;
                     layout_node.margin = child_styles.margin;
                     layout_node.background_color = child_styles.background_color;
+
+                    // Extract image src from <img> tags
+                    if node.tag_name() == "img" {
+                        layout_node.image_src = node.get_attr("src");
+                    }
 
                     let text = node.text_content().map(|t| t.to_string());
                     if text.is_some() && node.children_ids().is_empty() {
@@ -1014,6 +1027,47 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
     }
 
     texts
+}
+
+/// Information about an image that needs to be rendered.
+#[derive(Clone, Debug)]
+pub struct ImageInfo {
+    /// X position in layout space (pixels from left).
+    pub x: f32,
+    /// Y position in layout space (pixels from top).
+    pub y: f32,
+    /// Width of the image display area.
+    pub width: f32,
+    /// Height of the image display area.
+    pub height: f32,
+    /// The source URL of the image.
+    pub src: String,
+}
+
+/// Collect all image nodes from the layout tree for rendering.
+///
+/// Walks the tree and extracts nodes that have an image_src with valid
+/// dimensions. Each entry contains position, size, and image URL.
+pub fn collect_image_nodes(node: &LayoutNode) -> Vec<ImageInfo> {
+    let mut images = Vec::new();
+
+    if let Some(src) = &node.image_src {
+        if node.rect.width > 0.0 && node.rect.height > 0.0 {
+            images.push(ImageInfo {
+                x: node.rect.x,
+                y: node.rect.y,
+                width: node.rect.width,
+                height: node.rect.height,
+                src: src.clone(),
+            });
+        }
+    }
+
+    for child in &node.children {
+        images.extend(collect_image_nodes(child));
+    }
+
+    images
 }
 
 #[cfg(test)]
@@ -1798,5 +1852,74 @@ mod tests {
         let texts = collect_text_nodes(&root);
         assert_eq!(texts.len(), 1);
         assert_eq!(texts[0].text, "Nested");
+    }
+
+    #[test]
+    fn collect_image_nodes_finds_images() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut img_child = LayoutNode::new(Rect::new(10.0, 10.0, 200.0, 150.0));
+        img_child.image_src = Some("https://example.com/logo.png".to_string());
+
+        let text_child = LayoutNode::new(Rect::new(10.0, 170.0, 100.0, 30.0));
+
+        root.add_child(img_child);
+        root.add_child(text_child);
+
+        let images = collect_image_nodes(&root);
+        assert_eq!(images.len(), 1, "Only one node has image_src");
+        assert_eq!(images[0].src, "https://example.com/logo.png");
+        assert!((images[0].x - 10.0).abs() < 0.001);
+        assert!((images[0].y - 10.0).abs() < 0.001);
+        assert!((images[0].width - 200.0).abs() < 0.001);
+        assert!((images[0].height - 150.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn collect_image_nodes_skips_zero_dimensions() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut img_child = LayoutNode::new(Rect::new(10.0, 10.0, 0.0, 0.0));
+        img_child.image_src = Some("https://example.com/hidden.png".to_string());
+
+        root.add_child(img_child);
+
+        let images = collect_image_nodes(&root);
+        assert!(images.is_empty(), "Zero-dimension image nodes are skipped");
+    }
+
+    #[test]
+    fn collect_image_nodes_recurses() {
+        let mut grandchild = LayoutNode::new(Rect::new(20.0, 20.0, 100.0, 80.0));
+        grandchild.image_src = Some("https://example.com/nested.jpg".to_string());
+
+        let mut child = LayoutNode::new(Rect::new(10.0, 10.0, 200.0, 100.0));
+        child.add_child(grandchild);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(child);
+
+        let images = collect_image_nodes(&root);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].src, "https://example.com/nested.jpg");
+    }
+
+    #[test]
+    fn collect_image_nodes_multiple() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut img1 = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 100.0));
+        img1.image_src = Some("https://example.com/a.png".to_string());
+
+        let mut img2 = LayoutNode::new(Rect::new(210.0, 0.0, 200.0, 100.0));
+        img2.image_src = Some("https://example.com/b.png".to_string());
+
+        root.add_child(img1);
+        root.add_child(img2);
+
+        let images = collect_image_nodes(&root);
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].src, "https://example.com/a.png");
+        assert_eq!(images[1].src, "https://example.com/b.png");
     }
 }

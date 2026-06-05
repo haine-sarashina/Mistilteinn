@@ -199,4 +199,43 @@ mod tests {
             assert!(rect.height >= 0.0);
         }
     }
+
+    #[test]
+    fn page_img_tag_creates_layout_node_with_src() {
+        // Verify that <img> tags get their src attribute extracted into layout nodes.
+        // Note: Without explicit width/height CSS, inline <img> elements will have
+        // zero dimensions and be filtered by collect_image_nodes (which requires
+        // positive dimensions). The image_src field IS set correctly on the node —
+        // this test verifies that behavior via a direct layout node check.
+        use crate::layout::{LayoutNode, LayoutDomNode};
+
+        let page = Page::new(
+            r#"<html><body>
+                <img src="https://example.com/logo.png" />
+              </body></html>"#,
+            "",
+            800.0,
+            600.0,
+        );
+
+        // Walk layout tree looking for a node with image_src set
+        fn find_image_node(node: &LayoutNode) -> Option<&LayoutNode> {
+            if node.image_src.is_some() {
+                return Some(node);
+            }
+            for child in &node.children {
+                if let Some(found) = find_image_node(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        let img_node = find_image_node(&page.layout_root);
+        assert!(img_node.is_some(), "Expected an img node with image_src set");
+        assert_eq!(
+            img_node.unwrap().image_src.as_deref(),
+            Some("https://example.com/logo.png")
+        );
+    }
 }

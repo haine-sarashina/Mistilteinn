@@ -9,8 +9,9 @@
 /// - Glyph layout via Parley
 ///
 /// TODO: Glyph atlas texture, wgpu text render pipeline, draw calls.
-
-use parley::{Alignment, AlignmentOptions, FontContext, Layout, LayoutContext, PositionedLayoutItem};
+use parley::{
+    Alignment, AlignmentOptions, FontContext, Layout, LayoutContext, PositionedLayoutItem,
+};
 
 /// A single line of laid-out text and its position.
 #[derive(Clone)]
@@ -55,18 +56,11 @@ impl TextRenderer {
     ///
     /// This is used by the layout engine to compute text box dimensions
     /// before rendering.
-    pub fn measure(
-        &mut self,
-        text: &str,
-        font_size: f32,
-        family: &str,
-    ) -> (f32, f32) {
+    pub fn measure(&mut self, text: &str, font_size: f32, family: &str) -> (f32, f32) {
         let display_scale = 1.0;
-        let mut builder = self.layout_ctx.ranged_builder(
-            &mut self.font_ctx,
-            text,
-            display_scale,
-        );
+        let mut builder = self
+            .layout_ctx
+            .ranged_builder(&mut self.font_ctx, text, display_scale);
 
         // Set default styles
         builder.push_default(parley::StyleProperty::FontSize(font_size));
@@ -89,19 +83,11 @@ impl TextRenderer {
     ///
     /// Each run is laid out independently. The advance and line_height
     /// fields are populated with computed values.
-    pub fn layout_runs(
-        &mut self,
-        runs: &[TextRun],
-        _max_width: f32,
-    ) -> Vec<TextRun> {
+    pub fn layout_runs(&mut self, runs: &[TextRun], _max_width: f32) -> Vec<TextRun> {
         let mut result = Vec::with_capacity(runs.len());
 
         for run in runs {
-            let (advance, line_height) = self.measure(
-                &run.text,
-                run.font_size,
-                &run.family,
-            );
+            let (advance, line_height) = self.measure(&run.text, run.font_size, &run.family);
 
             result.push(TextRun {
                 advance,
@@ -125,11 +111,9 @@ impl TextRenderer {
         max_width: f32,
     ) -> Vec<(f32, f32, f32)> {
         let display_scale = 1.0;
-        let mut builder = self.layout_ctx.ranged_builder(
-            &mut self.font_ctx,
-            text,
-            display_scale,
-        );
+        let mut builder = self
+            .layout_ctx
+            .ranged_builder(&mut self.font_ctx, text, display_scale);
 
         builder.push_default(parley::StyleProperty::FontSize(font_size));
         builder.push_default(parley::StyleProperty::FontStack(family.into()));
@@ -137,7 +121,11 @@ impl TextRenderer {
 
         let mut layout: Layout<()> = builder.build(text);
         layout.break_all_lines(Some(max_width));
-        layout.align(Some(max_width), Alignment::Start, AlignmentOptions::default());
+        layout.align(
+            Some(max_width),
+            Alignment::Start,
+            AlignmentOptions::default(),
+        );
 
         let mut lines = Vec::new();
         for line in layout.lines() {

@@ -31,6 +31,7 @@ image = "0.25"
 # Text layout
 parley = "0.3"
 fontdb = "0.23"
+swash = { version = "0.2", default-features = false, features = ["scale", "render"] }
 
 # Utility
 log = "0.4"

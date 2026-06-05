@@ -2050,6 +2050,7 @@ dependencies = [
  "reqwest",
  "rustc-hash 2.1.2",
  "smallvec",
+ "swash",
  "thiserror 2.0.18",
  "tokio",
  "wgpu",

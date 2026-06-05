@@ -6,6 +6,7 @@ use winit::{
 };
 
 use crate::render::{ColorF, Renderer, layout_to_clip};
+use crate::render::text::TextRenderer;
 
 /// Main application struct implementing winit's ApplicationHandler trait.
 pub struct MistilteinnApp {
@@ -79,6 +80,44 @@ impl ApplicationHandler for MistilteinnApp {
                             .collect();
 
                         renderer.set_rects(&render_rects, &render_colors);
+
+                        // Collect text nodes from layout tree and rasterize into a bitmap
+                        let text_nodes = crate::layout::collect_text_nodes(&page.layout_root);
+                        if !text_nodes.is_empty() {
+                            let mut text_renderer = TextRenderer::new();
+                            let view_width = page.view_width as u32;
+                            let view_height = page.view_height as u32;
+
+                            // Allocate RGBA buffer (transparent background)
+                            let mut text_buffer = vec![0u8; (view_width * view_height * 4) as usize];
+
+                            // Rasterize each text node into the composite buffer
+                            for text_info in &text_nodes {
+                                let color_f32: [f32; 4] = [
+                                    text_info.color[0] as f32 / 255.0,
+                                    text_info.color[1] as f32 / 255.0,
+                                    text_info.color[2] as f32 / 255.0,
+                                    text_info.color[3] as f32 / 255.0,
+                                ];
+
+                                text_renderer.rasterize_to_bitmap(
+                                    &text_info.text,
+                                    text_info.font_size,
+                                    "sans-serif",
+                                    color_f32,
+                                    text_info.x,
+                                    text_info.y,
+                                    text_info.width,
+                                    &mut text_buffer,
+                                    view_width,
+                                    view_height,
+                                );
+                            }
+
+                            // Upload the composite text bitmap to GPU
+                            renderer.set_text_bitmap(view_width, view_height, &text_buffer);
+                            log::info!("Text overlay uploaded: {} glyphs at {}x{}", text_nodes.len(), view_width, view_height);
+                        }
 
                         if let Err(e) = renderer.render() {
                             log::error!("Initial render failed: {:?}", e);

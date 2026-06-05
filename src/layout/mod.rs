@@ -968,6 +968,54 @@ pub fn collect_render_rects(node: &LayoutNode) -> Vec<(Rect, Option<[u8; 4]>)> {
     rects
 }
 
+/// Information about a text node for rasterization.
+#[derive(Clone, Debug)]
+pub struct TextInfo {
+    /// X position in layout space (pixels from left).
+    pub x: f32,
+    /// Y position in layout space (pixels from top).
+    pub y: f32,
+    /// Available width for text wrapping.
+    pub width: f32,
+    /// Text content to render.
+    pub text: String,
+    /// RGBA color (0-255 range).
+    pub color: [u8; 4],
+    /// Font size in pixels.
+    pub font_size: f32,
+}
+
+/// Collect all text nodes from the layout tree for rendering.
+///
+/// Walks the tree and extracts nodes that have text content with valid
+/// dimensions. Each entry contains position, text, color, and font info.
+pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
+    let mut texts = Vec::new();
+
+    if let Some(ref text) = node.text {
+        if !text.trim().is_empty() && node.rect.width > 0.0 && node.rect.height > 0.0 {
+            // Determine text color: use the node's background_color as a hint,
+            // but default to black for text rendering
+            let color = node.background_color.unwrap_or([0, 0, 0, 255]);
+
+            texts.push(TextInfo {
+                x: node.rect.x,
+                y: node.rect.y,
+                width: node.rect.width,
+                text: text.clone(),
+                color,
+                font_size: 16.0, // Default; will be enriched when CSS font-size is available
+            });
+        }
+    }
+
+    for child in &node.children {
+        texts.extend(collect_text_nodes(child));
+    }
+
+    texts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1688,5 +1736,67 @@ mod tests {
         // Both lines should have grown from their original sizes
         assert!(line1_h > 50.0 || (line1_h - 50.0).abs() < 1.0);
         assert!(line2_h > 45.0 || (line2_h - 45.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn collect_text_nodes_finds_text() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut text_child = LayoutNode::new(Rect::new(10.0, 10.0, 200.0, 30.0));
+        text_child.text = Some("Hello".to_string());
+
+        let empty_child = LayoutNode::new(Rect::new(10.0, 50.0, 200.0, 30.0));
+        // No text — should be skipped
+
+        root.add_child(text_child);
+        root.add_child(empty_child);
+
+        let texts = collect_text_nodes(&root);
+        assert_eq!(texts.len(), 1, "Only one node has text");
+        assert_eq!(texts[0].text, "Hello");
+        assert!((texts[0].x - 10.0).abs() < 0.001);
+        assert!((texts[0].y - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn collect_text_nodes_skips_whitespace_only() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut ws_child = LayoutNode::new(Rect::new(10.0, 10.0, 200.0, 30.0));
+        ws_child.text = Some("   ".to_string());
+
+        root.add_child(ws_child);
+
+        let texts = collect_text_nodes(&root);
+        assert!(texts.is_empty(), "Whitespace-only text is skipped");
+    }
+
+    #[test]
+    fn collect_text_nodes_skips_zero_dimensions() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut zero_child = LayoutNode::new(Rect::new(10.0, 10.0, 0.0, 0.0));
+        zero_child.text = Some("Hidden".to_string());
+
+        root.add_child(zero_child);
+
+        let texts = collect_text_nodes(&root);
+        assert!(texts.is_empty(), "Zero-dimension text nodes are skipped");
+    }
+
+    #[test]
+    fn collect_text_nodes_recurses() {
+        let mut grandchild = LayoutNode::new(Rect::new(20.0, 20.0, 150.0, 25.0));
+        grandchild.text = Some("Nested".to_string());
+
+        let mut child = LayoutNode::new(Rect::new(10.0, 10.0, 200.0, 100.0));
+        child.add_child(grandchild);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(child);
+
+        let texts = collect_text_nodes(&root);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].text, "Nested");
     }
 }

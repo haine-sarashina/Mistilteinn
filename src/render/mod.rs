@@ -25,6 +25,18 @@ pub struct Renderer {
     rect_bind_group: wgpu::BindGroup,
     /// Current number of rectangles to draw (max 64).
     num_rects: u32,
+    /// Texture for overlaying rasterized text onto the frame.
+    text_texture: Option<wgpu::Texture>,
+    /// Texture view for the text texture.
+    text_texture_view: Option<wgpu::TextureView>,
+    /// Sampler for the text texture (nearest-neighbor for crisp text).
+    text_sampler: wgpu::Sampler,
+    /// Render pipeline for drawing a textured quad (text overlay).
+    text_pipeline: wgpu::RenderPipeline,
+    /// Bind group layout for the text pipeline (texture + sampler).
+    text_bind_group_layout: wgpu::BindGroupLayout,
+    /// Vertex buffer for a fullscreen quad (2 triangles).
+    quad_vertex_buffer: wgpu::Buffer,
 }
 
 impl Renderer {
@@ -154,6 +166,39 @@ impl Renderer {
             ],
         });
 
+        // Create text sampler — nearest-neighbor for crisp text rendering
+        let text_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // Create text render pipeline (textured quad overlay)
+        let text_pipeline = Self::create_text_pipeline(&device, surface_format);
+        let text_bind_group_layout = text_pipeline.get_bind_group_layout(0);
+
+        // Create fullscreen quad vertex buffer
+        // Vertex format: [x, y, uv_x, uv_y] as f32 — 6 vertices for 2 triangles
+        let quad_vertices: [f32; 24] = [
+            // Triangle 1
+            -1.0, -1.0, 0.0, 0.0,
+            -1.0,  1.0, 0.0, 1.0,
+             1.0,  1.0, 1.0, 1.0,
+            // Triangle 2
+            -1.0, -1.0, 0.0, 0.0,
+             1.0,  1.0, 1.0, 1.0,
+             1.0, -1.0, 1.0, 0.0,
+        ];
+        let quad_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Quad Vertex Buffer"),
+            size: quad_vertices.len() as u64 * std::mem::size_of::<f32>() as u64,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&quad_vertex_buffer, 0, bytemuck::cast_slice(&quad_vertices));
+
         log::info!(
             "Renderer initialized — surface format: {:?}, size: {}x{}",
             surface_format,
@@ -172,6 +217,12 @@ impl Renderer {
             rect_color_buffer,
             rect_bind_group,
             num_rects: 0,
+            text_texture: None,
+            text_texture_view: None,
+            text_sampler,
+            text_pipeline,
+            text_bind_group_layout,
+            quad_vertex_buffer,
         })
     }
 
@@ -268,6 +319,96 @@ impl Renderer {
         })
     }
 
+    /// Create the render pipeline for drawing a fullscreen textured quad (text overlay).
+    fn create_text_pipeline(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+    ) -> wgpu::RenderPipeline {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Text Quad Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", shader::TEXT_VERTEX, shader::TEXT_FRAGMENT).into(),
+            ),
+        });
+
+        // Separate bind group layout for text texture + sampler
+        let text_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Text Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Text Pipeline Layout"),
+            bind_group_layouts: &[&text_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Text Quad Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_text_quad",
+                buffers: &[], // Vertex positions are generated in the shader
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_text_quad",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            operation: wgpu::BlendOperation::Add,
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            operation: wgpu::BlendOperation::Add,
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        })
+    }
+
     /// Resize the renderer when the window is resized.
     pub fn resize(&mut self, new_width: u32, new_height: u32) {
         if new_width == 0 || new_height == 0 {
@@ -311,6 +452,53 @@ impl Renderer {
             .write_buffer(&self.rect_color_buffer, 0, bytemuck::bytes_of(&color_data));
     }
 
+    /// Upload an RGBA bitmap as the text overlay texture.
+    ///
+    /// The `rgba_data` must contain `width * height * 4` bytes of RGBA pixel data.
+    /// This texture is then composited on top of rectangles during rendering,
+    /// using alpha blending so transparent areas show through.
+    pub fn set_text_bitmap(&mut self, width: u32, height: u32, rgba_data: &[u8]) {
+        if width == 0 || height == 0 || rgba_data.is_empty() {
+            return;
+        }
+
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Text Overlay Texture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba_data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+
+        self.text_texture = Some(texture);
+        self.text_texture_view = None; // Invalidate cached view (created fresh each frame)
+    }
+
     /// Render a frame: clear the surface and draw all rectangles.
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let frame = self.surface.get_current_texture()?;
@@ -325,6 +513,32 @@ impl Renderer {
             });
 
         {
+            // Pre-create text bind group if needed.
+            // Must be created BEFORE render_pass so it outlives render_pass on scope exit.
+            let text_bg = if let Some(text_tex) = self.text_texture.as_ref() {
+                let text_tex = text_tex;
+                let text_view = text_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                let bg = self.device.create_bind_group(
+                    &wgpu::BindGroupDescriptor {
+                        label: Some("Text Bind Group"),
+                        layout: &self.text_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&text_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.text_sampler),
+                            },
+                        ],
+                    }
+                );
+                Some((text_view, bg))
+            } else {
+                None
+            };
+
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -351,6 +565,13 @@ impl Renderer {
             // Draw triangles: 6 vertices per rectangle (2 triangles)
             let vert_count = self.num_rects * 6;
             render_pass.draw(0..vert_count, 0..1);
+
+            // Draw text overlay if available
+            if let Some((_view, ref bg)) = text_bg {
+                render_pass.set_pipeline(&self.text_pipeline);
+                render_pass.set_bind_group(0, bg, &[]);
+                render_pass.draw(0..6, 0..1); // Fullscreen quad: 6 vertices
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -426,6 +647,42 @@ mod shader {
                 return vec4f(1.0, 1.0, 1.0, 1.0);
             }
             return rect_colors.colors[rect_idx];
+        }
+    "#;
+
+    /// Vertex shader for the fullscreen text overlay quad.
+    pub const TEXT_VERTEX: &str = r#"
+        struct VertexOutput {
+            @builtin(position) position: vec4f,
+            @location(0) uv: vec2f,
+        }
+
+        @vertex
+        fn vs_text_quad(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+            var positions = array<vec2f, 6>(
+                vec2f(-1.0, -1.0), vec2f(-1.0, 1.0), vec2f(1.0, 1.0),
+                vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(1.0, -1.0),
+            );
+            var uvs = array<vec2f, 6>(
+                vec2f(0.0, 0.0), vec2f(0.0, 1.0), vec2f(1.0, 1.0),
+                vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(1.0, 0.0),
+            );
+            var out: VertexOutput;
+            out.position = vec4f(positions[vertex_index], 0.0, 1.0);
+            out.uv = uvs[vertex_index];
+            return out;
+        }
+    "#;
+
+    /// Fragment shader for the text overlay — samples the text texture with alpha blending.
+    pub const TEXT_FRAGMENT: &str = r#"
+        @group(0) @binding(0) var text_tex: texture_2d<f32>;
+        @group(0) @binding(1) var text_smp: sampler;
+
+        @fragment
+        fn fs_text_quad(@location(0) uv: vec2f) -> @location(0) vec4f {
+            let tex_uv = vec2f(1.0 - uv.x, 1.0 - uv.y); // Flip to match layout coords
+            return textureSample(text_tex, text_smp, tex_uv);
         }
     "#;
 }

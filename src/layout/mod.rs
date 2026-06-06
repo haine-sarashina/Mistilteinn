@@ -69,6 +69,39 @@ impl Rect {
     }
 }
 
+/// Inline box types within a line (inline formatting context).
+#[derive(Debug, Clone)]
+pub enum InlineBox {
+    Text {
+        text: String,
+        width: f32, // measured width of this run
+        color: Option<[u8; 4]>,
+        font_size: f32,
+    },
+    Element {
+        child_index: usize, // index into parent's children vec for the LayoutNode
+        width: f32,
+        height: f32,
+        baseline_offset: f32, // distance from bottom of element to baseline
+    },
+    Whitespace {
+        collapsible: bool,
+        width: f32,
+    },
+}
+
+/// A line box contains inline boxes and records its metrics.
+#[derive(Debug, Clone)]
+pub struct LineBox {
+    /// Top position of this line (relative to block container).
+    pub y: f32,
+    /// Baseline position for alignment.
+    pub baseline_y: f32,
+    /// Total line height (max ascender + max descender in line).
+    pub height: f32,
+    pub boxes: Vec<InlineBox>,
+}
+
 /// A node in the layout tree.
 #[derive(Debug, Clone)]
 pub struct LayoutNode {
@@ -85,6 +118,8 @@ pub struct LayoutNode {
     pub text: Option<String>,
     /// Background color as RGBA (None = transparent/no background).
     pub background_color: Option<[u8; 4]>,
+    /// Foreground text color as RGBA (None = not explicitly set, defaults to black).
+    pub color: Option<[u8; 4]>,
     /// Flex container properties
     pub flex_direction: FlexDirection,
     pub flex_wrap: FlexWrap,
@@ -101,6 +136,8 @@ pub struct LayoutNode {
     pub flex_basis: Option<f32>,
     /// URL of an image source for <img> tags (None = not an image).
     pub image_src: Option<String>,
+    /// Line boxes for block containers with inline children (None = no inline layout computed yet).
+    pub line_boxes: Option<Vec<LineBox>>,
 }
 
 impl LayoutNode {
@@ -114,6 +151,7 @@ impl LayoutNode {
             children: Vec::new(),
             text: None,
             background_color: None,
+            color: None,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
             justify_content: JustifyContent::FlexStart,
@@ -125,6 +163,7 @@ impl LayoutNode {
             flex_shrink: 1.0,
             flex_basis: None,
             image_src: None,
+            line_boxes: None,
         }
     }
 
@@ -254,6 +293,7 @@ fn build_layout_children<N, F>(
                     layout_node.padding = child_styles.padding;
                     layout_node.margin = child_styles.margin;
                     layout_node.background_color = child_styles.background_color;
+                    layout_node.color = child_styles.color;
                     // Copy flexbox properties
                     layout_node.flex_direction = child_styles.flex_direction;
                     layout_node.flex_wrap = child_styles.flex_wrap;
@@ -293,6 +333,7 @@ fn build_layout_children<N, F>(
                     layout_node.padding = child_styles.padding;
                     layout_node.margin = child_styles.margin;
                     layout_node.background_color = child_styles.background_color;
+                    layout_node.color = child_styles.color;
 
                     // Extract image src from <img> tags
                     if node.tag_name() == "img" {
@@ -322,8 +363,13 @@ fn build_layout_children<N, F>(
 ///
 /// Block-level children are stacked vertically (top-to-bottom).
 /// Flex containers lay out their children using flexbox algorithm.
+/// Inline children are grouped into line boxes with word wrapping and baseline alignment.
 /// Each node's margin, border, padding, and content box are computed.
-pub fn compute_layout(root: &mut LayoutNode, page_width: f32) {
+pub fn compute_layout(
+    root: &mut LayoutNode,
+    page_width: f32,
+    text_renderer: &mut crate::render::text::TextRenderer,
+) {
     let available_width = page_width
         - root.margin[3]
         - root.border[3]
@@ -337,61 +383,235 @@ pub fn compute_layout(root: &mut LayoutNode, page_width: f32) {
 
     match root.display {
         DisplayType::Flex | DisplayType::InlineFlex => {
-            compute_flex_children(root, start_x, start_y, available_width, 0);
+            compute_flex_children(root, start_x, start_y, available_width, 0, text_renderer);
         }
         _ => {
-            compute_block_children(root, start_x, start_y, available_width, 0);
+            compute_block_children(root, start_x, start_y, available_width, 0, text_renderer);
         }
     }
 }
 
+/// Check if a child participates in the inline formatting context.
+/// Text nodes (nodes with `text` set) and inline/inline-block elements do so.
+fn is_inline_child(child: &LayoutNode) -> bool {
+    child.text.is_some()
+        || matches!(
+            child.display,
+            DisplayType::Inline | DisplayType::InlineBlock
+        )
+}
+
+/// Check if a child is a block-level participant (flex children are also block-level here).
+fn is_block_child(child: &LayoutNode) -> bool {
+    !is_inline_child(child)
+        && matches!(
+            child.display,
+            DisplayType::Block | DisplayType::Flex | DisplayType::InlineFlex
+        )
+}
+
 /// Stack block-level children vertically, computing each child's rect.
+/// Inline children (text nodes and inline elements) are grouped into an inline
+/// formatting context: build_inline_boxes + break_into_lines + position.
 fn compute_block_children(
     parent: &mut LayoutNode,
     parent_x: f32,
-    mut y: f32,
+    _parent_y: f32,
     available_width: f32,
     depth: usize,
+    text_renderer: &mut crate::render::text::TextRenderer,
 ) {
     if depth > MAX_LAYOUT_DEPTH {
         return;
     }
 
-    for child in &mut parent.children {
-        // Apply margins
-        let child_x = parent_x + child.margin[3];
-        let child_y = y + child.margin[0];
-        let child_width = available_width - child.margin[3] - child.margin[1];
-        let child_height = compute_block_height(child, depth + 1)
-            + child.padding[0]
-            + child.padding[2]
-            + child.border[0]
-            + child.border[2];
+    // --- Separate children into block and inline runs ---
+    // We process the children list and find contiguous runs of inline children.
+    // Each run is laid out as an inline formatting context. Block children use
+    // the traditional vertical stacking.
 
-        child.rect = Rect::new(child_x, child_y, child_width, child_height);
-        y = child.rect.bottom() + child.margin[2];
+    let mut y = parent.padding[0]; // start after top padding
+    let children_count = parent.children.len();
+    let mut i = 0;
+
+    while i < children_count {
+        let child = &parent.children[i];
+
+        if is_inline_child(child)
+            || matches!(
+                child.display,
+                DisplayType::Inline | DisplayType::InlineBlock
+            )
+        {
+            // Start of an inline run — collect consecutive inline children
+            let mut run_end = i;
+            while run_end < children_count && is_inline_child(&parent.children[run_end]) {
+                run_end += 1;
+            }
+
+            // Build inline boxes from the run
+            let inline_boxes = build_inline_boxes_from_slice(parent, &parent.children[i..run_end]);
+
+            if !inline_boxes.is_empty() {
+                // Compute heights of inline children first (needed for element sizing)
+                for j in i..run_end {
+                    compute_block_height_inner(&parent.children[j], depth + 1, text_renderer);
+                }
+
+                // Break into lines
+                let line_boxes = break_into_lines(inline_boxes, available_width, text_renderer);
+
+                // Position inline children within line boxes
+                position_inline_children_in_lines(
+                    &mut parent.children[i..run_end],
+                    &line_boxes,
+                    parent_x,
+                    y,
+                );
+
+                // Store line boxes on parent
+                if parent.line_boxes.is_none() {
+                    parent.line_boxes = Some(line_boxes.clone());
+                } else if let Some(ref mut existing) = parent.line_boxes {
+                    existing.extend(line_boxes.clone());
+                }
+
+                // Advance y past the inline content
+                let mut inline_height = 0.0;
+                for lb in &line_boxes {
+                    let line_bottom = lb.y + lb.height;
+                    if line_bottom > inline_height {
+                        inline_height = line_bottom;
+                    }
+                }
+                y += inline_height;
+            }
+
+            i = run_end;
+        } else if is_block_child(child) {
+            // Block-level child: traditional vertical stacking
+            // Collect all values from immutable borrow before mutating
+            let c = &parent.children[i];
+            let child_x = parent_x + c.margin[3];
+            let child_y = y + c.margin[0];
+            let child_width = available_width - c.margin[3] - c.margin[1];
+            let child_content_height =
+                compute_block_height_inner(&parent.children[i], depth + 1, text_renderer);
+            let pad_top = c.padding[0];
+            let pad_bottom = c.padding[2];
+            let border_top = c.border[0];
+            let border_bottom = c.border[2];
+            let margin_bottom = c.margin[2];
+            let margin_left = c.margin[3];
+            let margin_right = c.margin[1];
+            let border_left = c.border[3];
+            let border_right = c.border[1];
+            let pad_left = c.padding[3];
+            let pad_right = c.padding[1];
+            let child_display = c.display;
+            // Use all values from the immutable borrow above before mutating parent.children[i] below
+
+            let child_height =
+                child_content_height + pad_top + pad_bottom + border_top + border_bottom;
+
+            parent.children[i].rect = Rect::new(child_x, child_y, child_width, child_height);
+            y = parent.children[i].rect.bottom() + margin_bottom;
+
+            // Recurse into block child's children
+            let inner_width = (parent.children[i].rect.width
+                - margin_left
+                - margin_right
+                - border_left
+                - border_right
+                - pad_left
+                - pad_right)
+                .max(0.0);
+
+            let inner_x = parent.children[i].rect.x + pad_left + border_left;
+            let inner_y = parent.children[i].rect.y + pad_top + border_top;
+
+            match child_display {
+                DisplayType::Flex | DisplayType::InlineFlex => {
+                    compute_flex_children(
+                        &mut parent.children[i],
+                        inner_x,
+                        inner_y,
+                        inner_width,
+                        depth + 1,
+                        text_renderer,
+                    );
+                }
+                _ => {
+                    compute_block_children(
+                        &mut parent.children[i],
+                        inner_x,
+                        inner_y,
+                        inner_width,
+                        depth + 1,
+                        text_renderer,
+                    );
+                }
+            }
+
+            i += 1;
+        } else {
+            // display:none or unclassified — skip
+            i += 1;
+        }
+    }
+
+    // Update parent height based on content extent
+    // Only overwrite height/width if they haven't been set by a parent flexbox layout pass.
+    let content_height = (y - parent.padding[0]).max(0.0);
+    let computed_total_height = content_height
+        + parent.padding[0]
+        + parent.border[0]
+        + parent.padding[2]
+        + parent.border[2];
+
+    // Only set height if it's zero (not already set by flexbox parent)
+    if parent.rect.height == 0.0 {
+        parent.rect.height = computed_total_height;
+    } else {
+        // Use the larger of computed or existing height
+        parent.rect.height = parent.rect.height.max(computed_total_height);
+    }
+
+    // If width wasn't set, fill available width
+    if parent.rect.width == 0.0 {
+        parent.rect.width = available_width;
     }
 }
 
-/// Compute the height of a block node (content + inner children).
-fn compute_block_height(node: &LayoutNode, depth: usize) -> f32 {
+/// Compute inner height contribution of a single node (content area only, no padding).
+fn compute_block_height_inner(
+    node: &LayoutNode,
+    depth: usize,
+    _text_renderer: &mut crate::render::text::TextRenderer,
+) -> f32 {
     if depth > MAX_LAYOUT_DEPTH {
         return 0.0;
     }
     let mut height = 0.0;
     for child in &node.children {
-        let inner_height = if child.display == DisplayType::Block {
-            compute_block_height(child, depth + 1)
+        if is_block_child(child) {
+            height += compute_block_height_inner(child, depth + 1, _text_renderer)
                 + child.padding[0]
                 + child.padding[2]
                 + child.border[0]
-                + child.border[2]
-        } else {
-            compute_inline_height(child)
-        };
-        height += inner_height;
+                + child.border[2];
+        } else if is_inline_child(child) {
+            height += compute_inline_height(child);
+        }
     }
     height + node.padding[0] + node.padding[2]
+}
+
+/// Compute the height of a block node (content + inner children).
+/// Legacy wrapper for compatibility.
+fn compute_block_height(node: &LayoutNode, depth: usize) -> f32 {
+    let mut renderer = crate::render::text::TextRenderer::new();
+    compute_block_height_inner(node, depth, &mut renderer)
 }
 
 /// Compute the height of an inline node (used as a line box).
@@ -453,6 +673,7 @@ fn compute_flex_children(
     parent_y: f32,
     available_width: f32,
     depth: usize,
+    text_renderer: &mut crate::render::text::TextRenderer,
 ) {
     if depth > MAX_LAYOUT_DEPTH {
         return;
@@ -917,10 +1138,24 @@ fn compute_flex_children(
 
         match child.display {
             DisplayType::Flex | DisplayType::InlineFlex => {
-                compute_flex_children(child, inner_x, inner_y, inner_width, depth + 1);
+                compute_flex_children(
+                    child,
+                    inner_x,
+                    inner_y,
+                    inner_width,
+                    depth + 1,
+                    text_renderer,
+                );
             }
             _ => {
-                compute_block_children(child, inner_x, inner_y, inner_width, depth + 1);
+                compute_block_children(
+                    child,
+                    inner_x,
+                    inner_y,
+                    inner_width,
+                    depth + 1,
+                    text_renderer,
+                );
             }
         }
     }
@@ -955,6 +1190,448 @@ fn compute_flex_children(
         + parent.border[0]
         + parent.padding[2]
         + parent.border[2];
+}
+
+/// Check if a string contains only collapsible whitespace characters.
+fn is_collapsible_whitespace(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r')
+}
+
+/// Build inline boxes from the children of a block container.
+///
+/// Collects consecutive text nodes and inline elements into [`InlineBox`] entries:
+/// - Text nodes with non-whitespace content become [`InlineBox::Text`].
+/// - Whitespace-only text nodes become [`InlineBox::Whitespace`] with `collapsible: true`.
+/// - Inline element children become [`InlineBox::Element`].
+///
+/// Dimensions (`width`, `height`, `baseline_offset`) are set to `0.0` here and
+/// filled in during line-breaking (Step A3/A4) when text measurement occurs.
+fn build_inline_boxes(_parent: &LayoutNode, children: &[LayoutNode]) -> Vec<InlineBox> {
+    let mut boxes = Vec::new();
+
+    for (idx, child) in children.iter().enumerate() {
+        if let Some(ref text) = child.text {
+            // Whitespace-only text nodes are marked as collapsible
+            if is_collapsible_whitespace(text) {
+                boxes.push(InlineBox::Whitespace {
+                    collapsible: true,
+                    width: 0.0,
+                });
+            } else {
+                boxes.push(InlineBox::Text {
+                    text: text.clone(),
+                    width: 0.0, // measured in Step A3 with TextRenderer
+                    color: child.color,
+                    font_size: 16.0, // default; will be enriched when CSS font-size is on LayoutNode
+                });
+            }
+        } else if matches!(
+            child.display,
+            DisplayType::Inline | DisplayType::InlineBlock
+        ) {
+            boxes.push(InlineBox::Element {
+                child_index: idx,
+                width: 0.0,           // filled in during line breaking
+                height: 0.0,          // filled in during line breaking
+                baseline_offset: 0.0, // filled in Step A4
+            });
+        }
+        // Block children are not part of inline formatting context — skip them
+    }
+
+    boxes
+}
+
+/// Build inline boxes from a specific slice of children (for inline runs within compute_block_children).
+/// Like `build_inline_boxes` but indices are relative to the slice start.
+fn build_inline_boxes_from_slice(_parent: &LayoutNode, children: &[LayoutNode]) -> Vec<InlineBox> {
+    let mut boxes = Vec::new();
+
+    for (idx, child) in children.iter().enumerate() {
+        if let Some(ref text) = child.text {
+            if is_collapsible_whitespace(text) {
+                boxes.push(InlineBox::Whitespace {
+                    collapsible: true,
+                    width: 0.0,
+                });
+            } else {
+                boxes.push(InlineBox::Text {
+                    text: text.clone(),
+                    width: 0.0,
+                    color: child.color,
+                    font_size: 16.0,
+                });
+            }
+        } else if matches!(
+            child.display,
+            DisplayType::Inline | DisplayType::InlineBlock
+        ) {
+            boxes.push(InlineBox::Element {
+                child_index: idx,
+                width: child.rect.width,
+                height: child.rect.height,
+                baseline_offset: 0.0,
+            });
+        }
+    }
+
+    boxes
+}
+
+/// Collect rect positions from line boxes back into LayoutNode children.
+///
+/// Walks the line boxes and for each inline box updates the corresponding
+/// LayoutNode child's `rect` to reflect its position within the line.
+/// Text nodes get positioned at the line top with line-height extent.
+/// Inline elements are baseline-aligned.
+fn position_inline_children_in_lines(
+    children: &mut [LayoutNode],
+    line_boxes: &[LineBox],
+    parent_x: f32,
+    line_area_y: f32,
+) {
+    // First pass: collect positions for all children based on inline box data.
+    // We track a child_idx that walks through the children slice matching
+    // text/whitespace children to their corresponding InlineBox entries.
+    // Element boxes carry explicit child_index for direct mapping.
+
+    // Build a position map: child_index -> (x, y, width, height)
+    let mut positions: Vec<(usize, f32, f32, f32, f32)> = Vec::new();
+    let mut text_child_idx: usize = 0;
+
+    for line in line_boxes {
+        let baseline_y = line.baseline_y;
+        let line_top = line.y;
+
+        let mut x_offset = parent_x
+            + if children.is_empty() {
+                0.0
+            } else {
+                children[0].margin[3]
+            };
+
+        for box_item in &line.boxes {
+            match box_item {
+                InlineBox::Text {
+                    width, font_size, ..
+                } => {
+                    // Map this text box to the corresponding text child
+                    while text_child_idx < children.len() {
+                        if children[text_child_idx].text.is_some() {
+                            let line_h = *font_size * 1.2;
+                            positions.push((
+                                text_child_idx,
+                                x_offset,
+                                line_top + line_area_y,
+                                *width,
+                                line_h,
+                            ));
+                            text_child_idx += 1;
+                            break;
+                        } else {
+                            // Skip non-text children (inline elements) for text mapping
+                            text_child_idx += 1;
+                        }
+                    }
+                    x_offset += *width;
+                }
+                InlineBox::Element {
+                    child_index,
+                    width,
+                    height,
+                    baseline_offset,
+                } => {
+                    if *child_index < children.len() {
+                        let elem_bottom = baseline_y + line_area_y - *baseline_offset;
+                        let elem_y = elem_bottom - *height;
+                        positions.push((
+                            *child_index,
+                            x_offset,
+                            elem_y,
+                            (*width).max(1.0),
+                            (*height).max(1.0),
+                        ));
+                    }
+                    x_offset += *width;
+                }
+                InlineBox::Whitespace { width, .. } => {
+                    // Whitespace maps to text-only children that have whitespace text
+                    while text_child_idx < children.len() {
+                        if let Some(ref t) = children[text_child_idx].text {
+                            if is_collapsible_whitespace(t) {
+                                positions.push((
+                                    text_child_idx,
+                                    x_offset,
+                                    line_top + line_area_y,
+                                    *width,
+                                    0.0,
+                                ));
+                                text_child_idx += 1;
+                                break;
+                            }
+                        }
+                        // If it's not a whitespace child, we might have an offset
+                        // Just continue to next child for this whitespace entry
+                    }
+                    x_offset += *width;
+                }
+            }
+        }
+    }
+
+    // Apply collected positions to children (mutable access, no borrow conflict)
+    for &(idx, px, py, pw, ph) in &positions {
+        if idx < children.len() {
+            children[idx].rect.x = px;
+            children[idx].rect.y = py;
+            if pw > 0.0 {
+                children[idx].rect.width = pw;
+            }
+            if ph > 0.0 {
+                children[idx].rect.height = ph;
+            }
+        }
+    }
+}
+
+/// Break inline boxes into line boxes based on available width.
+///
+/// Text is measured using the `TextRenderer`, and lines wrap at word boundaries.
+/// Whitespace at line boundaries is collapsed. If a single word exceeds the
+/// available width it overflows rather than being split mid-word.
+///
+/// Baseline alignment:
+/// - The line's reference baseline is determined by the largest font size on the line.
+/// - `ascender` = max_font_size * 0.8, `descender` = max_font_size * 0.2.
+/// - Line height = ascender + descender + leading (= max_font_size * 1.2).
+/// - `baseline_y = y + ascender`.
+/// - Smaller text shares the same baseline; its shorter ascender means it sits
+///   visually above the shared baseline, which matches CSS inline alignment.
+/// - Inline elements get `baseline_offset = element_height * 0.7` (typical vertical-align baseline).
+pub fn break_into_lines(
+    inline_boxes: Vec<InlineBox>,
+    available_width: f32,
+    text_renderer: &mut crate::render::text::TextRenderer,
+) -> Vec<LineBox> {
+    let mut line_boxes = Vec::new();
+    let mut current_line_boxes: Vec<InlineBox> = Vec::new();
+    let mut current_line_width: f32 = 0.0;
+    let mut current_line_max_font_size: f32 = 0.0;
+    let mut line_y: f32 = 0.0;
+
+    // Helper to flush the current line into a LineBox
+    let flush_line = |line_boxes: &mut Vec<LineBox>,
+                      boxes: &mut Vec<InlineBox>,
+                      width: &mut f32,
+                      max_font_size: &mut f32,
+                      line_y: &mut f32| {
+        // Remove trailing collapsible whitespace before flushing
+        while let Some(InlineBox::Whitespace {
+            collapsible: true, ..
+        }) = boxes.last()
+        {
+            boxes.pop();
+        }
+
+        // Determine reference font size for this line (largest text on the line)
+        let ref_font = if *max_font_size > 0.0 {
+            *max_font_size
+        } else {
+            // Default line height when no text is present
+            16.0
+        };
+
+        // Baseline metrics:
+        //   ascender   = ref_font * 0.8  (distance from baseline to top of caps)
+        //   descender  = ref_font * 0.2  (distance from baseline to bottom of descenders)
+        //   leading    = ref_font * 0.2  (extra space between lines)
+        //   total height = ascender + descender + leading = ref_font * 1.2
+        let ascender = ref_font * 0.8;
+        let _descender = ref_font * 0.2; // used conceptually for bottom edge calc
+        let height = ref_font * 1.2;
+
+        let baseline_y = *line_y + ascender;
+
+        line_boxes.push(LineBox {
+            y: *line_y,
+            baseline_y,
+            height,
+            boxes: std::mem::take(boxes),
+        });
+
+        *width = 0.0;
+        *max_font_size = 0.0;
+        *line_y += height;
+    };
+
+    for box_item in inline_boxes {
+        match &box_item {
+            InlineBox::Text {
+                text,
+                width: _,
+                color: _,
+                font_size,
+            } => {
+                let mut words: Vec<&str> = text.split_whitespace().collect();
+                let has_spaces = text.contains(' ') || text.contains('\t') || text.contains('\n');
+
+                // If the text contains no whitespace separators it's a single "word"
+                if words.is_empty() && !text.trim().is_empty() {
+                    words.push(text.trim());
+                }
+
+                for word in &words {
+                    let (word_width, _word_height) =
+                        text_renderer.measure(word, *font_size, "sans-serif");
+
+                    // Space width between words
+                    let space_width = if has_spaces && current_line_boxes.is_empty() {
+                        0.0
+                    } else if has_spaces && !current_line_boxes.is_empty() {
+                        let (sw, _) = text_renderer.measure(" ", *font_size, "sans-serif");
+                        sw
+                    } else {
+                        0.0
+                    };
+
+                    let tentative = current_line_width + space_width + word_width;
+
+                    if tentative > available_width && !current_line_boxes.is_empty() {
+                        // Flush current line and start a new one
+                        flush_line(
+                            &mut line_boxes,
+                            &mut current_line_boxes,
+                            &mut current_line_width,
+                            &mut current_line_max_font_size,
+                            &mut line_y,
+                        );
+                    }
+
+                    // Add the word as a Text box (space prefix not added to text content,
+                    // width is tracked separately). The y_offset within the line is implicit:
+                    // text boxes sit with their ascender above the shared baseline.
+                    let total_word = space_width + word_width;
+                    current_line_boxes.push(InlineBox::Text {
+                        text: word.to_string(),
+                        width: word_width,
+                        color: None, // will be enriched from parent during render
+                        font_size: *font_size,
+                    });
+
+                    // Add space width between words as a non-collapsible whitespace entry
+                    if space_width > 0.0 {
+                        current_line_boxes.push(InlineBox::Whitespace {
+                            collapsible: false,
+                            width: space_width,
+                        });
+                    }
+
+                    current_line_width += total_word;
+                    if *font_size > current_line_max_font_size {
+                        current_line_max_font_size = *font_size;
+                    }
+                }
+            }
+            InlineBox::Element {
+                child_index,
+                width,
+                height,
+                baseline_offset: _,
+            } => {
+                let est_width = (*width).max(1.0); // at least 1px for inline elements
+                let est_height = (*height).max(1.0);
+
+                if (current_line_width + est_width > available_width)
+                    && !current_line_boxes.is_empty()
+                {
+                    flush_line(
+                        &mut line_boxes,
+                        &mut current_line_boxes,
+                        &mut current_line_width,
+                        &mut current_line_max_font_size,
+                        &mut line_y,
+                    );
+                }
+
+                // baseline_offset = distance from bottom of element to shared baseline.
+                // For typical inline elements (img, span), 0.7 of element height is standard.
+                let elem_baseline_offset = est_height * 0.7;
+
+                current_line_boxes.push(InlineBox::Element {
+                    child_index: *child_index,
+                    width: est_width,
+                    height: est_height,
+                    baseline_offset: elem_baseline_offset,
+                });
+                current_line_width += est_width;
+            }
+            InlineBox::Whitespace { collapsible, width } => {
+                if *collapsible {
+                    // Skip collapsible whitespace at the start of a line
+                    if current_line_boxes.is_empty() {
+                        continue;
+                    }
+                    // At the end of a line it will be trimmed during flush
+                    // Add as a single space-width marker
+                    let last = current_line_boxes.last();
+                    // If the last item is already whitespace, skip (collapse consecutive)
+                    if matches!(last, Some(InlineBox::Whitespace { .. })) {
+                        continue;
+                    }
+
+                    // Estimate space width from max font size on this line
+                    let fs = if current_line_max_font_size > 0.0 {
+                        current_line_max_font_size
+                    } else {
+                        16.0
+                    };
+                    let (sw, _) = text_renderer.measure(" ", fs, "sans-serif");
+
+                    if current_line_width + sw > available_width {
+                        // Flush line; trailing whitespace will be trimmed
+                        flush_line(
+                            &mut line_boxes,
+                            &mut current_line_boxes,
+                            &mut current_line_width,
+                            &mut current_line_max_font_size,
+                            &mut line_y,
+                        );
+                        continue;
+                    }
+
+                    current_line_boxes.push(InlineBox::Whitespace {
+                        collapsible: true,
+                        width: sw,
+                    });
+                    current_line_width += sw;
+                } else {
+                    // Non-collapsible whitespace (e.g., space between words we inserted)
+                    // Already handled in the text path above, so just use the pre-set width
+                    let sw = (*width).max(1.0);
+                    current_line_boxes.push(InlineBox::Whitespace {
+                        collapsible: false,
+                        width: sw,
+                    });
+                    current_line_width += sw;
+                }
+            }
+        }
+    }
+
+    // Flush remaining content
+    if !current_line_boxes.is_empty() {
+        flush_line(
+            &mut line_boxes,
+            &mut current_line_boxes,
+            &mut current_line_width,
+            &mut current_line_max_font_size,
+            &mut line_y,
+        );
+    }
+
+    line_boxes
 }
 
 /// Flatten the layout tree into renderable rectangles with colors.
@@ -1000,16 +1677,66 @@ pub struct TextInfo {
 
 /// Collect all text nodes from the layout tree for rendering.
 ///
-/// Walks the tree and extracts nodes that have text content with valid
-/// dimensions. Each entry contains position, text, color, and font info.
+/// When a node has `line_boxes` (inline layout was computed), walks through
+/// each LineBox's inline boxes and extracts TextInfo from `InlineBox::Text`
+/// entries with positions derived from the parent rect origin, line y offset,
+/// and accumulated horizontal offset within the line.
+///
+/// When `line_boxes` is None, falls back to the recursive tree walk for
+/// block-level text nodes.
 pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
     let mut texts = Vec::new();
 
-    if let Some(ref text) = node.text {
+    // If this node has inline layout (line_boxes), walk them instead of recursing
+    // into children for text collection — the line boxes hold the authoritative
+    // positions and word-split text fragments.
+    if let Some(ref line_boxes) = node.line_boxes {
+        let base_x = node.rect.x + node.padding[3] + node.border[3];
+        let base_y = node.rect.y + node.padding[0] + node.border[0];
+
+        for line in line_boxes {
+            let line_y = base_y + line.y;
+            let mut x_offset = base_x;
+
+            for box_item in &line.boxes {
+                match box_item {
+                    InlineBox::Text {
+                        text,
+                        width,
+                        color,
+                        font_size,
+                    } => {
+                        if !text.trim().is_empty() {
+                            // Use CSS `color` (foreground), default to black
+                            let text_color = color.unwrap_or([0, 0, 0, 255]);
+
+                            texts.push(TextInfo {
+                                x: x_offset,
+                                y: line_y,
+                                width: *width,
+                                text: text.clone(),
+                                color: text_color,
+                                font_size: *font_size,
+                            });
+                        }
+                        x_offset += *width;
+                    }
+                    InlineBox::Element { width, .. } => {
+                        // Inline elements are just spacing in the line — skip for text
+                        x_offset += *width;
+                    }
+                    InlineBox::Whitespace { width, .. } => {
+                        // Whitespace is just horizontal spacing — skip
+                        x_offset += *width;
+                    }
+                }
+            }
+        }
+    } else if let Some(ref text) = node.text {
+        // Fallback: no inline layout was computed, use the block-level approach.
         if !text.trim().is_empty() && node.rect.width > 0.0 && node.rect.height > 0.0 {
-            // Determine text color: use the node's background_color as a hint,
-            // but default to black for text rendering
-            let color = node.background_color.unwrap_or([0, 0, 0, 255]);
+            // Use CSS `color` (foreground) as text color, default to black
+            let color = node.color.unwrap_or([0, 0, 0, 255]);
 
             texts.push(TextInfo {
                 x: node.rect.x,
@@ -1070,9 +1797,27 @@ pub fn collect_image_nodes(node: &LayoutNode) -> Vec<ImageInfo> {
     images
 }
 
+/// Given a LineBox, return (line_top, baseline_y, line_bottom, line_height).
+///
+/// Returns the top edge of the line box, the baseline position for text
+/// alignment, the bottom edge including descenders, and the total height.
+pub fn line_box_metrics(line: &LineBox) -> (f32, f32, f32, f32) {
+    let line_top = line.y;
+    let baseline_y = line.baseline_y;
+    let line_bottom = line.y + line.height;
+    let line_height = line.height;
+    (line_top, baseline_y, line_bottom, line_height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper to run compute_layout with a fresh TextRenderer for tests.
+    fn test_compute_layout(root: &mut LayoutNode, page_width: f32) {
+        let mut renderer = crate::render::text::TextRenderer::new();
+        compute_layout(root, page_width, &mut renderer);
+    }
 
     #[test]
     fn rect_contains() {
@@ -1164,7 +1909,7 @@ mod tests {
             LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
         root.add_child(child2);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
         // child1 should start below root padding
         assert!(root.children[0].rect.y >= 10.0);
         // child2 should be below child1
@@ -1223,7 +1968,7 @@ mod tests {
         root.add_child(child1);
         root.add_child(child2);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // Both children have basis=0 and no grow → both get full container width split evenly via shrink
         // Actually with no grow, no basis, the free_space = 800 - 0 = 800 > 0 but total_grow = 0
@@ -1249,7 +1994,7 @@ mod tests {
         root.add_child(child1);
         root.add_child(child2);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // Each should get ~400px width (half of 800)
         assert!((root.children[0].rect.width - 400.0).abs() < 1.0);
@@ -1273,7 +2018,7 @@ mod tests {
         root.add_child(child1);
         root.add_child(child2);
 
-        compute_layout(&mut root, 900.0);
+        test_compute_layout(&mut root, 900.0);
 
         // 2:1 ratio → child1 gets 600px, child2 gets 300px
         assert!((root.children[0].rect.width - 600.0).abs() < 1.0);
@@ -1296,7 +2041,7 @@ mod tests {
         root.add_child(child1);
         root.add_child(child2);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // Children should have full width
         assert!((root.children[0].rect.width - 800.0).abs() < 1.0);
@@ -1324,7 +2069,7 @@ mod tests {
         root.add_child(child2);
         root.add_child(child3);
 
-        compute_layout(&mut root, 600.0);
+        test_compute_layout(&mut root, 600.0);
 
         // All items have 0 basis + no grow → all at width 0
         // Space between: 600px / 2 gaps = 300px per gap
@@ -1346,7 +2091,7 @@ mod tests {
 
         root.add_child(child1);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // Item should be centered: (800 - 200) / 2 = 300 offset
         assert!((root.children[0].rect.x - 300.0).abs() < 1.0);
@@ -1369,7 +2114,7 @@ mod tests {
         root.add_child(child1);
         root.add_child(child2);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // Overflow = 200px. Shrink weight: 1*600=600 and 1*400=400, total=1000
         // child1 shrinks by: 200 * 600/1000 = 120 → width = 480
@@ -1395,7 +2140,7 @@ mod tests {
         root.add_child(child1);
         root.add_child(child2);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // Each gets: 100 + (600/2) = 400px
         assert!((root.children[0].rect.width - 400.0).abs() < 1.0);
@@ -1420,7 +2165,7 @@ mod tests {
         root.add_child(child1);
         root.add_child(child2);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // Both on same line, side by side
         assert_eq!(root.children[0].rect.x, 0.0);
@@ -1448,7 +2193,7 @@ mod tests {
         root.add_child(child2);
         root.add_child(child3);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // First two items on line 1 (y ≈ 0)
         assert!((root.children[0].rect.y - 0.0).abs() < 1.0);
@@ -1488,7 +2233,7 @@ mod tests {
         root.add_child(child3);
         root.add_child(child4);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // Line 1: basis total = 500, free = 300. Each grows by 150 → widths: 350, 450
         assert!((root.children[0].rect.width - 350.0).abs() < 2.0);
@@ -1519,7 +2264,7 @@ mod tests {
         root.add_child(child2);
         root.add_child(child3);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // With wrap-reverse, the first line is placed at the bottom, but our implementation
         // shifts all children up so y >= 0. The key: child3 (on line 2 in normal order) should
@@ -1549,7 +2294,7 @@ mod tests {
         root.add_child(child1);
         root.add_child(child2);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // child1 starts at x=0, child2 should start at x=200+20=220
         assert!((root.children[0].rect.x - 0.0).abs() < 1.0);
@@ -1579,7 +2324,7 @@ mod tests {
         root.add_child(child2);
         root.add_child(child3);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // Line 1 items at y=0
         assert!((root.children[0].rect.y - 0.0).abs() < 1.0);
@@ -1610,7 +2355,7 @@ mod tests {
         root.add_child(child1);
         root.add_child(child2);
 
-        compute_layout(&mut root, 840.0);
+        test_compute_layout(&mut root, 840.0);
 
         // Total basis = 200, gap = 20, free_space = 840 - 200 - 20 = 620
         // Each grows by 310 → widths: 410, 410
@@ -1643,7 +2388,7 @@ mod tests {
         root.add_child(child2);
         root.add_child(child3);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // Lines total cross-size ≈ max(50, 50) + max(40, 0) = ~90 (plus gaps)
         // Container height is 300, so excess ≈ 210px should be distributed as centering
@@ -1678,7 +2423,7 @@ mod tests {
         root.add_child(child3);
         root.add_child(child4);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // Line 1 (child[0]) at top, line 2 (child[1],child[2]) in middle,
         // line 3 (child[3]) pushed to bottom area by SpaceBetween
@@ -1711,7 +2456,7 @@ mod tests {
         root.add_child(child2);
         root.add_child(child3);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // Line 1: total width 600, centered → x starts at (800-600)/2 = 100
         assert!((root.children[0].rect.x - 100.0).abs() < 2.0);
@@ -1736,7 +2481,7 @@ mod tests {
         root.add_child(child1);
         root.add_child(child2);
 
-        compute_layout(&mut root, 600.0);
+        test_compute_layout(&mut root, 600.0);
 
         // child1 on line 1 at x=0, y=0
         assert!((root.children[0].rect.x - 0.0).abs() < 1.0);
@@ -1774,7 +2519,7 @@ mod tests {
         root.add_child(child3);
         root.add_child(child4);
 
-        compute_layout(&mut root, 800.0);
+        test_compute_layout(&mut root, 800.0);
 
         // With stretch, extra height is distributed to each line's items
         // Original line heights: ~50 and ~45, with gap. Container = 400.
@@ -1921,5 +2666,710 @@ mod tests {
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].src, "https://example.com/a.png");
         assert_eq!(images[1].src, "https://example.com/b.png");
+    }
+
+    // ---- Inline Box Construction Tests (Step A2) ----
+
+    #[test]
+    fn test_build_inline_boxes_simple() {
+        // A parent with a text child and an inline element child
+        // produces [Text, Element]
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut text_child = LayoutNode::new(Rect::new(10.0, 10.0, 100.0, 20.0));
+        text_child.text = Some("Hello".to_string());
+
+        let inline_child =
+            LayoutNode::new_with_display(Rect::new(10.0, 10.0, 50.0, 20.0), DisplayType::Inline);
+
+        root.add_child(text_child);
+        root.add_child(inline_child);
+
+        let boxes = build_inline_boxes(&root, &root.children);
+
+        assert_eq!(boxes.len(), 2);
+
+        // First box is Text
+        match &boxes[0] {
+            InlineBox::Text {
+                text,
+                width: _,
+                color: _,
+                font_size: _,
+            } => {
+                assert_eq!(text.as_str(), "Hello");
+            }
+            _ => panic!("Expected Text variant"),
+        }
+
+        // Second box is Element pointing to index 1
+        match &boxes[1] {
+            InlineBox::Element {
+                child_index,
+                width: _,
+                height: _,
+                baseline_offset: _,
+            } => {
+                assert_eq!(*child_index, 1);
+            }
+            _ => panic!("Expected Element variant"),
+        }
+    }
+
+    #[test]
+    fn test_build_inline_boxes_whitespace() {
+        // Whitespace-only text nodes produce Whitespace variant with collapsible=true
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut ws_child = LayoutNode::new(Rect::new(10.0, 10.0, 50.0, 20.0));
+        ws_child.text = Some("   ".to_string());
+
+        let mut tab_child = LayoutNode::new(Rect::new(10.0, 10.0, 50.0, 20.0));
+        tab_child.text = Some("\t\n".to_string());
+
+        root.add_child(ws_child);
+        root.add_child(tab_child);
+
+        let boxes = build_inline_boxes(&root, &root.children);
+
+        assert_eq!(boxes.len(), 2);
+
+        match &boxes[0] {
+            InlineBox::Whitespace {
+                collapsible,
+                width: _,
+            } => {
+                assert!(*collapsible, "Spaces should be collapsible");
+            }
+            _ => panic!("Expected Whitespace variant"),
+        }
+
+        match &boxes[1] {
+            InlineBox::Whitespace {
+                collapsible,
+                width: _,
+            } => {
+                assert!(*collapsible, "Tab/newline should be collapsible");
+            }
+            _ => panic!("Expected Whitespace variant"),
+        }
+    }
+
+    #[test]
+    fn test_build_inline_boxes_mixed() {
+        // Text + whitespace + inline element -> [Text, Whitespace, Element]
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut text_child = LayoutNode::new(Rect::new(10.0, 10.0, 100.0, 20.0));
+        text_child.text = Some("Bold: ".to_string());
+
+        let mut ws_child = LayoutNode::new(Rect::new(60.0, 10.0, 10.0, 20.0));
+        ws_child.text = Some(" ".to_string());
+
+        let inline_child =
+            LayoutNode::new_with_display(Rect::new(70.0, 10.0, 50.0, 20.0), DisplayType::Inline);
+
+        root.add_child(text_child);
+        root.add_child(ws_child);
+        root.add_child(inline_child);
+
+        let boxes = build_inline_boxes(&root, &root.children);
+
+        assert_eq!(boxes.len(), 3);
+
+        match &boxes[0] {
+            InlineBox::Text { text, .. } => assert_eq!(text.as_str(), "Bold: "),
+            _ => panic!("Expected Text"),
+        }
+
+        match &boxes[1] {
+            InlineBox::Whitespace { collapsible, .. } => assert!(*collapsible),
+            _ => panic!("Expected Whitespace"),
+        }
+
+        match &boxes[2] {
+            InlineBox::Element { child_index, .. } => assert_eq!(*child_index, 2),
+            _ => panic!("Expected Element"),
+        }
+    }
+
+    #[test]
+    fn test_build_inline_boxes_skips_block_children() {
+        // Block-level children are not part of inline formatting context
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let block_child =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 100.0, 50.0), DisplayType::Block);
+
+        let mut text_child = LayoutNode::new(Rect::new(10.0, 10.0, 80.0, 20.0));
+        text_child.text = Some("text".to_string());
+
+        root.add_child(block_child);
+        root.add_child(text_child);
+
+        let boxes = build_inline_boxes(&root, &root.children);
+
+        // Only the text child produces an inline box; block child is skipped
+        assert_eq!(boxes.len(), 1);
+
+        match &boxes[0] {
+            InlineBox::Text { text, .. } => assert_eq!(text.as_str(), "text"),
+            _ => panic!("Expected Text variant"),
+        }
+    }
+
+    #[test]
+    fn test_build_inline_boxes_empty_children() {
+        let root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        let boxes = build_inline_boxes(&root, &root.children);
+        assert!(boxes.is_empty());
+    }
+
+    #[test]
+    fn test_build_inline_boxes_single_whitespace_collapsible() {
+        // A single space between inline elements is collapsible whitespace
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut space = LayoutNode::new(Rect::new(0.0, 0.0, 5.0, 20.0));
+        space.text = Some(" ".to_string());
+
+        root.add_child(space);
+
+        let boxes = build_inline_boxes(&root, &root.children);
+
+        assert_eq!(boxes.len(), 1);
+        match &boxes[0] {
+            InlineBox::Whitespace { collapsible, .. } => {
+                assert!(*collapsible, "Single space should be collapsible");
+            }
+            _ => panic!("Expected Whitespace variant for single space"),
+        }
+    }
+
+    #[test]
+    fn test_build_inline_boxes_non_whitespace_text_not_collapsible() {
+        // Text that contains non-whitespace chars is NOT treated as Whitespace
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut mixed = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+        mixed.text = Some(" a ".to_string()); // has non-whitespace 'a'
+
+        root.add_child(mixed);
+
+        let boxes = build_inline_boxes(&root, &root.children);
+
+        assert_eq!(boxes.len(), 1);
+        match &boxes[0] {
+            InlineBox::Text { text, .. } => assert_eq!(text.as_str(), " a "),
+            _ => panic!("Expected Text variant for mixed content"),
+        }
+    }
+
+    // ---- Line Breaking Tests (Step A3) ----
+
+    #[test]
+    fn test_line_breaking_no_wrap() {
+        // Short text that fits within available width stays on one line
+        let mut renderer = crate::render::text::TextRenderer::new();
+
+        let boxes = vec![InlineBox::Text {
+            text: "Hello".to_string(),
+            width: 0.0,
+            color: None,
+            font_size: 16.0,
+        }];
+
+        let lines = break_into_lines(boxes, 800.0, &mut renderer);
+
+        assert_eq!(lines.len(), 1, "Short text should fit on one line");
+        assert!(!lines[0].boxes.is_empty(), "Line should contain boxes");
+        // Line height should be font_size * 1.2 = 19.2
+        assert!((lines[0].height - 16.0 * 1.2).abs() < 0.5);
+    }
+
+    #[test]
+    fn test_line_breaking_wraps_at_words() {
+        // Long text with multiple words should break into multiple lines
+        let mut renderer = crate::render::text::TextRenderer::new();
+
+        // "The quick brown fox jumps over the lazy dog" with a narrow container
+        let boxes = vec![InlineBox::Text {
+            text: "The quick brown fox jumps over the lazy dog".to_string(),
+            width: 0.0,
+            color: None,
+            font_size: 16.0,
+        }];
+
+        // A narrow width that forces wrapping (each word ~30-70px)
+        let lines = break_into_lines(boxes, 80.0, &mut renderer);
+
+        assert!(
+            lines.len() > 1,
+            "Long text with narrow width should wrap to multiple lines"
+        );
+    }
+
+    #[test]
+    fn test_line_breaking_whitespace_collapse() {
+        // Leading and trailing whitespace on lines should be collapsed
+        let mut renderer = crate::render::text::TextRenderer::new();
+
+        let boxes = vec![
+            // Leading whitespace
+            InlineBox::Whitespace {
+                collapsible: true,
+                width: 0.0,
+            },
+            InlineBox::Text {
+                text: "Hello world".to_string(),
+                width: 0.0,
+                color: None,
+                font_size: 16.0,
+            },
+            // Trailing whitespace
+            InlineBox::Whitespace {
+                collapsible: true,
+                width: 0.0,
+            },
+        ];
+
+        let lines = break_into_lines(boxes, 800.0, &mut renderer);
+
+        assert_eq!(lines.len(), 1);
+        // Leading whitespace should be skipped, trailing trimmed during flush
+        // So the first box should be Text, not Whitespace
+        match &lines[0].boxes[0] {
+            InlineBox::Text { .. } => {} // expected
+            _ => panic!("First box should be Text after leading ws collapse"),
+        }
+    }
+
+    #[test]
+    fn test_line_breaking_single_word_overflow() {
+        // A single word wider than the container overflows rather than being split
+        let mut renderer = crate::render::text::TextRenderer::new();
+
+        let boxes = vec![InlineBox::Text {
+            text: "Supercalifragilisticexpialidocious".to_string(),
+            width: 0.0,
+            color: None,
+            font_size: 16.0,
+        }];
+
+        // Very narrow container - word won't fit but should not be split
+        let lines = break_into_lines(boxes, 30.0, &mut renderer);
+
+        assert_eq!(lines.len(), 1, "Single word should not be split");
+        assert!(
+            !lines[0].boxes.is_empty(),
+            "Line should contain the overflowing word"
+        );
+
+        // Verify the text content is intact (not truncated)
+        match &lines[0].boxes[0] {
+            InlineBox::Text { text, .. } => {
+                assert_eq!(text.as_str(), "Supercalifragilisticexpialidocious");
+            }
+            _ => panic!("Expected Text box for overflowing word"),
+        }
+    }
+
+    // ---- Baseline Alignment Tests (Step A4) ----
+
+    #[test]
+    fn test_baseline_alignment_same_size() {
+        // When all text has the same font size, baselines should be identical
+        let mut renderer = crate::render::text::TextRenderer::new();
+
+        let boxes = vec![
+            InlineBox::Text {
+                text: "Hello".to_string(),
+                width: 0.0,
+                color: None,
+                font_size: 16.0,
+            },
+            InlineBox::Whitespace {
+                collapsible: false,
+                width: 5.0,
+            },
+            InlineBox::Text {
+                text: "World".to_string(),
+                width: 0.0,
+                color: None,
+                font_size: 16.0,
+            },
+        ];
+
+        let lines = break_into_lines(boxes, 800.0, &mut renderer);
+
+        assert_eq!(lines.len(), 1, "Same-size text fits on one line");
+        // All text is 16px → max_font_size = 16.0
+        // ascender = 16.0 * 0.8 = 12.8, baseline_y = 0 + 12.8 = 12.8
+        assert!(
+            (lines[0].baseline_y - 12.8).abs() < 0.5,
+            "Baseline should be at ascender (= font_size * 0.8)"
+        );
+        // Line height = 16.0 * 1.2 = 19.2
+        assert!(
+            (lines[0].height - 19.2).abs() < 0.5,
+            "Line height should be font_size * 1.2"
+        );
+    }
+
+    #[test]
+    fn test_baseline_alignment_mixed_sizes() {
+        // Mixed font sizes: line height = largest, baseline shared across all text
+        let mut renderer = crate::render::text::TextRenderer::new();
+
+        let boxes = vec![
+            InlineBox::Text {
+                text: "Small".to_string(),
+                width: 0.0,
+                color: None,
+                font_size: 12.0, // smaller
+            },
+            InlineBox::Whitespace {
+                collapsible: false,
+                width: 5.0,
+            },
+            InlineBox::Text {
+                text: "Large".to_string(),
+                width: 0.0,
+                color: None,
+                font_size: 24.0, // larger — determines line metrics
+            },
+        ];
+
+        let lines = break_into_lines(boxes, 800.0, &mut renderer);
+
+        assert_eq!(lines.len(), 1, "Mixed-size text fits on one line");
+        // max_font_size = 24.0 (largest)
+        // ascender = 24.0 * 0.8 = 19.2
+        // baseline_y = 0 + 19.2 = 19.2
+        assert!(
+            (lines[0].baseline_y - 19.2).abs() < 0.5,
+            "Baseline should be set by largest font (24px * 0.8 = 19.2)"
+        );
+        // height = 24.0 * 1.2 = 28.8
+        assert!(
+            (lines[0].height - 28.8).abs() < 0.5,
+            "Line height should be max_font_size * 1.2"
+        );
+    }
+
+    #[test]
+    fn test_line_box_metrics() {
+        // Verify the helper function returns correct derived values
+        let line = LineBox {
+            y: 10.0,
+            baseline_y: 22.8,
+            height: 19.2,
+            boxes: Vec::new(),
+        };
+
+        let (top, baseline, bottom, height) = line_box_metrics(&line);
+
+        assert!((top - 10.0).abs() < 0.001, "top should equal y");
+        assert!(
+            (baseline - 22.8).abs() < 0.001,
+            "baseline should match line baseline_y"
+        );
+        assert!(
+            (bottom - 29.2).abs() < 0.001,
+            "bottom should equal y + height (10.0 + 19.2 = 29.2)"
+        );
+        assert!(
+            (height - 19.2).abs() < 0.001,
+            "returned height should match line height"
+        );
+    }
+
+    #[test]
+    fn test_inline_element_baseline_offset() {
+        // Inline elements get baseline_offset = height * 0.7
+        let mut renderer = crate::render::text::TextRenderer::new();
+
+        let boxes = vec![InlineBox::Element {
+            child_index: 0,
+            width: 50.0,
+            height: 40.0,
+            baseline_offset: 0.0,
+        }];
+
+        let lines = break_into_lines(boxes, 800.0, &mut renderer);
+
+        assert_eq!(lines.len(), 1);
+        match &lines[0].boxes[0] {
+            InlineBox::Element {
+                baseline_offset, ..
+            } => {
+                // expected: height (40.0) * 0.7 = 28.0
+                assert!(
+                    (*baseline_offset - 28.0).abs() < 0.5,
+                    "Element baseline_offset should be height * 0.7"
+                );
+            }
+            _ => panic!("Expected Element box"),
+        }
+    }
+
+    // ---- Inline Layout Integration Tests (Step A5) ----
+
+    #[test]
+    fn test_inline_in_block_integration() {
+        // HTML-like structure: a block container with text + inline span children.
+        // Verify that rect positions are set based on line box layout.
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 0.0));
+        root.padding = [10.0; 4];
+
+        // Text child: "Hello"
+        let mut text_child = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
+        text_child.text = Some("Hello".to_string());
+
+        // Inline element child (simulating a <span>)
+        let inline_child =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Inline);
+
+        root.add_child(text_child);
+        root.add_child(inline_child);
+
+        test_compute_layout(&mut root, 800.0);
+
+        // Root should have line_boxes computed
+        assert!(
+            root.line_boxes.is_some(),
+            "Block container with inline children should have line boxes"
+        );
+
+        let line_boxes = root.line_boxes.as_ref().unwrap();
+        assert!(!line_boxes.is_empty(), "Should have at least one line box");
+
+        // Text child should have valid dimensions after layout
+        assert!(
+            root.children[0].rect.width > 0.0,
+            "Text child should have positive width after inline layout"
+        );
+        assert!(
+            root.children[0].rect.height > 0.0,
+            "Text child should have positive height after inline layout"
+        );
+
+        // Text child should be positioned below padding
+        assert!(
+            root.children[0].rect.y >= root.padding[0],
+            "Text child y should start at or below top padding"
+        );
+
+        // Inline element child should also be positioned
+        assert!(
+            root.children[1].rect.x >= 0.0,
+            "Inline element x should be non-negative"
+        );
+    }
+
+    #[test]
+    fn test_mixed_block_and_inline() {
+        // Block children followed by inline children, both positioned correctly.
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 0.0));
+        root.padding = [10.0; 4];
+
+        // First a block child
+        let block_child =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+        root.add_child(block_child);
+
+        // Then inline children
+        let mut text_child = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
+        text_child.text = Some("After block".to_string());
+        root.add_child(text_child);
+
+        test_compute_layout(&mut root, 800.0);
+
+        // Block child should be positioned first (at y >= padding)
+        assert!(
+            root.children[0].rect.y >= root.padding[0],
+            "Block child should start at or below top padding"
+        );
+
+        // Inline text child should be positioned after the block child
+        assert!(
+            root.children[1].rect.y >= root.children[0].rect.y,
+            "Inline child should be at or below the block child"
+        );
+
+        // Both children should have valid dimensions
+        assert!(
+            root.children[0].rect.width > 0.0,
+            "Block child should have positive width"
+        );
+        assert!(
+            root.children[1].rect.width > 0.0,
+            "Inline text child should have positive width"
+        );
+    }
+
+    #[test]
+    fn test_inline_layout_with_wrapping() {
+        // Text that wraps to multiple lines within a block container.
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 0.0));
+        root.padding = [10.0; 4];
+
+        // Long text child that should wrap on a narrow width
+        let mut long_text = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
+        long_text.text =
+            Some("The quick brown fox jumps over the lazy dog again and again".to_string());
+        root.add_child(long_text);
+
+        // Use a narrow page width to force wrapping
+        test_compute_layout(&mut root, 200.0);
+
+        // Root should have multiple line boxes from wrapping
+        let line_boxes = root.line_boxes.as_ref().unwrap();
+        assert!(
+            line_boxes.len() > 1,
+            "Long text with narrow width should wrap to multiple lines, got {} line(s)",
+            line_boxes.len()
+        );
+
+        // The total height of the content should reflect multiple lines
+        let expected_min_height = line_boxes.len() as f32 * 16.0 * 1.2;
+        assert!(
+            root.children[0].rect.height > 0.0,
+            "Text child should have positive height after wrapping, got {}",
+            root.children[0].rect.height
+        );
+
+        // Root height should accommodate all lines plus padding
+        assert!(
+            root.rect.height >= expected_min_height + root.padding[0] + root.padding[2],
+            "Root height {} should fit all wrapped lines (expected >= {}) plus padding",
+            root.rect.height,
+            expected_min_height + root.padding[0] + root.padding[2]
+        );
+    }
+
+    // ---- Text Collection from Line Boxes Tests (Step A6-A7) ----
+
+    #[test]
+    fn test_collect_text_nodes_from_line_boxes() {
+        // When a LayoutNode has line_boxes, collect_text_nodes walks the line
+        // boxes instead of recursing into children for text.
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.padding = [10.0; 4];
+        root.border = [0.0; 4];
+
+        // Manually set line_boxes to simulate what compute_layout does for
+        // a block container with inline text children.
+        let line_boxes = vec![LineBox {
+            y: 0.0,
+            baseline_y: 12.8, // 16.0 * 0.8
+            height: 19.2,     // 16.0 * 1.2
+            boxes: vec![
+                InlineBox::Text {
+                    text: "Hello".to_string(),
+                    width: 50.0,
+                    color: Some([255, 0, 0, 255]), // red text
+                    font_size: 16.0,
+                },
+                InlineBox::Whitespace {
+                    collapsible: false,
+                    width: 8.0,
+                },
+                InlineBox::Text {
+                    text: "World".to_string(),
+                    width: 45.0,
+                    color: Some([0, 0, 255, 255]), // blue text
+                    font_size: 16.0,
+                },
+            ],
+        }];
+        root.line_boxes = Some(line_boxes);
+
+        let texts = collect_text_nodes(&root);
+
+        assert_eq!(
+            texts.len(),
+            2,
+            "Should find two text entries from line boxes"
+        );
+        // First text: "Hello" in red at the computed position
+        assert_eq!(texts[0].text, "Hello");
+        assert!(
+            (texts[0].x - (0.0 + 10.0)).abs() < 0.001,
+            "x = base_x = padding left"
+        );
+        assert!(
+            (texts[0].y - (0.0 + 10.0)).abs() < 0.001,
+            "y = base_y = padding top"
+        );
+        assert_eq!(texts[0].color, [255, 0, 0, 255], "Hello should be red");
+        // Second text: "World" in blue, shifted right by Hello's width + whitespace
+        assert_eq!(texts[1].text, "World");
+        assert!(
+            (texts[1].x - (10.0 + 50.0 + 8.0)).abs() < 0.001,
+            "World x = padding + Hello width + space width"
+        );
+        assert_eq!(texts[1].color, [0, 0, 255, 255], "World should be blue");
+    }
+
+    #[test]
+    fn test_collect_text_uses_foreground_color() {
+        // Text color comes from the CSS `color` property (stored in InlineBox::Text.color),
+        // NOT from background_color.
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.padding = [0.0; 4];
+        root.border = [0.0; 4];
+        // Set a green background on the container — this should NOT be used as text color
+        root.background_color = Some([0, 255, 0, 255]);
+
+        let line_boxes = vec![LineBox {
+            y: 0.0,
+            baseline_y: 12.8,
+            height: 19.2,
+            boxes: vec![InlineBox::Text {
+                text: "Foreground".to_string(),
+                width: 60.0,
+                color: Some([255, 0, 0, 255]), // red foreground CSS color
+                font_size: 16.0,
+            }],
+        }];
+        root.line_boxes = Some(line_boxes);
+
+        let texts = collect_text_nodes(&root);
+
+        assert_eq!(texts.len(), 1);
+        assert_eq!(
+            texts[0].color,
+            [255, 0, 0, 255],
+            "Text color should be the CSS foreground color (red), not background (green)"
+        );
+    }
+
+    #[test]
+    fn test_collect_text_fallback_no_line_boxes() {
+        // When line_boxes is None, collect_text_nodes falls back to the
+        // existing recursive behavior walking children.
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut text_child = LayoutNode::new(Rect::new(10.0, 10.0, 200.0, 30.0));
+        text_child.text = Some("Fallback".to_string());
+        text_child.color = Some([128, 0, 128, 255]); // purple foreground
+
+        root.add_child(text_child);
+        // line_boxes is None → fallback behavior
+
+        let texts = collect_text_nodes(&root);
+
+        assert_eq!(
+            texts.len(),
+            1,
+            "Fallback should still find text via recursion"
+        );
+        assert_eq!(texts[0].text, "Fallback");
+        assert_eq!(
+            texts[0].color,
+            [128, 0, 128, 255],
+            "Fallback should use the node's color field (purple)"
+        );
     }
 }

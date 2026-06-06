@@ -207,6 +207,10 @@ fn inherit_properties(parent: &ComputedValues, mut child: ComputedValues) -> Com
     if child.font_family.is_empty() && !parent.font_family.is_empty() {
         child.font_family = parent.font_family.clone();
     }
+    // `line-height` inherits
+    if child.line_height == 1.2 && parent.line_height != 1.2 {
+        child.line_height = parent.line_height;
+    }
     // `background_color` does NOT inherit (CSS initial = transparent)
     child
 }
@@ -439,6 +443,8 @@ pub struct ComputedValues {
     pub flex_shrink: f32,
     /// Flex basis (None = auto)
     pub flex_basis: Option<f32>,
+    /// Normalized line-height multiplier (CSS default = 1.2 for "normal").
+    pub line_height: f32,
 }
 
 impl Default for ComputedValues {
@@ -464,6 +470,7 @@ impl Default for ComputedValues {
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: None,
+            line_height: 1.2, // CSS default for "normal"
         }
     }
 }
@@ -642,6 +649,17 @@ impl ComputedValues {
             "column-gap" => {
                 if let Some(v) = parse_length(val) {
                     self.column_gap = v;
+                }
+            }
+            "line-height" => {
+                if val.eq_ignore_ascii_case("normal") {
+                    self.line_height = 1.2; // CSS default for normal
+                } else if let Ok(v) = val.parse::<f32>() {
+                    // Unitless number → normalized multiplier
+                    self.line_height = v;
+                } else if let Some(px) = parse_length(val) {
+                    // Pixel value → convert to normalized multiplier relative to font-size
+                    self.line_height = px / self.font_size;
                 }
             }
             _ => {}

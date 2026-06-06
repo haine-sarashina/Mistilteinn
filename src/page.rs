@@ -39,7 +39,8 @@ impl Page {
         );
 
         // Stage 5: Compute layout positions
-        crate::layout::compute_layout(&mut layout_root, view_width);
+        let mut text_renderer = crate::render::text::TextRenderer::new();
+        crate::layout::compute_layout(&mut layout_root, view_width, &mut text_renderer);
 
         log::info!(
             "Page pipeline complete — view: {}x{}, styles: {}, root children: {}",
@@ -207,7 +208,7 @@ mod tests {
         // zero dimensions and be filtered by collect_image_nodes (which requires
         // positive dimensions). The image_src field IS set correctly on the node —
         // this test verifies that behavior via a direct layout node check.
-        use crate::layout::{LayoutNode, LayoutDomNode};
+        use crate::layout::{LayoutDomNode, LayoutNode};
 
         let page = Page::new(
             r#"<html><body>
@@ -232,7 +233,10 @@ mod tests {
         }
 
         let img_node = find_image_node(&page.layout_root);
-        assert!(img_node.is_some(), "Expected an img node with image_src set");
+        assert!(
+            img_node.is_some(),
+            "Expected an img node with image_src set"
+        );
         assert_eq!(
             img_node.unwrap().image_src.as_deref(),
             Some("https://example.com/logo.png")

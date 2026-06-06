@@ -183,13 +183,8 @@ impl Renderer {
         // Vertex format: [x, y, uv_x, uv_y] as f32 — 6 vertices for 2 triangles
         let quad_vertices: [f32; 24] = [
             // Triangle 1
-            -1.0, -1.0, 0.0, 0.0,
-            -1.0,  1.0, 0.0, 1.0,
-             1.0,  1.0, 1.0, 1.0,
-            // Triangle 2
-            -1.0, -1.0, 0.0, 0.0,
-             1.0,  1.0, 1.0, 1.0,
-             1.0, -1.0, 1.0, 0.0,
+            -1.0, -1.0, 0.0, 0.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, // Triangle 2
+            -1.0, -1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0,
         ];
         let quad_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Quad Vertex Buffer"),
@@ -332,27 +327,28 @@ impl Renderer {
         });
 
         // Separate bind group layout for text texture + sampler
-        let text_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Text Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+        let text_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Text Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Text Pipeline Layout"),
@@ -518,22 +514,20 @@ impl Renderer {
             let text_bg = if let Some(text_tex) = self.text_texture.as_ref() {
                 let text_tex = text_tex;
                 let text_view = text_tex.create_view(&wgpu::TextureViewDescriptor::default());
-                let bg = self.device.create_bind_group(
-                    &wgpu::BindGroupDescriptor {
-                        label: Some("Text Bind Group"),
-                        layout: &self.text_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&text_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&self.text_sampler),
-                            },
-                        ],
-                    }
-                );
+                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Text Bind Group"),
+                    layout: &self.text_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&text_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.text_sampler),
+                        },
+                    ],
+                });
                 Some((text_view, bg))
             } else {
                 None
@@ -845,8 +839,7 @@ mod tests {
         let mut dest = vec![0u8; 4 * 4 * 4];
         // 2x2 source image: solid red
         let src = [
-            255, 0, 0, 255, 255, 0, 0, 255,
-            255, 0, 0, 255, 255, 0, 0, 255,
+            255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
         ];
 
         composite_image(&src, 2, 2, &mut dest, 4, 4, 1.0, 1.0);
@@ -866,8 +859,7 @@ mod tests {
         let mut dest = vec![0u8; 2 * 2 * 4];
         // Semi-transparent green (alpha = 128 ~ 0.5)
         let src = [
-            0, 255, 0, 128, 0, 255, 0, 128,
-            0, 255, 0, 128, 0, 255, 0, 128,
+            0, 255, 0, 128, 0, 255, 0, 128, 0, 255, 0, 128, 0, 255, 0, 128,
         ];
 
         composite_image(&src, 2, 2, &mut dest, 2, 2, 0.0, 0.0);

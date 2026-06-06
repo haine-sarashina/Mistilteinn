@@ -7,6 +7,7 @@
 /// - Render tree construction
 use crate::css::{
     AlignContent, AlignItems, ComputedValues, DisplayType, FlexDirection, FlexWrap, JustifyContent,
+    Overflow, PositionType,
 };
 use rustc_hash::FxHashMap;
 
@@ -138,6 +139,14 @@ pub struct LayoutNode {
     pub image_src: Option<String>,
     /// Line boxes for block containers with inline children (None = no inline layout computed yet).
     pub line_boxes: Option<Vec<LineBox>>,
+    /// Overflow behavior for clipping/scrolling.
+    pub overflow: Overflow,
+    /// Positioning type (static, relative, absolute).
+    pub position: PositionType,
+    /// Offset values: [top, right, bottom, left]
+    pub offsets: [Option<f32>; 4],
+    /// Absolutely positioned children extracted from the normal flow.
+    pub absolute_children: Vec<LayoutNode>,
 }
 
 impl LayoutNode {
@@ -164,6 +173,10 @@ impl LayoutNode {
             flex_basis: None,
             image_src: None,
             line_boxes: None,
+            overflow: Overflow::Visible,
+            position: PositionType::Static,
+            offsets: [None, None, None, None],
+            absolute_children: Vec::new(),
         }
     }
 
@@ -244,6 +257,14 @@ where
     root_layout.align_content = root_styles.align_content;
     root_layout.row_gap = root_styles.row_gap;
     root_layout.column_gap = root_styles.column_gap;
+    root_layout.overflow = root_styles.overflow_x;
+    root_layout.position = root_styles.position;
+    root_layout.offsets = [
+        root_styles.offset_top,
+        root_styles.offset_right,
+        root_styles.offset_bottom,
+        root_styles.offset_left,
+    ];
 
     if let Some(node) = root_dom {
         build_layout_children(&mut root_layout, &node.children_ids(), styles, get_node, 0);
@@ -306,6 +327,16 @@ fn build_layout_children<N, F>(
                     layout_node.flex_shrink = child_styles.flex_shrink;
                     layout_node.flex_basis = child_styles.flex_basis;
 
+                    // Copy overflow and positioning properties
+                    layout_node.overflow = child_styles.overflow_x;
+                    layout_node.position = child_styles.position;
+                    layout_node.offsets = [
+                        child_styles.offset_top,
+                        child_styles.offset_right,
+                        child_styles.offset_bottom,
+                        child_styles.offset_left,
+                    ];
+
                     // Extract image src from <img> tags
                     if node.tag_name() == "img" {
                         layout_node.image_src = node.get_attr("src");
@@ -334,6 +365,16 @@ fn build_layout_children<N, F>(
                     layout_node.margin = child_styles.margin;
                     layout_node.background_color = child_styles.background_color;
                     layout_node.color = child_styles.color;
+
+                    // Copy overflow and positioning properties
+                    layout_node.overflow = child_styles.overflow_x;
+                    layout_node.position = child_styles.position;
+                    layout_node.offsets = [
+                        child_styles.offset_top,
+                        child_styles.offset_right,
+                        child_styles.offset_bottom,
+                        child_styles.offset_left,
+                    ];
 
                     // Extract image src from <img> tags
                     if node.tag_name() == "img" {
@@ -388,6 +429,184 @@ pub fn compute_layout(
         _ => {
             compute_block_children(root, start_x, start_y, available_width, 0, text_renderer);
         }
+    }
+}
+
+/// Extract absolutely positioned children from the normal flow.
+/// This must run after `build_layout_children` and before `compute_layout`.
+///
+/// Absolutely positioned elements are removed from `node.children` and stored
+/// in `node.absolute_children` so they don't participate in block or flex layout.
+pub fn extract_absolute_children(node: &mut LayoutNode) {
+    // Collect absolute children by swapping them out (stable without drain_filter)
+    let mut abs_children: Vec<LayoutNode> = Vec::new();
+    let mut i = 0;
+    while i < node.children.len() {
+        if node.children[i].position == PositionType::Absolute {
+            abs_children.push(node.children.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+
+    node.absolute_children = abs_children;
+
+    // Recurse into remaining (normal-flow) children
+    for child in &mut node.children {
+        extract_absolute_children(child);
+    }
+}
+
+/// Apply relative positioning offsets after normal layout computation.
+///
+/// Relatively positioned elements stay in the normal flow but their rect is
+/// shifted by the specified top/right/bottom/left offsets.
+pub fn apply_relative_positioning(node: &mut LayoutNode) {
+    for child in &mut node.children {
+        if child.position == PositionType::Relative {
+            let dx = child.offsets[3].unwrap_or(0.0) - child.offsets[1].unwrap_or(0.0); // left - right
+            let dy = child.offsets[0].unwrap_or(0.0) - child.offsets[2].unwrap_or(0.0); // top - bottom
+            child.rect.x += dx;
+            child.rect.y += dy;
+        }
+        apply_relative_positioning(child);
+    }
+
+    // Also handle absolute children's descendants
+    for abs_child in &mut node.absolute_children {
+        if abs_child.position == PositionType::Relative {
+            let dx = abs_child.offsets[3].unwrap_or(0.0) - abs_child.offsets[1].unwrap_or(0.0);
+            let dy = abs_child.offsets[0].unwrap_or(0.0) - abs_child.offsets[2].unwrap_or(0.0);
+            abs_child.rect.x += dx;
+            abs_child.rect.y += dy;
+        }
+        apply_relative_positioning(abs_child);
+    }
+}
+
+/// Compute positions for absolutely positioned children relative to the containing block.
+///
+/// The `containing_block` rect defines the content box of the nearest ancestor with
+/// `position != Static`. For static ancestors, it defaults to the initial containing block.
+pub fn compute_absolute_positions(
+    node: &mut LayoutNode,
+    containing_block: Rect,
+    text_renderer: &mut crate::render::text::TextRenderer,
+) {
+    for abs_child in &mut node.absolute_children {
+        // Position based on offsets relative to containing block's content box
+        let x = containing_block.x + abs_child.offsets[3].unwrap_or(0.0); // left offset (index 3)
+        let y = containing_block.y + abs_child.offsets[0].unwrap_or(0.0); // top offset (index 0)
+
+        // Compute intrinsic dimensions for the absolute child
+        let content_height = compute_block_height_inner(abs_child, 0, text_renderer);
+        let total_height = content_height
+            + abs_child.padding[0]
+            + abs_child.padding[2]
+            + abs_child.border[0]
+            + abs_child.border[2];
+
+        // Width: if explicit width is set via rect, use it; otherwise compute from content
+        let mut total_width = if abs_child.rect.width > 0.0 {
+            abs_child.rect.width
+                - abs_child.padding[1]
+                - abs_child.padding[3]
+                - abs_child.border[1]
+                - abs_child.border[3]
+        } else {
+            // Estimate intrinsic width from content
+            let mut max_child_width = 0.0;
+            for grandchild in &abs_child.children {
+                if is_block_child(grandchild) {
+                    // For block children, they'd take full available width
+                    // Use a reasonable default based on containing block
+                    max_child_width = containing_block.width;
+                    break;
+                } else if is_inline_child(grandchild) {
+                    let child_content_h = compute_inline_height(grandchild);
+                    if child_content_h > max_child_width {
+                        max_child_width = child_content_h;
+                    }
+                }
+            }
+            if abs_child.children.is_empty() {
+                // No children: shrink to fit padding+border only
+                max_child_width = 0.0;
+            } else {
+                max_child_width = max_child_width.min(containing_block.width);
+            }
+            max_child_width
+                + abs_child.padding[1]
+                + abs_child.padding[3]
+                + abs_child.border[1]
+                + abs_child.border[3]
+        };
+
+        // Handle right/bottom offsets (if set, they constrain the box differently)
+        if abs_child.offsets[1].is_some() {
+            // Right offset: x = containing_block.right - offset_right - total_width
+            // We need to recompute width first
+            let cb_right = containing_block.right();
+            total_width = total_width.max(0.0);
+            abs_child.rect.x = cb_right - abs_child.offsets[1].unwrap_or(0.0) - total_width;
+        } else {
+            abs_child.rect.x = x;
+        }
+
+        if abs_child.offsets[2].is_some() {
+            // Bottom offset: y = containing_block.bottom - offset_bottom - total_height
+            let cb_bottom = containing_block.bottom();
+            abs_child.rect.height = total_height.max(0.0);
+            abs_child.rect.y =
+                cb_bottom - abs_child.offsets[2].unwrap_or(0.0) - abs_child.rect.height;
+        } else {
+            abs_child.rect.y = y;
+            abs_child.rect.height = total_height.max(0.0);
+        }
+
+        abs_child.rect.width = total_width.max(0.0);
+
+        // Compute layout for the absolute child's normal-flow children
+        let inner_width = (abs_child.rect.width
+            - abs_child.padding[3]
+            - abs_child.padding[1]
+            - abs_child.border[3]
+            - abs_child.border[1])
+            .max(0.0);
+
+        let inner_x = abs_child.rect.x + abs_child.padding[3] + abs_child.border[3];
+        let inner_y = abs_child.rect.y + abs_child.padding[0] + abs_child.border[0];
+
+        match abs_child.display {
+            DisplayType::Flex | DisplayType::InlineFlex => {
+                compute_flex_children(abs_child, inner_x, inner_y, inner_width, 0, text_renderer);
+            }
+            _ => {
+                compute_block_children(abs_child, inner_x, inner_y, inner_width, 0, text_renderer);
+            }
+        }
+
+        // Apply relative positioning to descendants within the absolute child
+        apply_relative_positioning(abs_child);
+
+        // Recurse: compute absolute children of this absolute node
+        let abs_content_box = Rect::new(
+            abs_child.rect.x + abs_child.padding[3] + abs_child.border[3],
+            abs_child.rect.y + abs_child.padding[0] + abs_child.border[0],
+            (abs_child.rect.width
+                - abs_child.padding[1]
+                - abs_child.padding[3]
+                - abs_child.border[1]
+                - abs_child.border[3])
+                .max(0.0),
+            (abs_child.rect.height
+                - abs_child.padding[0]
+                - abs_child.padding[2]
+                - abs_child.border[0]
+                - abs_child.border[2])
+                .max(0.0),
+        );
+        compute_absolute_positions(abs_child, abs_content_box, text_renderer);
     }
 }
 
@@ -1638,24 +1857,76 @@ pub fn break_into_lines(
 ///
 /// Collects all nodes that have a background color, plus leaf text nodes
 /// that have computed dimensions. Used to bridge layout tree to renderer.
+/// Delegates to [`collect_render_rects_with_clipping`] with an empty clip stack.
 pub fn collect_render_rects(node: &LayoutNode) -> Vec<(Rect, Option<[u8; 4]>)> {
+    let mut clip_stack = Vec::new();
     let mut rects = Vec::new();
+    collect_render_rects_with_clipping(node, &mut clip_stack, &mut rects);
+    rects
+}
 
-    if node.background_color.is_some() {
-        rects.push((node.rect, node.background_color));
+/// Clip-aware variant of [`collect_render_rects`].
+///
+/// Walks the layout tree and collects (Rect, Option<[u8; 4]>) tuples.
+/// When a node's `overflow` is not `Visible`, its content box is pushed onto
+/// `clip_stack` so all descendant rects are clipped to that region.
+pub fn collect_render_rects_with_clipping(
+    node: &LayoutNode,
+    clip_stack: &mut Vec<Rect>,
+    out: &mut Vec<(Rect, Option<[u8; 4]>)>,
+) {
+    // Push a clip region if this node clips its children
+    let pushed_clip = match node.overflow {
+        Overflow::Visible => false,
+        _ => {
+            clip_stack.push(node.content_box());
+            true
+        }
+    };
+
+    // Recurse into children (their rects may be clipped by this node's overflow)
+    for child in &node.children {
+        collect_render_rects_with_clipping(child, clip_stack, out);
     }
 
-    for child in &node.children {
-        rects.extend(collect_render_rects(child));
+    // Also collect from absolutely positioned children (rendered on top)
+    for abs_child in &node.absolute_children {
+        collect_render_rects_with_clipping(abs_child, clip_stack, out);
+    }
+
+    // Pop the clip region we pushed
+    if pushed_clip {
+        clip_stack.pop();
+    }
+
+    // Collect this node's own rect(s), clipped by the current clip stack
+    if node.background_color.is_some() {
+        add_clipped_rect(node.rect, node.background_color, clip_stack, out);
     }
 
     if node.text.is_some() && node.background_color.is_none() {
         if node.rect.width > 0.0 && node.rect.height > 0.0 {
-            rects.push((node.rect, Some([0, 0, 0, 255])));
+            add_clipped_rect(node.rect, Some([0, 0, 0, 255]), clip_stack, out);
         }
     }
+}
 
-    rects
+/// Add a rect to the output, intersecting it with every clip region on the stack.
+/// If the rect falls entirely outside any clip region, it is skipped.
+fn add_clipped_rect(
+    rect: Rect,
+    color: Option<[u8; 4]>,
+    clip_stack: &[Rect],
+    out: &mut Vec<(Rect, Option<[u8; 4]>)>,
+) {
+    let mut current = rect;
+    for clip in clip_stack {
+        match current.intersect(clip) {
+            Some(intersection) => current = intersection,
+            None => return, // Fully outside clip region
+        }
+    }
+    out.push((current, color));
 }
 
 /// Information about a text node for rasterization.
@@ -1753,6 +2024,11 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
         texts.extend(collect_text_nodes(child));
     }
 
+    // Also collect from absolutely positioned children
+    for abs_child in &node.absolute_children {
+        texts.extend(collect_text_nodes(abs_child));
+    }
+
     texts
 }
 
@@ -1792,6 +2068,11 @@ pub fn collect_image_nodes(node: &LayoutNode) -> Vec<ImageInfo> {
 
     for child in &node.children {
         images.extend(collect_image_nodes(child));
+    }
+
+    // Also collect from absolutely positioned children
+    for abs_child in &node.absolute_children {
+        images.extend(collect_image_nodes(abs_child));
     }
 
     images
@@ -3371,5 +3652,485 @@ mod tests {
             [128, 0, 128, 255],
             "Fallback should use the node's color field (purple)"
         );
+    }
+
+    #[test]
+    fn test_layout_node_defaults() {
+        // LayoutNode::new() has correct defaults for overflow/position/offsets fields
+        let node = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        assert_eq!(node.overflow, Overflow::Visible);
+        assert_eq!(node.position, PositionType::Static);
+        assert_eq!(node.offsets, [None, None, None, None]);
+        assert!(node.absolute_children.is_empty());
+    }
+
+    #[test]
+    fn test_layout_node_copies_position() {
+        // Verify build_layout_tree copies position/offsets from computed styles.
+        let arena = crate::html::parse_html(
+            r#"<div style="position:relative; top:10px; left:-5px"><p>child</p></div>"#,
+        );
+
+        let stylesheet = crate::css::parser::parse_stylesheet(
+            "div { position: relative; top: 10px; left: -5px; }",
+        );
+        let styles = crate::css::compute_styles_for_tree(&arena, &stylesheet);
+
+        // Find the div node ID
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
+        });
+        drop(nodes);
+
+        let div_id = div_id.expect("Expected to find a <div> node");
+
+        // Build layout tree starting from the div
+        let root_layout = build_layout_tree(
+            div_id as u32,
+            &styles,
+            |id| {
+                let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(id));
+                arena.get(handle)
+            },
+            800.0,
+        );
+
+        assert_eq!(root_layout.position, PositionType::Relative);
+        assert_eq!(root_layout.offsets[0], Some(10.0)); // top = 10px
+        assert_eq!(root_layout.offsets[3], Some(-5.0)); // left = -5px
+    }
+
+    // ---- Positioning Tests (Track D) ----
+
+    #[test]
+    fn test_relative_positioning_shifts_rect() {
+        // A relative element with top:20px and left:30px shifts down/right by those amounts
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.padding = [10.0; 4];
+
+        let mut child =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+        child.position = PositionType::Relative;
+        child.offsets = [Some(20.0), None, None, Some(30.0)]; // top=20, left=30
+
+        root.add_child(child);
+        test_compute_layout(&mut root, 800.0);
+
+        let original_x = 10.0; // root padding left
+        let original_y = 10.0; // root padding top
+
+        apply_relative_positioning(&mut root);
+
+        assert!(
+            (root.children[0].rect.x - (original_x + 30.0)).abs() < 1.0,
+            "x should shift right by left offset (30)"
+        );
+        assert!(
+            (root.children[0].rect.y - (original_y + 20.0)).abs() < 1.0,
+            "y should shift down by top offset (20)"
+        );
+    }
+
+    #[test]
+    fn test_relative_positioning_negative_offsets() {
+        // Negative offsets shift in the opposite direction
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.padding = [10.0; 4];
+
+        let mut child =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+        child.position = PositionType::Relative;
+        child.offsets = [Some(-15.0), None, None, Some(-25.0)]; // top=-15, left=-25
+
+        root.add_child(child);
+        test_compute_layout(&mut root, 800.0);
+
+        let before_x = root.children[0].rect.x;
+        let before_y = root.children[0].rect.y;
+
+        apply_relative_positioning(&mut root);
+
+        assert!(
+            (root.children[0].rect.x - (before_x - 25.0)).abs() < 1.0,
+            "x should shift left by negative left offset"
+        );
+        assert!(
+            (root.children[0].rect.y - (before_y - 15.0)).abs() < 1.0,
+            "y should shift up by negative top offset"
+        );
+    }
+
+    #[test]
+    fn test_absolute_removed_from_flow() {
+        // An absolute child is extracted and does not affect sibling positioning
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.padding = [10.0; 4];
+
+        let sibling_before =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+
+        let mut abs_child =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 100.0, 50.0), DisplayType::Block);
+        abs_child.position = PositionType::Absolute;
+        abs_child.offsets = [Some(5.0), None, None, Some(10.0)];
+
+        let sibling_after =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+
+        root.add_child(sibling_before);
+        root.add_child(abs_child);
+        root.add_child(sibling_after);
+
+        extract_absolute_children(&mut root);
+
+        assert_eq!(
+            root.children.len(),
+            2,
+            "Absolute child should be removed from normal flow"
+        );
+        assert_eq!(
+            root.absolute_children.len(),
+            1,
+            "One absolute child extracted"
+        );
+        assert!(root.children[0].position != PositionType::Absolute);
+        assert!(root.children[1].position != PositionType::Absolute);
+    }
+
+    #[test]
+    fn test_absolute_positioned_from_ancestor() {
+        // Absolute child positioned relative to containing block's content box
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.padding = [20.0; 4];
+        root.border = [5.0; 4];
+
+        let mut abs_child =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+        abs_child.position = PositionType::Absolute;
+        abs_child.offsets = [Some(10.0), None, None, Some(20.0)]; // top=10, left=20
+
+        root.add_child(abs_child);
+        extract_absolute_children(&mut root);
+
+        let mut renderer = crate::render::text::TextRenderer::new();
+        test_compute_layout(&mut root, 800.0);
+
+        let containing_block = Rect::new(
+            root.padding[3] + root.border[3], // 25
+            root.padding[0] + root.border[0], // 25
+            (root.rect.width - root.padding[1] - root.padding[3] - root.border[1] - root.border[3])
+                .max(0.0),
+            (root.rect.height
+                - root.padding[0]
+                - root.padding[2]
+                - root.border[0]
+                - root.border[2])
+                .max(0.0),
+        );
+
+        compute_absolute_positions(&mut root, containing_block, &mut renderer);
+
+        // x should be cb.x + left_offset = 25 + 20 = 45
+        assert!(
+            (root.absolute_children[0].rect.x - 45.0).abs() < 1.0,
+            "x should be cb_x + left"
+        );
+        // y should be cb.y + top_offset = 25 + 10 = 35
+        assert!(
+            (root.absolute_children[0].rect.y - 35.0).abs() < 1.0,
+            "y should be cb_y + top"
+        );
+    }
+
+    #[test]
+    fn test_absolute_in_flex_skipped() {
+        // Absolutely positioned child of a flex container is excluded from flex layout
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 0.0));
+        root.display = DisplayType::Flex;
+        root.flex_direction = FlexDirection::Row;
+        root.padding = [0.0; 4];
+
+        let child1 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
+
+        let mut abs_child = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 50.0));
+        abs_child.position = PositionType::Absolute;
+
+        let child2 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
+
+        root.add_child(child1);
+        root.add_child(abs_child);
+        root.add_child(child2);
+
+        extract_absolute_children(&mut root);
+
+        // After extraction, only 2 normal-flow children remain for flex layout
+        assert_eq!(root.children.len(), 2);
+        assert_eq!(root.absolute_children.len(), 1);
+
+        test_compute_layout(&mut root, 800.0);
+
+        // Flex layout should only position the 2 remaining children
+        assert!((root.children[0].rect.x - 0.0).abs() < 1.0);
+        // child2 should be after child1 in flex order (index 1)
+        assert!(root.children[1].rect.x >= root.children[0].rect.x);
+    }
+
+    #[test]
+    fn test_absolute_sibling_ordering() {
+        // Siblings before and after an absolute child are adjacent after extraction
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.padding = [10.0; 4];
+
+        let sibling_a =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+
+        let mut abs_child =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 100.0, 50.0), DisplayType::Block);
+        abs_child.position = PositionType::Absolute;
+
+        let sibling_b =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+
+        root.add_child(sibling_a);
+        root.add_child(abs_child);
+        root.add_child(sibling_b);
+
+        extract_absolute_children(&mut root);
+
+        // sibling_a and sibling_b should now be adjacent in children vec
+        assert_eq!(root.children.len(), 2);
+
+        test_compute_layout(&mut root, 800.0);
+
+        // sibling_b should be directly below sibling_a (no gap from absolute child)
+        assert!(root.children[1].rect.y >= root.children[0].rect.bottom());
+    }
+
+    #[test]
+    fn test_collect_rects_includes_absolute() {
+        // Render rect collection includes rectangles from absolutely positioned children
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let normal_child =
+            LayoutNode::new_with_display(Rect::new(10.0, 10.0, 200.0, 100.0), DisplayType::Block);
+
+        let mut abs_child =
+            LayoutNode::new_with_display(Rect::new(50.0, 50.0, 150.0, 80.0), DisplayType::Block);
+        abs_child.background_color = Some([255, 0, 0, 255]);
+        abs_child.position = PositionType::Absolute;
+
+        root.add_child(normal_child);
+        root.absolute_children.push(abs_child);
+
+        let rects = collect_render_rects(&root);
+
+        // The absolute child has a background color and should be in the collected rects
+        assert!(
+            rects.iter().any(|(_, c)| c == &Some([255, 0, 0, 255])),
+            "Absolute child's colored rect should appear in render rects"
+        );
+    }
+
+    #[test]
+    fn test_absolute_child_with_own_children() {
+        // An absolute node with nested block children positions them correctly inside its box
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.padding = [0.0; 4];
+
+        let mut abs_child =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+        abs_child.position = PositionType::Absolute;
+        abs_child.offsets = [Some(20.0), None, None, Some(30.0)];
+        abs_child.padding = [10.0; 4];
+
+        // Add a block child inside the absolute node
+        let inner_block =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+        abs_child.add_child(inner_block);
+
+        root.add_child(abs_child);
+        extract_absolute_children(&mut root);
+
+        let mut renderer = crate::render::text::TextRenderer::new();
+        test_compute_layout(&mut root, 800.0);
+
+        let containing_block = Rect::new(0.0, 0.0, 800.0, 600.0);
+        compute_absolute_positions(&mut root, containing_block, &mut renderer);
+
+        // The absolute child should be positioned at (30, 20)
+        assert!((root.absolute_children[0].rect.x - 30.0).abs() < 1.0);
+        assert!((root.absolute_children[0].rect.y - 20.0).abs() < 1.0);
+
+        // The inner block child should be positioned within the absolute node's padding box
+        let abs_node = &root.absolute_children[0];
+        assert!(
+            abs_node.children[0].rect.x
+                >= abs_node.rect.x + abs_node.padding[3] + abs_node.border[3],
+            "Inner child x should start after absolute node's left padding+border"
+        );
+        // Note: compute_block_children sets y positions relative to 0, starting at parent.padding[0],
+        // so the inner child's y is within the absolute node's content area (positive and > 0)
+        assert!(
+            abs_node.children[0].rect.y >= abs_node.padding[0] + abs_node.border[0],
+            "Inner child y should start after absolute node's top padding+border"
+        );
+    }
+
+    #[test]
+    fn test_absolute_default_offsets_zero() {
+        // Absolute with no explicit offsets uses 0 for position (top-left of containing block)
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.padding = [0.0; 4];
+
+        let mut abs_child =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+        abs_child.position = PositionType::Absolute;
+        // offsets are all None (defaults)
+
+        root.add_child(abs_child);
+        extract_absolute_children(&mut root);
+
+        let mut renderer = crate::render::text::TextRenderer::new();
+        test_compute_layout(&mut root, 800.0);
+
+        let containing_block = Rect::new(0.0, 0.0, 800.0, 600.0);
+        compute_absolute_positions(&mut root, containing_block, &mut renderer);
+
+        // With no offsets set, defaults to (0, 0) in containing block coords
+        assert!(
+            (root.absolute_children[0].rect.x - 0.0).abs() < 1.0,
+            "x should default to 0 when left offset is None"
+        );
+        assert!(
+            (root.absolute_children[0].rect.y - 0.0).abs() < 1.0,
+            "y should default to 0 when top offset is None"
+        );
+    }
+
+    // ------ Overflow Clipping Tests ------
+
+    #[test]
+    fn test_overflow_visible_no_clipping() {
+        // When overflow is Visible, child rects are not clipped.
+        let mut child = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        child.background_color = Some([255, 0, 0, 255]);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        root.overflow = Overflow::Visible;
+        // Content box of root = rect itself since padding/border/margin are 0
+        root.add_child(child);
+
+        let rects = collect_render_rects(&root);
+        // Child should appear with its full unclipped dimensions
+        assert!(!rects.is_empty());
+        let child_rect = rects
+            .iter()
+            .find(|r| r.1 == Some([255, 0, 0, 255]))
+            .expect("child colored rect");
+        assert_eq!(child_rect.0.width, 200.0);
+        assert_eq!(child_rect.0.height, 200.0);
+    }
+
+    #[test]
+    fn test_overflow_hidden_clips_children() {
+        // When overflow is Hidden, child rects are clipped to the parent's content box.
+        let mut child = LayoutNode::new(Rect::new(50.0, 50.0, 200.0, 200.0));
+        child.background_color = Some([0, 255, 0, 255]);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        root.overflow = Overflow::Hidden;
+        // Content box = rect since padding/border/margin are all 0
+        root.add_child(child);
+
+        let rects = collect_render_rects(&root);
+        let child_rect = rects
+            .iter()
+            .find(|r| r.1 == Some([0, 255, 0, 255]))
+            .expect("child colored rect");
+        // Child rect [50,50,200x200] clipped to content box [0,0,100x100] -> [50,50,50x50]
+        assert_eq!(child_rect.0.x, 50.0);
+        assert_eq!(child_rect.0.y, 50.0);
+        assert_eq!(child_rect.0.width, 50.0);
+        assert_eq!(child_rect.0.height, 50.0);
+    }
+
+    #[test]
+    fn test_partial_rect_intersection() {
+        // A rect partially overlapping a clip region yields the intersection.
+        let mut child = LayoutNode::new(Rect::new(80.0, 0.0, 50.0, 50.0));
+        child.background_color = Some([0, 0, 255, 255]);
+
+        let mut container = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        container.overflow = Overflow::Hidden;
+        container.add_child(child);
+
+        let rects = collect_render_rects(&container);
+        let child_rect = rects
+            .iter()
+            .find(|r| r.1 == Some([0, 0, 255, 255]))
+            .expect("child rect");
+        // [80,0,50x50] clipped to [0,0,100x100] -> [80,0,20x50]
+        assert_eq!(child_rect.0.x, 80.0);
+        assert_eq!(child_rect.0.width, 20.0);
+        assert_eq!(child_rect.0.height, 50.0);
+
+        // A rect fully outside the clip region is skipped entirely
+        let mut outside = LayoutNode::new(Rect::new(150.0, 150.0, 50.0, 50.0));
+        outside.background_color = Some([255, 255, 0, 255]);
+        container.add_child(outside);
+
+        let rects2 = collect_render_rects(&container);
+        assert!(rects2.iter().all(|r| r.1 != Some([255, 255, 0, 255])));
+    }
+
+    #[test]
+    fn test_nested_overflow_containers() {
+        // Two nested overflow:hidden containers clip correctly (intersection of both).
+        let mut grandchild = LayoutNode::new(Rect::new(80.0, 80.0, 100.0, 100.0));
+        grandchild.background_color = Some([128, 128, 128, 255]);
+
+        let mut inner = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        inner.overflow = Overflow::Hidden;
+        inner.add_child(grandchild);
+
+        let mut outer = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 50.0));
+        outer.overflow = Overflow::Hidden;
+        // Outer content box = [0,0,200x50] (no padding/border/margin)
+        // Inner content box = [0,0,100x100]
+        // Grandchild [80,80,100x100] clipped to both:
+        //   vs inner [0,0,100x100] -> [80,80,20x20]
+        //   vs outer [0,0,200x50]  -> fully outside (y=80 >= outer bottom y=50) -> skipped
+        outer.add_child(inner);
+
+        let rects = collect_render_rects(&outer);
+        // Grandchild rect is fully outside the outer clip (y=80 >= outer bottom y=50)
+        assert!(rects.iter().all(|r| r.1 != Some([128, 128, 128, 255])));
+
+        // Now test with a grandchild that falls within both clips
+        let mut gc2 = LayoutNode::new(Rect::new(10.0, 10.0, 30.0, 30.0));
+        gc2.background_color = Some([64, 64, 64, 255]);
+
+        let mut inner2 = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        inner2.overflow = Overflow::Hidden;
+        inner2.add_child(gc2);
+
+        let mut outer2 = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        outer2.overflow = Overflow::Hidden;
+        outer2.add_child(inner2);
+
+        let rects2 = collect_render_rects(&outer2);
+        let gc2_rect = rects2
+            .iter()
+            .find(|r| r.1 == Some([64, 64, 64, 255]))
+            .expect("gc2 rect within both clips");
+        // Within inner [0,0,100x100] and outer [0,0,200x200] -> no clipping needed
+        assert_eq!(gc2_rect.0.x, 10.0);
+        assert_eq!(gc2_rect.0.y, 10.0);
+        assert_eq!(gc2_rect.0.width, 30.0);
+        assert_eq!(gc2_rect.0.height, 30.0);
     }
 }

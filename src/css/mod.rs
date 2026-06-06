@@ -411,6 +411,27 @@ pub enum AlignContent {
     Stretch,
 }
 
+// ------ Overflow ------
+
+/// The computed `overflow` CSS property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overflow {
+    Visible,
+    Hidden,
+    Scroll,
+    Auto,
+}
+
+// ------ Positioning ------
+
+/// The computed `position` CSS property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionType {
+    Static,
+    Relative,
+    Absolute,
+}
+
 // ------ Computed Values ------
 
 /// Fully resolved CSS property values for a single element.
@@ -445,6 +466,15 @@ pub struct ComputedValues {
     pub flex_basis: Option<f32>,
     /// Normalized line-height multiplier (CSS default = 1.2 for "normal").
     pub line_height: f32,
+    // Overflow
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
+    // Positioning
+    pub position: PositionType,
+    pub offset_top: Option<f32>,
+    pub offset_right: Option<f32>,
+    pub offset_bottom: Option<f32>,
+    pub offset_left: Option<f32>,
 }
 
 impl Default for ComputedValues {
@@ -471,6 +501,13 @@ impl Default for ComputedValues {
             flex_shrink: 1.0,
             flex_basis: None,
             line_height: 1.2, // CSS default for "normal"
+            overflow_x: Overflow::Visible,
+            overflow_y: Overflow::Visible,
+            position: PositionType::Static,
+            offset_top: None,
+            offset_right: None,
+            offset_bottom: None,
+            offset_left: None,
         }
     }
 }
@@ -662,11 +699,85 @@ impl ComputedValues {
                     self.line_height = px / self.font_size;
                 }
             }
+            "overflow" => {
+                let parsed = match val {
+                    "hidden" => Overflow::Hidden,
+                    "scroll" => Overflow::Scroll,
+                    "auto" => Overflow::Auto,
+                    _ => Overflow::Visible,
+                };
+                self.overflow_x = parsed;
+                self.overflow_y = parsed;
+            }
+            "overflow-x" => {
+                self.overflow_x = match val {
+                    "hidden" => Overflow::Hidden,
+                    "scroll" => Overflow::Scroll,
+                    "auto" => Overflow::Auto,
+                    _ => Overflow::Visible,
+                };
+            }
+            "overflow-y" => {
+                self.overflow_y = match val {
+                    "hidden" => Overflow::Hidden,
+                    "scroll" => Overflow::Scroll,
+                    "auto" => Overflow::Auto,
+                    _ => Overflow::Visible,
+                };
+            }
+            "position" => {
+                self.position = match val {
+                    "relative" => PositionType::Relative,
+                    "absolute" => PositionType::Absolute,
+                    _ => PositionType::Static,
+                };
+            }
+            "top" => {
+                self.offset_top = parse_offset(val);
+            }
+            "right" => {
+                self.offset_right = parse_offset(val);
+            }
+            "bottom" => {
+                self.offset_bottom = parse_offset(val);
+            }
+            "left" => {
+                self.offset_left = parse_offset(val);
+            }
             _ => {}
         }
 
         self
     }
+}
+
+/// Parse a CSS offset value (top/right/bottom/left) allowing negative pixels.
+/// Returns `None` for `"auto"`, `"inherit"`, or unparseable values.
+fn parse_offset(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("auto")
+        || s.eq_ignore_ascii_case("inherit")
+        || s.eq_ignore_ascii_case("static")
+    {
+        return None;
+    }
+    // Strip common unit suffixes, keeping the sign
+    let mut chars = s.chars().peekable();
+    // Collect up to the first alphabetic char (unit suffix)
+    let mut num_str = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_alphabetic() {
+            break;
+        }
+        num_str.push(c);
+        chars.next();
+    }
+    // Trim whitespace from the collected number string
+    let num_str = num_str.trim();
+    if num_str.is_empty() {
+        return None;
+    }
+    num_str.parse::<f32>().ok()
 }
 
 /// Parse a CSS length value (pixels) from a string like `"10px"` or `"10"`.
@@ -1242,5 +1353,116 @@ mod tests {
             important: false,
         });
         assert_eq!(computed.flex_wrap, FlexWrap::WrapReverse);
+    }
+
+    // ------ Overflow & Positioning Tests ------
+
+    #[test]
+    fn test_overflow_enum_visible() {
+        // Overflow enum round-trip through parsing
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "overflow".to_string(),
+            value: "hidden".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.overflow_x, Overflow::Hidden);
+        assert_eq!(computed.overflow_y, Overflow::Hidden);
+
+        // Test "visible" via overflow-x only
+        let computed2 = ComputedValues::default().from_declaration(&Declaration {
+            property: "overflow-x".to_string(),
+            value: "scroll".to_string(),
+            important: false,
+        });
+        assert_eq!(computed2.overflow_x, Overflow::Scroll);
+        assert_eq!(computed2.overflow_y, Overflow::Visible); // unchanged default
+    }
+
+    #[test]
+    fn test_position_type_relative() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "position".to_string(),
+            value: "relative".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.position, PositionType::Relative);
+
+        let computed2 = ComputedValues::default().from_declaration(&Declaration {
+            property: "position".to_string(),
+            value: "absolute".to_string(),
+            important: false,
+        });
+        assert_eq!(computed2.position, PositionType::Absolute);
+
+        // Default is static
+        let computed3 = ComputedValues::default();
+        assert_eq!(computed3.position, PositionType::Static);
+    }
+
+    #[test]
+    fn test_offset_negative_left() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "left".to_string(),
+            value: "-10px".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.offset_left, Some(-10.0));
+
+        // Test top with positive value
+        let computed2 = ComputedValues::default().from_declaration(&Declaration {
+            property: "top".to_string(),
+            value: "20px".to_string(),
+            important: false,
+        });
+        assert_eq!(computed2.offset_top, Some(20.0));
+
+        // Test bottom
+        let computed3 = ComputedValues::default().from_declaration(&Declaration {
+            property: "bottom".to_string(),
+            value: "-5px".to_string(),
+            important: false,
+        });
+        assert_eq!(computed3.offset_bottom, Some(-5.0));
+
+        // Test right
+        let computed4 = ComputedValues::default().from_declaration(&Declaration {
+            property: "right".to_string(),
+            value: "auto".to_string(),
+            important: false,
+        });
+        assert_eq!(computed4.offset_right, None); // "auto" maps to None
+    }
+
+    #[test]
+    fn test_overflow_hidden_not_inherited() {
+        // Overflow should NOT inherit from parent to child per CSS spec.
+        // Parent has overflow:hidden; child should have default visible.
+        let arena = crate::html::parse_html("<div><p>child</p></div>");
+        let stylesheet = parser::parse_stylesheet("div { overflow: hidden; }");
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
+        });
+        let p_id = nodes.iter().position(|n| {
+            n.is_element() && n.tag_name().map(|t| t.to_string() == "p").unwrap_or(false)
+        });
+
+        if let (Some(div_id), Some(p_id)) = (div_id, p_id) {
+            let div_styles = styles.get(&(div_id as u32)).expect("div has styles");
+            assert_eq!(div_styles.overflow_x, Overflow::Hidden);
+            assert_eq!(div_styles.overflow_y, Overflow::Hidden);
+
+            let p_styles = styles.get(&(p_id as u32)).expect("p has styles");
+            // Child should have default Visible, not inherited Hidden
+            assert_eq!(p_styles.overflow_x, Overflow::Visible);
+            assert_eq!(p_styles.overflow_y, Overflow::Visible);
+        } else {
+            assert!(false, "Expected to find both <div> and <p> nodes");
+        }
     }
 }

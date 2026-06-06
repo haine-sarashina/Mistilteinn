@@ -38,9 +38,38 @@ impl Page {
             view_width,
         );
 
-        // Stage 5: Compute layout positions
+        // Stage 4.5: Extract absolutely positioned children from normal flow
+        crate::layout::extract_absolute_children(&mut layout_root);
+
+        // Stage 5: Compute layout positions for normal-flow children
         let mut text_renderer = crate::render::text::TextRenderer::new();
         crate::layout::compute_layout(&mut layout_root, view_width, &mut text_renderer);
+
+        // Stage 6: Apply relative positioning offsets to shifted elements
+        crate::layout::apply_relative_positioning(&mut layout_root);
+
+        // Stage 7: Compute positions for absolutely positioned children
+        let containing_block = Rect::new(
+            layout_root.padding[3] + layout_root.border[3],
+            layout_root.padding[0] + layout_root.border[0],
+            (layout_root.rect.width
+                - layout_root.padding[1]
+                - layout_root.padding[3]
+                - layout_root.border[1]
+                - layout_root.border[3])
+                .max(0.0),
+            (layout_root.rect.height
+                - layout_root.padding[0]
+                - layout_root.padding[2]
+                - layout_root.border[0]
+                - layout_root.border[2])
+                .max(0.0),
+        );
+        crate::layout::compute_absolute_positions(
+            &mut layout_root,
+            containing_block,
+            &mut text_renderer,
+        );
 
         log::info!(
             "Page pipeline complete — view: {}x{}, styles: {}, root children: {}",

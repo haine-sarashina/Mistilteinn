@@ -368,6 +368,7 @@ pub enum DisplayType {
     Flex,
     InlineFlex,
     None,
+    Grid,
 }
 
 // ------ Flexbox Enums ------
@@ -450,6 +451,19 @@ pub enum FlexBasis {
     Percentage(f32), // stored as fraction (0.5 for 50%)
 }
 
+// ------ Grid Track Sizing ------
+
+/// The size of a single grid track (column or row).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GridTrack {
+    /// Fixed pixel width/height, e.g. "150px"
+    Fixed(f32),
+    /// Fractional unit, e.g. "1fr", "2fr"
+    Fr(f32),
+    /// Automatic sizing, i.e. "auto"
+    Auto,
+}
+
 // ------ Positioning ------
 
 /// The computed `position` CSS property.
@@ -511,6 +525,13 @@ pub struct ComputedValues {
     pub offset_right: Option<f32>,
     pub offset_bottom: Option<f32>,
     pub offset_left: Option<f32>,
+    // Grid container properties
+    pub grid_template_columns: Vec<GridTrack>,
+    pub grid_template_rows: Vec<GridTrack>,
+    pub grid_column_gap: f32,
+    pub grid_row_gap: f32,
+    // Grid item / flex item property
+    pub order: i32,
 }
 
 impl Default for ComputedValues {
@@ -549,6 +570,11 @@ impl Default for ComputedValues {
             offset_right: None,
             offset_bottom: None,
             offset_left: None,
+            grid_template_columns: Vec::new(),
+            grid_template_rows: Vec::new(),
+            grid_column_gap: 0.0,
+            grid_row_gap: 0.0,
+            order: 0,
         }
     }
 }
@@ -571,6 +597,7 @@ impl ComputedValues {
                     "flex" => DisplayType::Flex,
                     "inline-flex" => DisplayType::InlineFlex,
                     "none" => DisplayType::None,
+                    "grid" => DisplayType::Grid,
                     _ => self.display,
                 };
             }
@@ -799,6 +826,21 @@ impl ComputedValues {
             "max-width" => {
                 self.max_width = parse_length(val);
             }
+            "grid-template-columns" => {
+                self.grid_template_columns = parse_grid_track_list(val);
+            }
+            "grid-template-rows" => {
+                self.grid_template_rows = parse_grid_track_list(val);
+            }
+            "grid-column-gap" => {
+                self.grid_column_gap = parse_length(val).unwrap_or(0.0);
+            }
+            "grid-row-gap" => {
+                self.grid_row_gap = parse_length(val).unwrap_or(0.0);
+            }
+            "order" => {
+                self.order = val.parse().unwrap_or(0);
+            }
             _ => {}
         }
 
@@ -963,6 +1005,37 @@ fn parse_align_content(s: &str) -> AlignContent {
         "stretch" => AlignContent::Stretch,
         _ => AlignContent::Normal,
     }
+}
+
+/// Parse a grid track list like "1fr 1fr 200px auto" into GridTrack enums.
+fn parse_grid_track_list(value: &str) -> Vec<GridTrack> {
+    let mut tracks = Vec::new();
+    for token in value.split_whitespace() {
+        if let Some(fr_val) = token.strip_suffix('r') {
+            // Check if the character before 'r' is 'f' (i.e. "fr" suffix)
+            let bytes = fr_val.as_bytes();
+            if let Some(&last) = bytes.last() {
+                if last == b'f' {
+                    let num_str = &fr_val[..fr_val.len() - 1];
+                    if let Ok(n) = num_str.parse::<f32>() {
+                        tracks.push(GridTrack::Fr(n));
+                        continue;
+                    }
+                }
+            }
+        }
+        if token.eq_ignore_ascii_case("auto") {
+            tracks.push(GridTrack::Auto);
+            continue;
+        }
+        if let Some(px_val) = token.strip_suffix('x').and_then(|s| s.strip_suffix('p')) {
+            if let Ok(n) = px_val.parse::<f32>() {
+                tracks.push(GridTrack::Fixed(n));
+                continue;
+            }
+        }
+    }
+    tracks
 }
 
 // ------ User-Agent Stylesheet ------
@@ -1847,5 +1920,97 @@ mod tests {
             important: false,
         });
         assert_eq!(computed.box_sizing, BoxSizing::BorderBox);
+    }
+
+    // ------ Grid Property Parsing Tests ------
+
+    #[test]
+    fn test_parse_display_grid() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "display".to_string(),
+            value: "grid".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.display, DisplayType::Grid);
+    }
+
+    #[test]
+    fn test_parse_grid_track_list() {
+        // Test parsing "1fr 1fr 200px auto"
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "grid-template-columns".to_string(),
+            value: "1fr 2fr 200px auto".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.grid_template_columns.len(), 4);
+        assert_eq!(computed.grid_template_columns[0], GridTrack::Fr(1.0));
+        assert_eq!(computed.grid_template_columns[1], GridTrack::Fr(2.0));
+        assert_eq!(computed.grid_template_columns[2], GridTrack::Fixed(200.0));
+        assert_eq!(computed.grid_template_columns[3], GridTrack::Auto);
+    }
+
+    #[test]
+    fn test_parse_grid_track_list_rows() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "grid-template-rows".to_string(),
+            value: "100px 1fr auto".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.grid_template_rows.len(), 3);
+        assert_eq!(computed.grid_template_rows[0], GridTrack::Fixed(100.0));
+        assert_eq!(computed.grid_template_rows[1], GridTrack::Fr(1.0));
+        assert_eq!(computed.grid_template_rows[2], GridTrack::Auto);
+    }
+
+    #[test]
+    fn test_parse_grid_column_gap() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "grid-column-gap".to_string(),
+            value: "16px".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.grid_column_gap, 16.0);
+    }
+
+    #[test]
+    fn test_parse_grid_row_gap() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "grid-row-gap".to_string(),
+            value: "8px".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.grid_row_gap, 8.0);
+    }
+
+    #[test]
+    fn test_parse_grid_defaults() {
+        let computed = ComputedValues::default();
+        assert!(computed.grid_template_columns.is_empty());
+        assert!(computed.grid_template_rows.is_empty());
+        assert_eq!(computed.grid_column_gap, 0.0);
+        assert_eq!(computed.grid_row_gap, 0.0);
+    }
+
+    #[test]
+    fn test_parse_order() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "order".to_string(),
+            value: "5".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.order, 5);
+
+        let computed2 = ComputedValues::default().from_declaration(&Declaration {
+            property: "order".to_string(),
+            value: "-2".to_string(),
+            important: false,
+        });
+        assert_eq!(computed2.order, -2);
+    }
+
+    #[test]
+    fn test_order_default() {
+        let computed = ComputedValues::default();
+        assert_eq!(computed.order, 0);
     }
 }

@@ -7,7 +7,7 @@
 /// - Render tree construction
 use crate::css::{
     AlignContent, AlignItems, BoxSizing, ComputedValues, DisplayType, FlexBasis, FlexDirection,
-    FlexWrap, JustifyContent, Overflow, PositionType,
+    FlexWrap, GridTrack, JustifyContent, Overflow, PositionType,
 };
 use rustc_hash::FxHashMap;
 
@@ -159,6 +159,13 @@ pub struct LayoutNode {
     pub font_size: f32,
     /// Computed font family (copied from CSS ComputedValues).
     pub font_family: String,
+    /// Grid container properties
+    pub grid_columns: Vec<GridTrack>,
+    pub grid_rows: Vec<GridTrack>,
+    pub grid_column_gap: f32,
+    pub grid_row_gap: f32,
+    /// CSS order property (for flex/grid item ordering)
+    pub order: i32,
 }
 
 impl LayoutNode {
@@ -196,6 +203,11 @@ impl LayoutNode {
             absolute_children: Vec::new(),
             font_size: 16.0,
             font_family: String::new(),
+            grid_columns: Vec::new(),
+            grid_rows: Vec::new(),
+            grid_column_gap: 0.0,
+            grid_row_gap: 0.0,
+            order: 0,
         }
     }
 
@@ -297,6 +309,13 @@ where
     root_layout.max_width = root_styles.max_width;
     root_layout.flex_basis = root_styles.flex_basis;
 
+    // Copy grid properties
+    root_layout.grid_columns = root_styles.grid_template_columns.clone();
+    root_layout.grid_rows = root_styles.grid_template_rows.clone();
+    root_layout.grid_column_gap = root_styles.grid_column_gap;
+    root_layout.grid_row_gap = root_styles.grid_row_gap;
+    root_layout.order = root_styles.order;
+
     if let Some(node) = root_dom {
         build_layout_children(&mut root_layout, &node.children_ids(), styles, get_node, 0);
     }
@@ -331,14 +350,15 @@ fn build_layout_children<N, F>(
 
             match child_styles.display {
                 DisplayType::None => continue,
-                DisplayType::Block | DisplayType::Flex | DisplayType::InlineFlex => {
-                    let display = if matches!(
-                        child_styles.display,
-                        DisplayType::Flex | DisplayType::InlineFlex
-                    ) {
-                        child_styles.display
-                    } else {
-                        DisplayType::Block
+                DisplayType::Block
+                | DisplayType::Flex
+                | DisplayType::InlineFlex
+                | DisplayType::Grid => {
+                    let display = match child_styles.display {
+                        DisplayType::Flex | DisplayType::InlineFlex | DisplayType::Grid => {
+                            child_styles.display
+                        }
+                        _ => DisplayType::Block,
                     };
                     let mut layout_node =
                         LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), display);
@@ -364,6 +384,13 @@ fn build_layout_children<N, F>(
                     layout_node.explicit_height = child_styles.explicit_height;
                     layout_node.min_width = child_styles.min_width;
                     layout_node.max_width = child_styles.max_width;
+
+                    // Copy grid properties
+                    layout_node.grid_columns = child_styles.grid_template_columns.clone();
+                    layout_node.grid_rows = child_styles.grid_template_rows.clone();
+                    layout_node.grid_column_gap = child_styles.grid_column_gap;
+                    layout_node.grid_row_gap = child_styles.grid_row_gap;
+                    layout_node.order = child_styles.order;
 
                     // Copy overflow and positioning properties
                     layout_node.overflow = child_styles.overflow_x;
@@ -465,6 +492,9 @@ pub fn compute_layout(
     match root.display {
         DisplayType::Flex | DisplayType::InlineFlex => {
             compute_flex_children(root, start_x, start_y, available_width, 0, text_renderer);
+        }
+        DisplayType::Grid => {
+            compute_grid_children(root, start_x, start_y, available_width, 0, text_renderer);
         }
         _ => {
             compute_block_children(root, start_x, start_y, available_width, 0, text_renderer);
@@ -621,6 +651,9 @@ pub fn compute_absolute_positions(
             DisplayType::Flex | DisplayType::InlineFlex => {
                 compute_flex_children(abs_child, inner_x, inner_y, inner_width, 0, text_renderer);
             }
+            DisplayType::Grid => {
+                compute_grid_children(abs_child, inner_x, inner_y, inner_width, 0, text_renderer);
+            }
             _ => {
                 compute_block_children(abs_child, inner_x, inner_y, inner_width, 0, text_renderer);
             }
@@ -665,7 +698,7 @@ fn is_block_child(child: &LayoutNode) -> bool {
     !is_inline_child(child)
         && matches!(
             child.display,
-            DisplayType::Block | DisplayType::Flex | DisplayType::InlineFlex
+            DisplayType::Block | DisplayType::Flex | DisplayType::InlineFlex | DisplayType::Grid
         )
 }
 
@@ -800,6 +833,16 @@ fn compute_block_children(
                         text_renderer,
                     );
                 }
+                DisplayType::Grid => {
+                    compute_grid_children(
+                        &mut parent.children[i],
+                        inner_x,
+                        inner_y,
+                        inner_width,
+                        depth + 1,
+                        text_renderer,
+                    );
+                }
                 _ => {
                     compute_block_children(
                         &mut parent.children[i],
@@ -878,6 +921,196 @@ fn compute_block_height(node: &LayoutNode, depth: usize) -> f32 {
 fn compute_inline_height(node: &LayoutNode) -> f32 {
     let line_height = node.font_size * 1.2;
     line_height + node.padding[0] + node.padding[2]
+}
+
+// ------ CSS Grid Layout ------
+
+/// Layout grid children according to explicit column tracks.
+/// If no explicit columns are defined, falls back to block layout.
+fn compute_grid_children(
+    parent: &mut LayoutNode,
+    parent_x: f32,
+    parent_y: f32,
+    available_width: f32,
+    depth: usize,
+    text_renderer: &mut crate::render::text::TextRenderer,
+) {
+    if depth > MAX_LAYOUT_DEPTH {
+        return;
+    }
+
+    let num_cols = if parent.grid_columns.is_empty() {
+        0
+    } else {
+        parent.grid_columns.len()
+    };
+
+    if num_cols == 0 {
+        // Fallback to block layout when no explicit columns defined
+        compute_block_children(
+            parent,
+            parent_x,
+            parent_y,
+            available_width,
+            depth,
+            text_renderer,
+        );
+        return;
+    }
+
+    let num_cols = num_cols as usize;
+
+    // Step 1: Compute column widths
+    let mut fixed_total: f32 = 0.0;
+    let mut fr_total: f32 = 0.0;
+    let mut col_widths: Vec<f32> = vec![0.0; num_cols];
+
+    for (i, track) in parent.grid_columns.iter().enumerate() {
+        match track {
+            GridTrack::Fixed(w) => {
+                fixed_total += w;
+                col_widths[i] = *w;
+            }
+            GridTrack::Fr(f) => {
+                fr_total += f;
+            }
+            GridTrack::Auto => {
+                fr_total += 1.0; // treat auto as 1fr
+            }
+        }
+    }
+
+    // Subtract gaps between columns from available width
+    let gap_total = (num_cols as f32 - 1.0) * parent.grid_column_gap;
+    let remaining = (available_width - fixed_total - gap_total).max(0.0);
+
+    // Distribute remaining space proportionally among fr/auto tracks
+    for (i, track) in parent.grid_columns.iter().enumerate() {
+        match track {
+            GridTrack::Fr(f) => {
+                col_widths[i] = if fr_total > 0.0 {
+                    (f / fr_total) * remaining
+                } else {
+                    remaining / num_cols as f32
+                }
+                .max(0.0);
+            }
+            GridTrack::Auto => {
+                col_widths[i] = if fr_total > 0.0 {
+                    (1.0 / fr_total) * remaining
+                } else {
+                    remaining / num_cols as f32
+                }
+                .max(0.0);
+            }
+            _ => {} // Fixed already set above
+        }
+    }
+
+    // Step 2: Determine row count based on child count
+    let child_count = parent.children.len();
+    let num_rows = if child_count > 0 {
+        (child_count + num_cols - 1) / num_cols
+    } else {
+        0
+    };
+
+    // Step 3: Compute row heights from content
+    // Use a minimum default height of 50px for grid cells, then grow based on explicit height
+    let mut row_heights = vec![50.0f32; num_rows];
+    for idx in 0..child_count {
+        let r = idx / num_cols;
+        let h = parent.children[idx].explicit_height.unwrap_or(50.0);
+        row_heights[r] = row_heights[r].max(h);
+    }
+
+    // Step 4: Position each child at its grid cell (row-major auto placement)
+    // Child index idx maps to column = idx % num_cols, row = idx / num_cols
+    for idx in 0..child_count {
+        let col = idx % num_cols;
+        let row = idx / num_cols;
+
+        // Compute x position: sum of column widths + gaps up to this column
+        let mut x = parent_x;
+        for c in 0..col {
+            x += col_widths[c] + parent.grid_column_gap;
+        }
+
+        // Compute y position: sum of row heights + gaps up to this row
+        let mut y = parent_y;
+        for r in 0..row {
+            y += row_heights[r] + parent.grid_row_gap;
+        }
+
+        let cell_width = col_widths[col];
+        let cell_height = row_heights[row];
+
+        let child = &mut parent.children[idx];
+        child.rect.x = x;
+        child.rect.y = y;
+        child.rect.width = cell_width;
+        child.rect.height = cell_height;
+
+        // Recurse into children of this grid item
+        let inner_width = (cell_width
+            - child.margin[3]
+            - child.margin[1]
+            - child.border[3]
+            - child.border[1]
+            - child.padding[3]
+            - child.padding[1])
+            .max(0.0);
+
+        let inner_x = child.rect.x + child.padding[3] + child.border[3];
+        let inner_y = child.rect.y + child.padding[0] + child.border[0];
+
+        match child.display {
+            DisplayType::Flex | DisplayType::InlineFlex => {
+                compute_flex_children(
+                    child,
+                    inner_x,
+                    inner_y,
+                    inner_width,
+                    depth + 1,
+                    text_renderer,
+                );
+            }
+            DisplayType::Grid => {
+                compute_grid_children(
+                    child,
+                    inner_x,
+                    inner_y,
+                    inner_width,
+                    depth + 1,
+                    text_renderer,
+                );
+            }
+            _ => {
+                compute_block_children(
+                    child,
+                    inner_x,
+                    inner_y,
+                    inner_width,
+                    depth + 1,
+                    text_renderer,
+                );
+            }
+        }
+    }
+
+    // Step 5: Update parent rect to encompass all children
+    if num_cols > 0 && num_rows > 0 {
+        let total_width: f32 = col_widths.iter().sum::<f32>() + gap_total;
+        let mut total_height: f32 = 0.0;
+        for (i, &h) in row_heights.iter().enumerate() {
+            total_height += h;
+            if i < num_rows - 1 {
+                total_height += parent.grid_row_gap;
+            }
+        }
+        parent.rect.width = parent.rect.width.max(total_width);
+        parent.rect.height = parent.rect.height.max(total_height);
+    }
 }
 
 // ------ Flexbox Layout ------
@@ -1434,6 +1667,16 @@ fn compute_flex_children(
         match child.display {
             DisplayType::Flex | DisplayType::InlineFlex => {
                 compute_flex_children(
+                    child,
+                    inner_x,
+                    inner_y,
+                    inner_width,
+                    depth + 1,
+                    text_renderer,
+                );
+            }
+            DisplayType::Grid => {
+                compute_grid_children(
                     child,
                     inner_x,
                     inner_y,
@@ -4330,5 +4573,155 @@ mod tests {
             "Child with min_width should not shrink below 150px, got {}",
             root.children[0].rect.width
         );
+    }
+
+    // ------ CSS Grid Layout Tests ------
+
+    #[test]
+    fn test_grid_four_columns() {
+        // Four 1fr tracks: children fill row by row
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 0.0));
+        root.display = DisplayType::Grid;
+        root.padding = [0.0; 4];
+        root.grid_columns = vec![
+            GridTrack::Fr(1.0),
+            GridTrack::Fr(1.0),
+            GridTrack::Fr(1.0),
+            GridTrack::Fr(1.0),
+        ];
+
+        // Add 4 children (one per column)
+        for _ in 0..4 {
+            root.add_child(LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0)));
+        }
+
+        test_compute_layout(&mut root, 800.0);
+
+        // Each column should get ~200px (800 / 4)
+        for i in 0..4 {
+            assert!(
+                (root.children[i].rect.width - 200.0).abs() < 1.0,
+                "Child {} width should be ~200px, got {}",
+                i,
+                root.children[i].rect.width
+            );
+        }
+
+        // Children should be positioned left to right
+        for i in 1..4 {
+            assert!(
+                root.children[i].rect.x > root.children[i - 1].rect.x,
+                "Child {} should be to the right of child {}",
+                i,
+                i - 1
+            );
+        }
+
+        // All children on same row should have same y
+        for i in 1..4 {
+            assert!(
+                (root.children[i].rect.y - root.children[0].rect.y).abs() < 1.0,
+                "All children on same row should share y position"
+            );
+        }
+    }
+
+    #[test]
+    fn test_grid_fallback_to_block() {
+        // Grid without explicit columns falls back to block layout
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 0.0));
+        root.display = DisplayType::Grid;
+        root.padding = [10.0; 4];
+        // No grid_columns set
+
+        let child1 =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+        let child2 =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+
+        root.add_child(child1);
+        root.add_child(child2);
+
+        test_compute_layout(&mut root, 800.0);
+
+        // Children should be stacked vertically (block fallback)
+        assert!(root.children[1].rect.y >= root.children[0].rect.y);
+        // Both should have full available width minus padding
+        assert!((root.children[0].rect.width - 780.0).abs() < 5.0);
+    }
+
+    #[test]
+    fn test_grid_two_by_two() {
+        // Two columns with 4 children -> 2 rows of 2
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 600.0, 0.0));
+        root.display = DisplayType::Grid;
+        root.padding = [0.0; 4];
+        root.grid_columns = vec![GridTrack::Fr(1.0), GridTrack::Fr(1.0)];
+
+        for _ in 0..4 {
+            root.add_child(LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0)));
+        }
+
+        test_compute_layout(&mut root, 600.0);
+
+        // Each column ~300px
+        assert!((root.children[0].rect.width - 300.0).abs() < 1.0);
+        assert!((root.children[1].rect.width - 300.0).abs() < 1.0);
+
+        // First row children at y=0, second row below
+        assert!(root.children[2].rect.y > root.children[0].rect.y);
+        // Second row starts after first row height + gap
+        assert!(
+            (root.children[2].rect.x - root.children[0].rect.x).abs() < 1.0,
+            "Second row first child should align with first row first child"
+        );
+    }
+
+    #[test]
+    fn test_grid_with_fixed_and_fr() {
+        // Layout: 200px 1fr -> fixed col + flexible col in 800px container
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 0.0));
+        root.display = DisplayType::Grid;
+        root.padding = [0.0; 4];
+        root.grid_columns = vec![GridTrack::Fixed(200.0), GridTrack::Fr(1.0)];
+
+        for _ in 0..2 {
+            root.add_child(LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0)));
+        }
+
+        test_compute_layout(&mut root, 800.0);
+
+        assert!((root.children[0].rect.width - 200.0).abs() < 1.0);
+        // Second column: (800 - 200) = 600px for the fr track
+        assert!((root.children[1].rect.width - 600.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_grid_with_gap() {
+        // Two columns with a 10px gap between them
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 0.0));
+        root.display = DisplayType::Grid;
+        root.padding = [0.0; 4];
+        root.grid_columns = vec![GridTrack::Fr(1.0), GridTrack::Fr(1.0)];
+        root.grid_column_gap = 10.0;
+
+        for _ in 0..2 {
+            root.add_child(LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0)));
+        }
+
+        test_compute_layout(&mut root, 800.0);
+
+        // Each fr gets (800 - 10) / 2 = 395px
+        assert!((root.children[0].rect.width - 395.0).abs() < 1.0);
+        assert!((root.children[1].rect.width - 395.0).abs() < 1.0);
+        // Second child x = 395 + 10 gap = 405
+        assert!((root.children[1].rect.x - 405.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_grid_order_default() {
+        // Default order is 0
+        let node = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        assert_eq!(node.order, 0);
     }
 }

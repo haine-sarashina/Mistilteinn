@@ -6,7 +6,7 @@ use winit::{
 };
 
 use crate::render::text::TextRenderer;
-use crate::render::{ColorF, RectClip, Renderer, layout_to_clip};
+use crate::render::{ColorF, MAX_RECTS, RectClip, Renderer, layout_to_clip};
 
 /// Chrome layout constants.
 const TAB_BAR_WIDTH: u32 = 200;
@@ -164,7 +164,7 @@ impl MistilteinnApp {
         let mut all_colors: Vec<ColorF> = chrome_colors;
 
         for (rect, color) in page_clip_rects {
-            if all_rects.len() < 512 {
+            if all_rects.len() < MAX_RECTS {
                 all_rects.push(rect);
                 all_colors.push(if let Some(col) = color {
                     crate::render::color_u8_to_f32(col)
@@ -268,12 +268,6 @@ impl MistilteinnApp {
 
     /// Load a page from a URL by fetching it over the network.
     pub fn load_url(&mut self, url: &str) {
-        // Push URL to history
-        if let Some(tab) = self.tab_manager.active_tab_mut() {
-            tab.push_history(url);
-            tab.url = url.to_string();
-        }
-
         let handle = match &self.tokio_handle {
             Some(h) => h.clone(),
             None => {
@@ -281,29 +275,34 @@ impl MistilteinnApp {
                 return;
             }
         };
+        // Delegate to async version to avoid blocking the event loop synchronously.
+        handle.block_on(self.load_url_async(url));
+    }
 
-        // Block on fetch for now — simpler than async channel pattern.
-        // TODO: Use spawn + Oneshot channel to avoid blocking the event loop.
-        let result = match handle.block_on(crate::network::fetch(url)) {
-            Ok(html) => html,
+    /// Load a page from a URL asynchronously with external CSS fetching.
+    pub async fn load_url_async(&mut self, url: &str) {
+        // Push URL to history
+        if let Some(tab) = self.tab_manager.active_tab_mut() {
+            tab.push_history(url);
+            tab.url = url.to_string();
+        }
+
+        // Fetch HTML
+        let html = match crate::network::fetch(url).await {
+            Ok(h) => h,
             Err(e) => {
                 log::error!("Failed to fetch {}: {:?}", url, e);
                 return;
             }
         };
 
-        // Try to fetch external stylesheets concurrently, fall back to inline-only CSS on error.
-        let css = match handle.block_on(crate::network::fetch_external_css(url, &result)) {
-            Ok(css) => css,
-            Err(e) => {
-                log::warn!(
-                    "Failed to fetch external CSS for {}, falling back to inline styles: {:?}",
-                    url,
-                    e
-                );
-                crate::network::extract_css(&result)
-            }
-        };
+        // Fetch all CSS (inline + external stylesheets) concurrently
+        let css = crate::network::fetch_external_css(url, &html)
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("Failed to fetch external CSS: {:?}", e);
+                crate::network::extract_css(&html)
+            });
 
         // Fallback default CSS if nothing extracted
         let final_css = if css.is_empty() {
@@ -312,7 +311,7 @@ impl MistilteinnApp {
             css
         };
 
-        self.load_page(&result, &final_css);
+        self.load_page_async(&html, &final_css).await;
     }
 
     /// Load a page asynchronously (fetches and composites images).
@@ -344,7 +343,7 @@ impl MistilteinnApp {
         let rects = page.collect_rects();
         let clip_rects: Vec<_> = rects
             .into_iter()
-            .take(512)
+            .take(MAX_RECTS)
             .filter_map(|(mut r, c)| {
                 // Apply scroll offset by shifting rect position
                 r.x -= scroll_offset.0;

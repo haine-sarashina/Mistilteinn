@@ -10,9 +10,18 @@ pub enum NetworkError {
     InvalidUrl(String),
 }
 
-/// Fetches the content of a URL.
+/// Max number of external stylesheets to fetch per page.
+const MAX_EXTERNAL_SHEETS: usize = 50;
+
+/// Fetches the content of a URL with a proper User-Agent and timeout.
 pub async fn fetch(url: &str) -> Result<String, NetworkError> {
-    let response = reqwest::get(url).await?.text().await?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("Mozilla/5.0 Mistilteinn/0.1")
+        .build()
+        .map_err(NetworkError::Http)?;
+
+    let response = client.get(url).send().await?.text().await?;
     Ok(response)
 }
 
@@ -132,8 +141,21 @@ pub fn extract_css(html_content: &str) -> String {
     css_parts.join("\n")
 }
 
+/// Fetch a single CSS file with a shorter timeout (10s) and the standard User-Agent.
+async fn fetch_css_file(url: &str) -> Result<String, NetworkError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("Mozilla/5.0 Mistilteinn/0.1")
+        .build()
+        .map_err(NetworkError::Http)?;
+
+    let response = client.get(url).send().await?.text().await?;
+    Ok(response)
+}
+
 /// Fetch all external stylesheets concurrently and merge their content with inline CSS.
 /// Resolves relative URLs against `base_url` before fetching.
+/// Caps the number of fetched stylesheets at `MAX_EXTERNAL_SHEETS`.
 /// Returns the combined CSS string (inline styles + fetched external stylesheets).
 pub async fn fetch_external_css(
     base_url: &str,
@@ -146,13 +168,28 @@ pub async fn fetch_external_css(
         return Ok(inline_css);
     }
 
+    // Cap the number of external stylesheets to prevent excessive fetches
+    let total_count = external_hrefs.len();
+    let limited_hrefs: Vec<String> = external_hrefs
+        .into_iter()
+        .take(MAX_EXTERNAL_SHEETS)
+        .collect();
+
+    if limited_hrefs.len() < total_count {
+        log::warn!(
+            "Limited external stylesheets from {} to {}",
+            total_count,
+            MAX_EXTERNAL_SHEETS
+        );
+    }
+
     log::info!(
         "Found {} external stylesheet(s), fetching concurrently",
-        external_hrefs.len()
+        limited_hrefs.len()
     );
 
     // Resolve all relative URLs against the base URL
-    let resolved_urls: Vec<String> = external_hrefs
+    let resolved_urls: Vec<String> = limited_hrefs
         .iter()
         .map(|href| resolve_url(base_url, href))
         .collect();
@@ -161,7 +198,7 @@ pub async fn fetch_external_css(
     let fetch_futures = resolved_urls.iter().map(|url| {
         let url_clone = url.clone();
         async move {
-            match fetch(&url_clone).await {
+            match fetch_css_file(&url_clone).await {
                 Ok(content) => {
                     log::info!(
                         "Fetched external stylesheet: {} ({} bytes)",

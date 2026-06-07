@@ -292,7 +292,18 @@ impl MistilteinnApp {
             }
         };
 
-        let css = crate::network::extract_css(&result);
+        // Try to fetch external stylesheets concurrently, fall back to inline-only CSS on error.
+        let css = match handle.block_on(crate::network::fetch_external_css(url, &result)) {
+            Ok(css) => css,
+            Err(e) => {
+                log::warn!(
+                    "Failed to fetch external CSS for {}, falling back to inline styles: {:?}",
+                    url,
+                    e
+                );
+                crate::network::extract_css(&result)
+            }
+        };
 
         // Fallback default CSS if nothing extracted
         let final_css = if css.is_empty() {

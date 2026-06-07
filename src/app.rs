@@ -15,6 +15,10 @@ const TAB_BUTTON_HEIGHT: f32 = 45.0;
 const TAB_BUTTON_SPACING: f32 = 4.0;
 const TAB_BUTTON_X: f32 = 10.0;
 const TAB_BUTTON_RIGHT_MARGIN: f32 = 20.0;
+const LOADING_BAR_HEIGHT: f32 = 3.0;
+const LOADING_BAR_COLOR_R: f32 = 80.0 / 255.0;
+const LOADING_BAR_COLOR_G: f32 = 140.0 / 255.0;
+const LOADING_BAR_COLOR_B: f32 = 230.0 / 255.0;
 
 /// Main application struct implementing winit's ApplicationHandler trait.
 pub struct MistilteinnApp {
@@ -89,6 +93,24 @@ impl MistilteinnApp {
             b: 60.0 / 255.0,
             a: 255.0,
         });
+
+        // Loading progress bar — appears below address bar when active tab is loading
+        if self.tab_manager.is_active_tab_loading() {
+            rects.push(layout_to_clip(
+                TAB_BAR_WIDTH as f32,
+                ADDRESS_BAR_HEIGHT as f32,
+                window_width as f32 - TAB_BAR_WIDTH as f32,
+                LOADING_BAR_HEIGHT,
+                window_width as f32,
+                window_height as f32,
+            ));
+            colors.push(ColorF {
+                r: LOADING_BAR_COLOR_R,
+                g: LOADING_BAR_COLOR_G,
+                b: LOADING_BAR_COLOR_B,
+                a: 255.0,
+            });
+        }
 
         (rects, colors)
     }
@@ -281,11 +303,19 @@ impl MistilteinnApp {
 
     /// Load a page from a URL asynchronously with external CSS fetching.
     pub async fn load_url_async(&mut self, url: &str) {
+        // Set loading state and repaint so the indicator appears before the async fetch
+        self.tab_manager.set_active_tab_loading(true);
+        self.recompose();
+        if let Some(ref renderer) = self.renderer {
+            renderer.window().request_redraw();
+        }
+
         // Fetch HTML
         let fetch_result = match crate::network::fetch(url).await {
             Ok(r) => r,
             Err(e) => {
                 log::error!("Failed to fetch {}: {:?}", url, e);
+                self.tab_manager.set_active_tab_loading(false);
                 return;
             }
         };
@@ -320,6 +350,7 @@ impl MistilteinnApp {
         };
 
         self.load_page_async(&html, &final_css).await;
+        self.tab_manager.set_active_tab_loading(false);
     }
 
     /// Load a page asynchronously (fetches and composites images).

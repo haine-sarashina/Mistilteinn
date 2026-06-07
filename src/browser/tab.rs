@@ -11,6 +11,7 @@ pub struct Tab {
     pub url: String,
     pub page: Option<Page>,
     pub scroll_offset: (f32, f32),
+    pub is_loading: bool,
     pub history: Vec<String>,
     pub history_index: usize,
 }
@@ -107,6 +108,7 @@ impl TabManager {
                 url: String::new(),
                 page: None,
                 scroll_offset: (0.0, 0.0),
+                is_loading: false,
                 history: Vec::new(),
                 history_index: 0,
             },
@@ -165,6 +167,18 @@ impl TabManager {
     /// Returns the ID of the currently active tab, if any.
     pub fn active_tab_id(&self) -> Option<TabId> {
         self.active_tab
+    }
+
+    /// Returns whether the active tab is currently loading a page.
+    pub fn is_active_tab_loading(&self) -> bool {
+        self.active_tab().map(|t| t.is_loading).unwrap_or(false)
+    }
+
+    /// Sets the loading state of the active tab.
+    pub fn set_active_tab_loading(&mut self, loading: bool) {
+        if let Some(tab) = self.active_tab_mut() {
+            tab.is_loading = loading;
+        }
     }
 }
 

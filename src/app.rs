@@ -135,7 +135,7 @@ impl MistilteinnApp {
 
         // Shift page content by chrome offset and apply scroll, then convert to clip space
         let mut page_clip_rects: Vec<(RectClip, Option<[u8; 4]>)> = Vec::new();
-        for (mut r, c) in rects.into_iter().take(32) {
+        for (mut r, c) in rects.into_iter() {
             // Apply scroll offset by shifting rect position
             r.x -= scroll_offset.0;
             r.y -= scroll_offset.1;
@@ -164,7 +164,7 @@ impl MistilteinnApp {
         let mut all_colors: Vec<ColorF> = chrome_colors;
 
         for (rect, color) in page_clip_rects {
-            if all_rects.len() < 64 {
+            if all_rects.len() < 512 {
                 all_rects.push(rect);
                 all_colors.push(if let Some(col) = color {
                     crate::render::color_u8_to_f32(col)
@@ -250,8 +250,8 @@ impl MistilteinnApp {
 
     /// Load a page from HTML and CSS source strings.
     pub fn load_page(&mut self, html_source: &str, css_source: &str) {
-        let w = self.window_width() as f32;
-        let h = self.window_height() as f32;
+        let w = self.window_width() as f32 - TAB_BAR_WIDTH as f32;
+        let h = self.window_height() as f32 - ADDRESS_BAR_HEIGHT as f32;
 
         let new_page = crate::page::Page::new(html_source, css_source, w, h);
         self.tab_manager.set_active_tab_page(new_page);
@@ -306,8 +306,8 @@ impl MistilteinnApp {
 
     /// Load a page asynchronously (fetches and composites images).
     pub async fn load_page_async(&mut self, html_source: &str, css_source: &str) {
-        let w = self.window_width() as f32;
-        let h = self.window_height() as f32;
+        let w = self.window_width() as f32 - TAB_BAR_WIDTH as f32;
+        let h = self.window_height() as f32 - ADDRESS_BAR_HEIGHT as f32;
 
         let new_page = crate::page::Page::new(html_source, css_source, w, h);
         self.tab_manager.set_active_tab_page(new_page);
@@ -333,7 +333,7 @@ impl MistilteinnApp {
         let rects = page.collect_rects();
         let clip_rects: Vec<_> = rects
             .into_iter()
-            .take(64)
+            .take(512)
             .filter_map(|(mut r, c)| {
                 // Apply scroll offset by shifting rect position
                 r.x -= scroll_offset.0;
@@ -599,8 +599,8 @@ impl ApplicationHandler for MistilteinnApp {
                 // Trigger recompose with new view dimensions
                 if let Some(tab) = self.tab_manager.active_tab_mut() {
                     if let Some(ref mut page) = tab.page {
-                        page.view_width = size.width as f32;
-                        page.view_height = size.height as f32;
+                        page.view_width = size.width as f32 - TAB_BAR_WIDTH as f32;
+                        page.view_height = size.height as f32 - ADDRESS_BAR_HEIGHT as f32;
                         // Rebuild layout positions with new view width
                         let mut text_renderer = TextRenderer::new();
                         crate::layout::compute_layout(

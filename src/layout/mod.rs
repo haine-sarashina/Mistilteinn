@@ -147,6 +147,10 @@ pub struct LayoutNode {
     pub offsets: [Option<f32>; 4],
     /// Absolutely positioned children extracted from the normal flow.
     pub absolute_children: Vec<LayoutNode>,
+    /// Computed font size in pixels (copied from CSS ComputedValues).
+    pub font_size: f32,
+    /// Computed font family (copied from CSS ComputedValues).
+    pub font_family: String,
 }
 
 impl LayoutNode {
@@ -177,6 +181,8 @@ impl LayoutNode {
             position: PositionType::Static,
             offsets: [None, None, None, None],
             absolute_children: Vec::new(),
+            font_size: 16.0,
+            font_family: String::new(),
         }
     }
 
@@ -266,6 +272,10 @@ where
         root_styles.offset_left,
     ];
 
+    // Propagate font properties from computed styles
+    root_layout.font_size = root_styles.font_size;
+    root_layout.font_family = root_styles.font_family.clone();
+
     if let Some(node) = root_dom {
         build_layout_children(&mut root_layout, &node.children_ids(), styles, get_node, 0);
     }
@@ -315,6 +325,8 @@ fn build_layout_children<N, F>(
                     layout_node.margin = child_styles.margin;
                     layout_node.background_color = child_styles.background_color;
                     layout_node.color = child_styles.color;
+                    layout_node.font_size = child_styles.font_size;
+                    layout_node.font_family = child_styles.font_family.clone();
                     // Copy flexbox properties
                     layout_node.flex_direction = child_styles.flex_direction;
                     layout_node.flex_wrap = child_styles.flex_wrap;
@@ -365,6 +377,8 @@ fn build_layout_children<N, F>(
                     layout_node.margin = child_styles.margin;
                     layout_node.background_color = child_styles.background_color;
                     layout_node.color = child_styles.color;
+                    layout_node.font_size = child_styles.font_size;
+                    layout_node.font_family = child_styles.font_family.clone();
 
                     // Copy overflow and positioning properties
                     layout_node.overflow = child_styles.overflow_x;
@@ -836,9 +850,7 @@ fn compute_block_height(node: &LayoutNode, depth: usize) -> f32 {
 /// Compute the height of an inline node (used as a line box).
 /// Uses the estimated font-size * 1.2 as the line-height per CSS spec.
 fn compute_inline_height(node: &LayoutNode) -> f32 {
-    // TODO: use actual ComputedValues.font_size once available in LayoutNode
-    let font_size = 16.0; // default CSS initial value
-    let line_height = font_size * 1.2;
+    let line_height = node.font_size * 1.2;
     line_height + node.padding[0] + node.padding[2]
 }
 
@@ -1443,7 +1455,7 @@ fn build_inline_boxes(_parent: &LayoutNode, children: &[LayoutNode]) -> Vec<Inli
                     text: text.clone(),
                     width: 0.0, // measured in Step A3 with TextRenderer
                     color: child.color,
-                    font_size: 16.0, // default; will be enriched when CSS font-size is on LayoutNode
+                    font_size: child.font_size,
                 });
             }
         } else if matches!(
@@ -1480,7 +1492,7 @@ fn build_inline_boxes_from_slice(_parent: &LayoutNode, children: &[LayoutNode]) 
                     text: text.clone(),
                     width: 0.0,
                     color: child.color,
-                    font_size: 16.0,
+                    font_size: child.font_size,
                 });
             }
         } else if matches!(
@@ -2015,7 +2027,7 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
                 width: node.rect.width,
                 text: text.clone(),
                 color,
-                font_size: 16.0, // Default; will be enriched when CSS font-size is available
+                font_size: node.font_size,
             });
         }
     }

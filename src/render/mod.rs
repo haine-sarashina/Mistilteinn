@@ -23,7 +23,7 @@ pub struct Renderer {
     rect_color_buffer: wgpu::Buffer,
     /// Bind group linking uniforms to the shader.
     rect_bind_group: wgpu::BindGroup,
-    /// Current number of rectangles to draw (max 64).
+    /// Current number of rectangles to draw (max 512).
     num_rects: u32,
     /// Texture for overlaying rasterized text onto the frame.
     text_texture: Option<wgpu::Texture>,
@@ -132,8 +132,8 @@ impl Renderer {
         // Create render pipeline
         let rect_pipeline = Self::create_rect_pipeline(&device, surface_format);
 
-        // Create uniform buffers (64 rects × vec4 = 256 f32)
-        let uniform_size = std::mem::size_of::<[f32; 256]>() as u64;
+        // Create uniform buffers (512 rects × vec4 = 2048 f32)
+        let uniform_size = std::mem::size_of::<[f32; 2048]>() as u64;
 
         let rect_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Rect Uniform Buffer"),
@@ -419,12 +419,12 @@ impl Renderer {
     ///
     /// Clip space: x ∈ [-1, 1], y ∈ [-1, 1], origin at center.
     pub fn set_rects(&mut self, rects: &[RectClip], colors: &[ColorF]) {
-        let count = rects.len().min(64);
+        let count = rects.len().min(512);
         self.num_rects = count as u32;
 
-        // Upload positions as vec4 array [x, y, w, h] × 64
-        let mut position_data = [0.0f32; 256];
-        for (i, rect) in rects.iter().take(64).enumerate() {
+        // Upload positions as vec4 array [x, y, w, h] × 512
+        let mut position_data = [0.0f32; 2048];
+        for (i, rect) in rects.iter().take(512).enumerate() {
             position_data[i * 4] = rect.x;
             position_data[i * 4 + 1] = rect.y;
             position_data[i * 4 + 2] = rect.width;
@@ -436,9 +436,9 @@ impl Renderer {
             bytemuck::bytes_of(&position_data),
         );
 
-        // Upload colors as vec4 array [r, g, b, a] × 64
-        let mut color_data = [0.0f32; 256];
-        for (i, color) in colors.iter().take(64).enumerate() {
+        // Upload colors as vec4 array [r, g, b, a] × 512
+        let mut color_data = [0.0f32; 2048];
+        for (i, color) in colors.iter().take(512).enumerate() {
             color_data[i * 4] = color.r;
             color_data[i * 4 + 1] = color.g;
             color_data[i * 4 + 2] = color.b;
@@ -580,11 +580,11 @@ mod shader {
     /// Vertex shader with per-rectangle uniform buffer.
     pub const RECT_VERTEX: &str = r#"
         struct RectUniform {
-            rects: array<vec4f, 64>,
+            rects: array<vec4f, 512>,
         }
 
         struct RectColor {
-            colors: array<vec4f, 64>,
+            colors: array<vec4f, 512>,
         }
 
         @group(0) @binding(0)
@@ -600,7 +600,7 @@ mod shader {
             // 6 vertices per rectangle (2 triangles)
             let tri = vertex_index % 6u;
             let rect_idx = (vertex_index / 6u) * 2u + tri / 2u;
-            if rect_idx > 63u {
+            if rect_idx > 511u {
                 return vec4f(0.0, 0.0, 0.0, 1.0);
             }
             let r = rect_data.rects[rect_idx];
@@ -625,7 +625,7 @@ mod shader {
     /// Fragment shader that outputs the rectangle color.
     pub const RECT_FRAGMENT: &str = r#"
         struct RectColor {
-            colors: array<vec4f, 64>,
+            colors: array<vec4f, 512>,
         }
 
         @group(0) @binding(1)
@@ -637,7 +637,7 @@ mod shader {
         ) -> @location(0) vec4f {
             let tri = vertex_index % 6u;
             let rect_idx = (vertex_index / 6u) * 2u + tri / 2u;
-            if rect_idx > 63u {
+            if rect_idx > 511u {
                 return vec4f(1.0, 1.0, 1.0, 1.0);
             }
             return rect_colors.colors[rect_idx];

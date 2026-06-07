@@ -24,8 +24,12 @@ impl Page {
         // Stage 1: Parse HTML into DOM arena
         let arena = html::parse_html(html_source);
 
-        // Stage 2: Parse CSS into stylesheet
-        let stylesheet = crate::css::parser::parse_stylesheet(css_source);
+        // Stage 2: Parse CSS into author stylesheet
+        let author_stylesheet = crate::css::parser::parse_stylesheet(css_source);
+
+        // Stage 2.5: Merge UA stylesheet (lowest priority) with author stylesheet
+        let ua_stylesheet = css::user_agent_stylesheet();
+        let stylesheet = css::merge_stylesheets_with_author(&ua_stylesheet, &author_stylesheet);
 
         // Stage 3: Compute styles for every element node
         let styles = css::compute_styles_for_tree(&arena, &stylesheet);

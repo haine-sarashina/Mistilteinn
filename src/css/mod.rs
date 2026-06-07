@@ -317,6 +317,15 @@ pub fn compute_styles_for_tree(
             computed = computed.from_declaration(decl);
         }
 
+        // Pass 3: Inline `style` attribute — highest specificity per CSS spec.
+        // Applied after stylesheet cascade but before inheritance propagation.
+        if let Some(style_attr) = node.get_attr("style") {
+            let inline_decls = parse_declarations(style_attr);
+            for decl in &inline_decls {
+                computed = computed.from_declaration(decl);
+            }
+        }
+
         result.insert(node_id, computed);
     }
 
@@ -903,6 +912,63 @@ fn parse_align_content(s: &str) -> AlignContent {
     }
 }
 
+// ------ User-Agent Stylesheet ------
+
+/// Returns a default user-agent stylesheet with standard UA styles for common HTML elements.
+///
+/// These rules have the lowest priority in the CSS cascade — author styles always override them.
+pub fn user_agent_stylesheet() -> parser::Stylesheet {
+    // Each tuple: (selector, declarations_string)
+    let ua_rules = vec![
+        ("html", "display: block"),
+        ("body", "display: block; margin: 8px"),
+        ("h1", "display: block; font-size: 2em; margin: 0.67em 0; font-weight: bold"),
+        ("h2", "display: block; font-size: 1.5em; margin: 0.83em 0; font-weight: bold"),
+        ("h3", "display: block; font-size: 1.17em; margin: 1em 0; font-weight: bold"),
+        ("h4", "display: block; margin: 1em 0; font-weight: bold"),
+        ("h5", "display: block; margin: 1em 0; font-weight: bold"),
+        ("h6", "display: block; margin: 1em 0; font-weight: bold"),
+        ("p", "display: block; margin: 1em 0"),
+        ("ul", "display: block; padding-left: 40px; margin: 1em 0"),
+        ("ol", "display: block; padding-left: 40px; margin: 1em 0"),
+        ("li", "display: block"),
+        ("table", "display: table"),
+        ("img", "display: inline"),
+        ("a", "display: inline"),
+        ("div", "display: block"),
+        ("span", "display: inline"),
+        ("form", "display: block"),
+        ("input", "display: inline"),
+    ];
+
+    let mut rules = Vec::new();
+
+    for (selector_str, decls_str) in ua_rules {
+        let selectors = parser::parse_selector_str(selector_str);
+        let declarations = parse_declarations(decls_str);
+        rules.push(parser::CSSRule {
+            selectors,
+            declarations,
+        });
+    }
+
+    parser::Stylesheet { rules }
+}
+
+/// Merges UA stylesheet rules with author stylesheet rules.
+///
+/// In CSS cascade, earlier source order loses to later source order at equal specificity,
+/// so UA rules are prepended and author rules are appended — author styles win.
+pub fn merge_stylesheets_with_author(
+    ua: &parser::Stylesheet,
+    author: &parser::Stylesheet,
+) -> parser::Stylesheet {
+    let mut rules = Vec::new();
+    rules.extend_from_slice(&ua.rules);
+    rules.extend_from_slice(&author.rules);
+    parser::Stylesheet { rules }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1463,6 +1529,239 @@ mod tests {
             assert_eq!(p_styles.overflow_y, Overflow::Visible);
         } else {
             assert!(false, "Expected to find both <div> and <p> nodes");
+        }
+    }
+
+    // ------ Inline Style Attribute Tests ------
+
+    #[test]
+    fn inline_style_applied() {
+        let arena = crate::html::parse_html(r#"<div style="color: blue;">Test</div>"#);
+        let stylesheet = parser::parse_stylesheet("");
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
+        });
+        let div_styles = styles
+            .get(&(div_id.unwrap() as u32))
+            .expect("div has styles");
+        assert_eq!(div_styles.color, Some([0, 0, 255, 255])); // blue
+    }
+
+    #[test]
+    fn inline_style_overrides_stylesheet() {
+        let arena = crate::html::parse_html(r#"<div id="mydiv" style="color: green;">Test</div>"#);
+        let stylesheet = parser::parse_stylesheet("div { color: red; } #mydiv { color: blue; }");
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
+        });
+        let div_styles = styles
+            .get(&(div_id.unwrap() as u32))
+            .expect("div has styles");
+        assert_eq!(div_styles.color, Some([0, 128, 0, 255])); // green from inline
+    }
+
+    #[test]
+    fn inline_style_multiple_properties() {
+        let arena = crate::html::parse_html(
+            r#"<div style="color: red; font-size: 20px; background-color: yellow;">Test</div>"#,
+        );
+        let stylesheet = parser::parse_stylesheet("");
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
+        });
+        let div_styles = styles
+            .get(&(div_id.unwrap() as u32))
+            .expect("div has styles");
+        assert_eq!(div_styles.color, Some([255, 0, 0, 255])); // red
+        assert_eq!(div_styles.font_size, 20.0);
+        assert_eq!(div_styles.background_color, Some([255, 255, 0, 255])); // yellow
+    }
+
+    #[test]
+    fn inline_style_combines_with_stylesheet() {
+        let arena = crate::html::parse_html(r#"<div style="color: red;">Test</div>"#);
+        let stylesheet = parser::parse_stylesheet("div { font-size: 18px; }");
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
+        });
+        let div_styles = styles
+            .get(&(div_id.unwrap() as u32))
+            .expect("div has styles");
+        assert_eq!(div_styles.color, Some([255, 0, 0, 255])); // from inline
+        assert_eq!(div_styles.font_size, 18.0);              // from stylesheet
+    }
+
+    #[test]
+    fn inline_style_overrides_important() {
+        let arena = crate::html::parse_html(r#"<div style="color: red;">Test</div>"#);
+        let stylesheet = parser::parse_stylesheet("div { color: blue !important; }");
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
+        });
+        let div_styles = styles
+            .get(&(div_id.unwrap() as u32))
+            .expect("div has styles");
+        assert_eq!(div_styles.color, Some([255, 0, 0, 255])); // inline wins
+    }
+
+    #[test]
+    fn inline_style_no_style_attribute() {
+        let arena = crate::html::parse_html("<div>No inline style</div>");
+        let stylesheet = parser::parse_stylesheet("div { color: green; }");
+        let styles = compute_styles_for_tree(&arena, &stylesheet);
+
+        assert!(!styles.is_empty());
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
+        });
+        let div_styles = styles
+            .get(&(div_id.unwrap() as u32))
+            .expect("div has styles");
+        assert_eq!(div_styles.color, Some([0, 128, 0, 255])); // green from stylesheet
+    }
+
+    // ------ User-Agent Stylesheet Tests ------
+
+    #[test]
+    fn ua_stylesheet_has_rules() {
+        let ua = user_agent_stylesheet();
+        assert!(!ua.rules.is_empty(), "UA stylesheet should have rules");
+    }
+
+    #[test]
+    fn ua_body_is_block_with_margin() {
+        let arena = crate::html::parse_html("<html><body><p>text</p></body></html>");
+        let ua = user_agent_stylesheet();
+        let empty_author = parser::parse_stylesheet("");
+        let merged = merge_stylesheets_with_author(&ua, &empty_author);
+        let styles = compute_styles_for_tree(&arena, &merged);
+
+        let nodes = arena.nodes.borrow();
+        let body_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "body")
+                    .unwrap_or(false)
+        });
+        if let Some(bid) = body_id {
+            let body_styles = styles.get(&(bid as u32)).expect("body has styles");
+            assert_eq!(body_styles.display, DisplayType::Block, "body should be block");
+            assert_eq!(body_styles.margin, [8.0, 8.0, 8.0, 8.0], "body margin should be 8px");
+        } else {
+            assert!(false, "Expected to find a <body> node");
+        }
+    }
+
+    #[test]
+    fn ul_has_left_padding_from_ua() {
+        let arena = crate::html::parse_html("<html><body><ul><li>item</li></ul></body></html>");
+        let ua = user_agent_stylesheet();
+        let empty_author = parser::parse_stylesheet("");
+        let merged = merge_stylesheets_with_author(&ua, &empty_author);
+        let styles = compute_styles_for_tree(&arena, &merged);
+
+        let nodes = arena.nodes.borrow();
+        let ul_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "ul")
+                    .unwrap_or(false)
+        });
+        if let Some(id) = ul_id {
+            let ul_styles = styles.get(&(id as u32)).expect("ul has styles");
+            assert_eq!(ul_styles.display, DisplayType::Block, "ul should be block");
+            assert_eq!(
+                ul_styles.padding[3], 40.0,
+                "ul should have left padding of 40px from UA stylesheet"
+            );
+        } else {
+            assert!(false, "Expected to find a <ul> node");
+        }
+    }
+
+    #[test]
+    fn p_has_margin_from_ua() {
+        let arena = crate::html::parse_html("<html><body><p>para</p></body></html>");
+        let ua = user_agent_stylesheet();
+        let empty_author = parser::parse_stylesheet("");
+        let merged = merge_stylesheets_with_author(&ua, &empty_author);
+        let styles = compute_styles_for_tree(&arena, &merged);
+
+        let nodes = arena.nodes.borrow();
+        let p_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "p")
+                    .unwrap_or(false)
+        });
+        if let Some(id) = p_id {
+            let p_styles = styles.get(&(id as u32)).expect("p has styles");
+            assert_eq!(p_styles.display, DisplayType::Block, "p should be block");
+            assert_eq!(p_styles.margin[0], 1.0, "p top margin from UA");
+            assert_eq!(p_styles.margin[2], 1.0, "p bottom margin from UA");
+        } else {
+            assert!(false, "Expected to find a <p> node");
+        }
+    }
+
+    #[test]
+    fn author_style_overrides_ua() {
+        let arena = crate::html::parse_html("<html><body><div>test</div></body></html>");
+        let ua = user_agent_stylesheet();
+        let author = parser::parse_stylesheet("div { display: inline; }");
+        let merged = merge_stylesheets_with_author(&ua, &author);
+        let styles = compute_styles_for_tree(&arena, &merged);
+
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
+        });
+        if let Some(id) = div_id {
+            let div_styles = styles.get(&(id as u32)).expect("div has styles");
+            assert_eq!(
+                div_styles.display,
+                DisplayType::Inline,
+                "Author style should override UA stylesheet"
+            );
+        } else {
+            assert!(false, "Expected to find a <div> node");
         }
     }
 }

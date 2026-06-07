@@ -242,13 +242,25 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore] // Requires network access and Amazon may return WAF challenge page
     async fn test_fetch_amazon() {
         let result = fetch("https://www.amazon.co.jp").await;
+        assert!(result.is_ok(), "Fetch should succeed");
+        let fetch_result = result.unwrap();
+        assert!(!fetch_result.final_url.is_empty(), "final_url should be set");
+        assert!(fetch_result.final_url.contains("amazon"), "Should redirect to amazon domain: {}", fetch_result.final_url);
+        // Note: Amazon may return empty content or a WAF challenge page for automated requests.
+        // Content validation is skipped in CI/automated environments.
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_fetch_example_com() {
+        let result = fetch("http://example.com").await;
         assert!(result.is_ok());
         let fetch_result = result.unwrap();
-        assert!(fetch_result.content.contains("html"));
-        assert!(!fetch_result.final_url.is_empty());
+        assert!(fetch_result.content.contains("<!DOCTYPE") || fetch_result.content.contains("<html"));
+        assert!(fetch_result.final_url.starts_with("http://example.com"));
     }
 
     #[test]

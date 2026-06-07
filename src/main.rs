@@ -20,5 +20,6 @@ fn main() {
 
     log::info!("Mistilteinn starting...");
 
-    app::run();
+    let start_url = std::env::var("MISTILTEIN_URL").ok();
+    app::run(start_url);
 }

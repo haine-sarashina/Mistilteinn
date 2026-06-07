@@ -23,6 +23,7 @@ const LOADING_BAR_COLOR_B: f32 = 230.0 / 255.0;
 /// Main application struct implementing winit's ApplicationHandler trait.
 pub struct MistilteinnApp {
     renderer: Option<Renderer>,
+    pub start_url: Option<String>,
     tab_manager: crate::browser::tab::TabManager,
     tokio_handle: Option<tokio::runtime::Handle>,
 }
@@ -604,25 +605,30 @@ impl ApplicationHandler for MistilteinnApp {
             });
             self.renderer = renderer;
 
-            // Load the default demo page through the pipeline
+            // Load startup URL or default demo page through the pipeline
             if self.renderer.is_some() {
-                self.load_page(
-                    r#"<html><body>
-                        <div id="header" class="header">Header</div>
-                        <div class="content">
-                            <p class="box green">Green box</p>
-                            <p class="box red">Red box</p>
-                        </div>
-                        <div id="footer" class="footer">Footer</div>
-                      </body></html>"#,
-                    r#".header { display: block; background-color: blue; padding: 20px; }
-                       .content { display: block; }
-                       .box { display: block; padding: 15px; }
-                       .green { background-color: green; }
-                       .red { background-color: red; }
-                       .footer { display: block; background-color: orange; padding: 10px; }"#,
-                );
-                log::info!("First frame rendered — pipeline output (HTML→CSS→Layout→Render)");
+                if let Some(url) = self.start_url.take() {
+                    self.load_url(&url);
+                    log::info!("Loaded startup URL from MISTILTEIN_URL: {}", url);
+                } else {
+                    self.load_page(
+                        r#"<html><body>
+                            <div id="header" class="header">Header</div>
+                            <div class="content">
+                                <p class="box green">Green box</p>
+                                <p class="box red">Red box</p>
+                            </div>
+                            <div id="footer" class="footer">Footer</div>
+                          </body></html>"#,
+                        r#".header { display: block; background-color: blue; padding: 20px; }
+                           .content { display: block; }
+                           .box { display: block; padding: 15px; }
+                           .green { background-color: green; }
+                           .red { background-color: red; }
+                           .footer { display: block; background-color: orange; padding: 10px; }"#,
+                    );
+                    log::info!("First frame rendered — pipeline output (HTML→CSS→Layout→Render)");
+                }
             }
         }
     }
@@ -716,10 +722,11 @@ impl ApplicationHandler for MistilteinnApp {
 }
 
 /// Application entry point.
-pub fn run() {
+pub fn run(start_url: Option<String>) {
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     let mut app = MistilteinnApp {
         renderer: None,
+        start_url,
         tab_manager: crate::browser::tab::TabManager::new(),
         tokio_handle: None,
     };

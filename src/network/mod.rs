@@ -135,7 +135,10 @@ pub fn extract_css(html_content: &str) -> String {
 /// Fetch all external stylesheets concurrently and merge their content with inline CSS.
 /// Resolves relative URLs against `base_url` before fetching.
 /// Returns the combined CSS string (inline styles + fetched external stylesheets).
-pub async fn fetch_external_css(base_url: &str, html_content: &str) -> Result<String, NetworkError> {
+pub async fn fetch_external_css(
+    base_url: &str,
+    html_content: &str,
+) -> Result<String, NetworkError> {
     let inline_css = extract_css(html_content);
     let external_hrefs = extract_external_css_urls(html_content);
 
@@ -168,11 +171,7 @@ pub async fn fetch_external_css(base_url: &str, html_content: &str) -> Result<St
                     Some(content)
                 }
                 Err(e) => {
-                    log::warn!(
-                        "Failed to fetch external stylesheet {}: {:?}",
-                        url_clone,
-                        e
-                    );
+                    log::warn!("Failed to fetch external stylesheet {}: {:?}", url_clone, e);
                     None
                 }
             }
@@ -263,7 +262,10 @@ mod tests {
     #[test]
     fn test_resolve_absolute_https_url() {
         assert_eq!(
-            resolve_url("https://example.com/page", "https://cdn.example.com/style.css"),
+            resolve_url(
+                "https://example.com/page",
+                "https://cdn.example.com/style.css"
+            ),
             "https://cdn.example.com/style.css"
         );
     }

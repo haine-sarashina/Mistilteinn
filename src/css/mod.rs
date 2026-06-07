@@ -922,9 +922,18 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
     let ua_rules = vec![
         ("html", "display: block"),
         ("body", "display: block; margin: 8px"),
-        ("h1", "display: block; font-size: 2em; margin: 0.67em 0; font-weight: bold"),
-        ("h2", "display: block; font-size: 1.5em; margin: 0.83em 0; font-weight: bold"),
-        ("h3", "display: block; font-size: 1.17em; margin: 1em 0; font-weight: bold"),
+        (
+            "h1",
+            "display: block; font-size: 2em; margin: 0.67em 0; font-weight: bold",
+        ),
+        (
+            "h2",
+            "display: block; font-size: 1.5em; margin: 0.83em 0; font-weight: bold",
+        ),
+        (
+            "h3",
+            "display: block; font-size: 1.17em; margin: 1em 0; font-weight: bold",
+        ),
         ("h4", "display: block; margin: 1em 0; font-weight: bold"),
         ("h5", "display: block; margin: 1em 0; font-weight: bold"),
         ("h6", "display: block; margin: 1em 0; font-weight: bold"),
@@ -1612,7 +1621,7 @@ mod tests {
             .get(&(div_id.unwrap() as u32))
             .expect("div has styles");
         assert_eq!(div_styles.color, Some([255, 0, 0, 255])); // from inline
-        assert_eq!(div_styles.font_size, 18.0);              // from stylesheet
+        assert_eq!(div_styles.font_size, 18.0); // from stylesheet
     }
 
     #[test]
@@ -1679,8 +1688,16 @@ mod tests {
         });
         if let Some(bid) = body_id {
             let body_styles = styles.get(&(bid as u32)).expect("body has styles");
-            assert_eq!(body_styles.display, DisplayType::Block, "body should be block");
-            assert_eq!(body_styles.margin, [8.0, 8.0, 8.0, 8.0], "body margin should be 8px");
+            assert_eq!(
+                body_styles.display,
+                DisplayType::Block,
+                "body should be block"
+            );
+            assert_eq!(
+                body_styles.margin,
+                [8.0, 8.0, 8.0, 8.0],
+                "body margin should be 8px"
+            );
         } else {
             assert!(false, "Expected to find a <body> node");
         }
@@ -1696,10 +1713,7 @@ mod tests {
 
         let nodes = arena.nodes.borrow();
         let ul_id = nodes.iter().position(|n| {
-            n.is_element()
-                && n.tag_name()
-                    .map(|t| t.to_string() == "ul")
-                    .unwrap_or(false)
+            n.is_element() && n.tag_name().map(|t| t.to_string() == "ul").unwrap_or(false)
         });
         if let Some(id) = ul_id {
             let ul_styles = styles.get(&(id as u32)).expect("ul has styles");
@@ -1723,10 +1737,7 @@ mod tests {
 
         let nodes = arena.nodes.borrow();
         let p_id = nodes.iter().position(|n| {
-            n.is_element()
-                && n.tag_name()
-                    .map(|t| t.to_string() == "p")
-                    .unwrap_or(false)
+            n.is_element() && n.tag_name().map(|t| t.to_string() == "p").unwrap_or(false)
         });
         if let Some(id) = p_id {
             let p_styles = styles.get(&(id as u32)).expect("p has styles");

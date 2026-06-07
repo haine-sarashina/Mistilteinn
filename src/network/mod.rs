@@ -13,16 +13,26 @@ pub enum NetworkError {
 /// Max number of external stylesheets to fetch per page.
 const MAX_EXTERNAL_SHEETS: usize = 50;
 
+/// Result of a network fetch, including the resolved (post-redirect) URL.
+pub struct FetchResult {
+    pub content: String,
+    /// The final URL after following all redirects. If no redirect occurred,
+    /// this equals the original request URL.
+    pub final_url: String,
+}
+
 /// Fetches the content of a URL with a proper User-Agent and timeout.
-pub async fn fetch(url: &str) -> Result<String, NetworkError> {
+pub async fn fetch(url: &str) -> Result<FetchResult, NetworkError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("Mozilla/5.0 Mistilteinn/0.1")
         .build()
         .map_err(NetworkError::Http)?;
 
-    let response = client.get(url).send().await?.text().await?;
-    Ok(response)
+    let response = client.get(url).send().await?;
+    let final_url = response.url().to_string();
+    let content = response.text().await?;
+    Ok(FetchResult { content, final_url })
 }
 
 /// Resolve a potentially relative URL against a base URL.
@@ -234,9 +244,21 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires network access
     async fn test_fetch_amazon() {
-        let content = fetch("https://www.amazon.co.jp").await;
-        assert!(content.is_ok());
-        assert!(content.unwrap().contains("html"));
+        let result = fetch("https://www.amazon.co.jp").await;
+        assert!(result.is_ok());
+        let fetch_result = result.unwrap();
+        assert!(fetch_result.content.contains("html"));
+        assert!(!fetch_result.final_url.is_empty());
+    }
+
+    #[test]
+    fn test_fetch_result_fields() {
+        let fr = FetchResult {
+            content: "hello".to_string(),
+            final_url: "https://example.com".to_string(),
+        };
+        assert_eq!(fr.content, "hello");
+        assert_eq!(fr.final_url, "https://example.com");
     }
 
     #[test]

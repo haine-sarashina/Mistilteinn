@@ -281,23 +281,31 @@ impl MistilteinnApp {
 
     /// Load a page from a URL asynchronously with external CSS fetching.
     pub async fn load_url_async(&mut self, url: &str) {
-        // Push URL to history
-        if let Some(tab) = self.tab_manager.active_tab_mut() {
-            tab.push_history(url);
-            tab.url = url.to_string();
-        }
-
         // Fetch HTML
-        let html = match crate::network::fetch(url).await {
-            Ok(h) => h,
+        let fetch_result = match crate::network::fetch(url).await {
+            Ok(r) => r,
             Err(e) => {
                 log::error!("Failed to fetch {}: {:?}", url, e);
                 return;
             }
         };
 
+        let final_url = fetch_result.final_url;
+        let html = fetch_result.content;
+
+        // Log redirect if the final URL differs from the requested URL
+        if final_url != url {
+            log::info!("Redirected: {} -> {}", url, final_url);
+        }
+
+        // Push resolved URL to history
+        if let Some(tab) = self.tab_manager.active_tab_mut() {
+            tab.push_history(&final_url);
+            tab.url = final_url.clone();
+        }
+
         // Fetch all CSS (inline + external stylesheets) concurrently
-        let css = crate::network::fetch_external_css(url, &html)
+        let css = crate::network::fetch_external_css(&final_url, &html)
             .await
             .unwrap_or_else(|e| {
                 log::warn!("Failed to fetch external CSS: {:?}", e);

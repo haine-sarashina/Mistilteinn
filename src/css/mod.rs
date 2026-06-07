@@ -431,6 +431,25 @@ pub enum Overflow {
     Auto,
 }
 
+// ------ Box Sizing ------
+
+/// The computed `box-sizing` CSS property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxSizing {
+    ContentBox,
+    BorderBox,
+}
+
+// ------ Flex Basis ------
+
+/// The computed `flex-basis` CSS property.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FlexBasis {
+    Auto,
+    Pixels(f32),
+    Percentage(f32), // stored as fraction (0.5 for 50%)
+}
+
 // ------ Positioning ------
 
 /// The computed `position` CSS property.
@@ -471,8 +490,16 @@ pub struct ComputedValues {
     /// Flex item properties
     pub flex_grow: f32,
     pub flex_shrink: f32,
-    /// Flex basis (None = auto)
-    pub flex_basis: Option<f32>,
+    /// Flex basis
+    pub flex_basis: FlexBasis,
+    /// Box sizing model
+    pub box_sizing: BoxSizing,
+    /// Explicit width/height from CSS (for border-box support)
+    pub explicit_width: Option<f32>,
+    pub explicit_height: Option<f32>,
+    /// Min/max width constraints
+    pub min_width: Option<f32>,
+    pub max_width: Option<f32>,
     /// Normalized line-height multiplier (CSS default = 1.2 for "normal").
     pub line_height: f32,
     // Overflow
@@ -508,7 +535,12 @@ impl Default for ComputedValues {
             column_gap: 0.0,
             flex_grow: 0.0,
             flex_shrink: 1.0,
-            flex_basis: None,
+            flex_basis: FlexBasis::Auto,
+            box_sizing: BoxSizing::ContentBox,
+            explicit_width: None,
+            explicit_height: None,
+            min_width: None,
+            max_width: None,
             line_height: 1.2, // CSS default for "normal"
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
@@ -544,9 +576,11 @@ impl ComputedValues {
             }
             "width" => {
                 self.width = parse_length(val);
+                self.explicit_width = self.width;
             }
             "height" => {
                 self.height = parse_length(val);
+                self.explicit_height = self.height;
             }
             "margin" => {
                 self.margin = parse_box_four(val, self.margin);
@@ -753,6 +787,18 @@ impl ComputedValues {
             "left" => {
                 self.offset_left = parse_offset(val);
             }
+            "box-sizing" => {
+                self.box_sizing = match val {
+                    "border-box" => BoxSizing::BorderBox,
+                    _ => BoxSizing::ContentBox,
+                };
+            }
+            "min-width" => {
+                self.min_width = parse_length(val);
+            }
+            "max-width" => {
+                self.max_width = parse_length(val);
+            }
             _ => {}
         }
 
@@ -826,17 +872,24 @@ fn parse_box_four(s: &str, fallback: [f32; 4]) -> [f32; 4] {
     }
 }
 
-/// Parse flex-basis value: "auto" -> None, numeric length -> Some(px).
-fn parse_flex_basis(s: &str) -> Option<f32> {
+/// Parse flex-basis value: "auto" -> FlexBasis::Auto, numeric length -> FlexBasis::Pixels(px),
+/// percentage value (e.g. "50%") -> FlexBasis::Percentage(frac).
+fn parse_flex_basis(s: &str) -> FlexBasis {
     let s = s.trim();
     if s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("content") {
-        return None;
+        return FlexBasis::Auto;
     }
-    // Percentages treated as auto for now (simplification)
-    if s.ends_with('%') {
-        return None;
+    if let Some(pct_val) = s.strip_suffix('%') {
+        if let Ok(n) = pct_val.parse::<f32>() {
+            return FlexBasis::Percentage(n / 100.0);
+        }
     }
-    parse_length(s)
+    if let Some(px_val) = s.strip_suffix("px") {
+        if let Ok(n) = px_val.parse::<f32>() {
+            return FlexBasis::Pixels(n);
+        }
+    }
+    FlexBasis::Auto
 }
 
 /// Parse the flex shorthand property: "flex: <grow> <shrink>? <basis>?"
@@ -851,7 +904,7 @@ fn parse_flex_shorthand(self_vals: &mut ComputedValues, val: &str) {
     if parts.len() == 1 && parts[0].eq_ignore_ascii_case("none") {
         self_vals.flex_grow = 0.0;
         self_vals.flex_shrink = 0.0;
-        self_vals.flex_basis = Some(0.0);
+        self_vals.flex_basis = FlexBasis::Pixels(0.0);
         return;
     }
 
@@ -859,7 +912,7 @@ fn parse_flex_shorthand(self_vals: &mut ComputedValues, val: &str) {
     if parts.len() == 1 && parts[0].eq_ignore_ascii_case("auto") {
         self_vals.flex_grow = 1.0;
         self_vals.flex_shrink = 1.0;
-        self_vals.flex_basis = None;
+        self_vals.flex_basis = FlexBasis::Auto;
         return;
     }
 
@@ -877,7 +930,7 @@ fn parse_flex_shorthand(self_vals: &mut ComputedValues, val: &str) {
         if let Ok(grow) = parts[0].parse::<f32>() {
             self_vals.flex_grow = grow;
         }
-        // Second part: try as number (shrink), else try as length (basis)
+        // Second part: try as number (shrink), else try as length/percentage (basis)
         if let Ok(shrink) = parts[1].parse::<f32>() {
             self_vals.flex_shrink = shrink;
         } else {
@@ -1292,7 +1345,7 @@ mod tests {
         });
         assert_eq!(computed.flex_grow, 2.0);
         assert_eq!(computed.flex_shrink, 1.0);
-        assert_eq!(computed.flex_basis, Some(100.0));
+        assert_eq!(computed.flex_basis, FlexBasis::Pixels(100.0));
     }
 
     #[test]
@@ -1304,7 +1357,7 @@ mod tests {
         });
         assert_eq!(computed.flex_grow, 0.0);
         assert_eq!(computed.flex_shrink, 0.0);
-        assert_eq!(computed.flex_basis, Some(0.0));
+        assert_eq!(computed.flex_basis, FlexBasis::Pixels(0.0));
     }
 
     #[test]
@@ -1316,7 +1369,7 @@ mod tests {
         });
         assert_eq!(computed.flex_grow, 1.0);
         assert_eq!(computed.flex_shrink, 1.0);
-        assert_eq!(computed.flex_basis, None);
+        assert_eq!(computed.flex_basis, FlexBasis::Auto);
     }
 
     #[test]
@@ -1328,7 +1381,7 @@ mod tests {
         });
         assert_eq!(computed.flex_grow, 3.0);
         assert_eq!(computed.flex_shrink, 1.0); // default
-        assert_eq!(computed.flex_basis, None); // default
+        assert_eq!(computed.flex_basis, FlexBasis::Auto); // default
     }
 
     #[test]
@@ -1343,7 +1396,7 @@ mod tests {
         assert_eq!(computed.column_gap, 0.0);
         assert_eq!(computed.flex_grow, 0.0);
         assert_eq!(computed.flex_shrink, 1.0);
-        assert_eq!(computed.flex_basis, None);
+        assert_eq!(computed.flex_basis, FlexBasis::Auto);
     }
 
     #[test]
@@ -1774,5 +1827,25 @@ mod tests {
         } else {
             assert!(false, "Expected to find a <div> node");
         }
+    }
+
+    #[test]
+    fn test_parse_flex_basis_percentage_50() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "flex-basis".to_string(),
+            value: "50%".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.flex_basis, FlexBasis::Percentage(0.5));
+    }
+
+    #[test]
+    fn test_parse_box_sizing_border_box() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "box-sizing".to_string(),
+            value: "border-box".to_string(),
+            important: false,
+        });
+        assert_eq!(computed.box_sizing, BoxSizing::BorderBox);
     }
 }

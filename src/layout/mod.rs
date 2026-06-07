@@ -6,8 +6,8 @@
 /// - Inline text layout
 /// - Render tree construction
 use crate::css::{
-    AlignContent, AlignItems, ComputedValues, DisplayType, FlexDirection, FlexWrap, JustifyContent,
-    Overflow, PositionType,
+    AlignContent, AlignItems, BoxSizing, ComputedValues, DisplayType, FlexBasis, FlexDirection,
+    FlexWrap, JustifyContent, Overflow, PositionType,
 };
 use rustc_hash::FxHashMap;
 
@@ -133,8 +133,16 @@ pub struct LayoutNode {
     /// Flex item properties
     pub flex_grow: f32,
     pub flex_shrink: f32,
-    /// Flex basis (None = auto)
-    pub flex_basis: Option<f32>,
+    /// Flex basis
+    pub flex_basis: FlexBasis,
+    /// Box sizing model
+    pub box_sizing: BoxSizing,
+    /// Explicit width/height from CSS (for border-box support)
+    pub explicit_width: Option<f32>,
+    pub explicit_height: Option<f32>,
+    /// Min/max width constraints
+    pub min_width: Option<f32>,
+    pub max_width: Option<f32>,
     /// URL of an image source for <img> tags (None = not an image).
     pub image_src: Option<String>,
     /// Line boxes for block containers with inline children (None = no inline layout computed yet).
@@ -174,7 +182,12 @@ impl LayoutNode {
             column_gap: 0.0,
             flex_grow: 0.0,
             flex_shrink: 1.0,
-            flex_basis: None,
+            flex_basis: FlexBasis::Auto,
+            box_sizing: BoxSizing::ContentBox,
+            explicit_width: None,
+            explicit_height: None,
+            min_width: None,
+            max_width: None,
             image_src: None,
             line_boxes: None,
             overflow: Overflow::Visible,
@@ -276,6 +289,14 @@ where
     root_layout.font_size = root_styles.font_size;
     root_layout.font_family = root_styles.font_family.clone();
 
+    // Copy box-sizing, explicit dimensions, flex basis, and min/max width
+    root_layout.box_sizing = root_styles.box_sizing;
+    root_layout.explicit_width = root_styles.explicit_width;
+    root_layout.explicit_height = root_styles.explicit_height;
+    root_layout.min_width = root_styles.min_width;
+    root_layout.max_width = root_styles.max_width;
+    root_layout.flex_basis = root_styles.flex_basis;
+
     if let Some(node) = root_dom {
         build_layout_children(&mut root_layout, &node.children_ids(), styles, get_node, 0);
     }
@@ -300,7 +321,7 @@ fn build_layout_children<N, F>(
 {
     if depth > MAX_LAYOUT_DEPTH {
         // Safety: prevent stack overflow on deeply nested DOM trees.
-        // Silently stop building — the page will render partially rather than crash.
+        // Silently stop building  Ethe page will render partially rather than crash.
         return;
     }
 
@@ -338,6 +359,11 @@ fn build_layout_children<N, F>(
                     layout_node.flex_grow = child_styles.flex_grow;
                     layout_node.flex_shrink = child_styles.flex_shrink;
                     layout_node.flex_basis = child_styles.flex_basis;
+                    layout_node.box_sizing = child_styles.box_sizing;
+                    layout_node.explicit_width = child_styles.explicit_width;
+                    layout_node.explicit_height = child_styles.explicit_height;
+                    layout_node.min_width = child_styles.min_width;
+                    layout_node.max_width = child_styles.max_width;
 
                     // Copy overflow and positioning properties
                     layout_node.overflow = child_styles.overflow_x;
@@ -676,7 +702,7 @@ fn compute_block_children(
                 DisplayType::Inline | DisplayType::InlineBlock
             )
         {
-            // Start of an inline run — collect consecutive inline children
+            // Start of an inline run  Ecollect consecutive inline children
             let mut run_end = i;
             while run_end < children_count && is_inline_child(&parent.children[run_end]) {
                 run_end += 1;
@@ -788,7 +814,7 @@ fn compute_block_children(
 
             i += 1;
         } else {
-            // display:none or unclassified — skip
+            // display:none or unclassified  Eskip
             i += 1;
         }
     }
@@ -953,14 +979,36 @@ fn compute_flex_children(
                 child.margin[0] + child.margin[2] // top + bottom
             };
 
-            let basis = if let Some(b) = child.flex_basis {
-                b
-            } else if is_row && child.rect.width > 0.0 {
-                child.rect.width
-            } else if !is_row && child.rect.height > 0.0 {
-                child.rect.height
-            } else {
-                compute_flex_item_content_main_size(child, is_row)
+            let basis = match child.flex_basis {
+                FlexBasis::Auto => {
+                    // Use explicit width if set, accounting for box-sizing
+                    if let Some(explicit_w) = child.explicit_width {
+                        match child.box_sizing {
+                            BoxSizing::BorderBox => {
+                                (explicit_w - child.padding[1] - child.padding[3]).max(0.0)
+                            }
+                            BoxSizing::ContentBox => explicit_w,
+                        }
+                    } else {
+                        // Content-based sizing
+                        if is_row && child.rect.width > 0.0 {
+                            child.rect.width
+                        } else if !is_row && child.rect.height > 0.0 {
+                            child.rect.height
+                        } else {
+                            compute_flex_item_content_main_size(child, is_row)
+                        }
+                    }
+                }
+                FlexBasis::Pixels(p) => p,
+                FlexBasis::Percentage(frac) => {
+                    let available = if is_row {
+                        available_width - child.margin[1] - child.margin[3]
+                    } else {
+                        available_width - child.margin[0] - child.margin[2]
+                    };
+                    (available * frac).max(0.0)
+                }
             };
 
             FlexItemState {
@@ -1102,6 +1150,22 @@ fn compute_flex_children(
                 }
             }
         }
+
+        // Clamp to min-width / max-width constraints
+        for &i in &line.item_indices {
+            let child = &parent.children[i];
+            let content_size = states[i].basis + states[i].main_margin;
+            if let Some(min_w) = child.min_width {
+                if content_size < min_w {
+                    states[i].basis = (min_w - states[i].main_margin).max(0.0);
+                }
+            }
+            if let Some(max_w) = child.max_width {
+                if content_size > max_w {
+                    states[i].basis = (max_w - states[i].main_margin).max(0.0);
+                }
+            }
+        }
     }
 
     // --- Step 5: Position children by line ---
@@ -1213,7 +1277,7 @@ fn compute_flex_children(
                             - parent.children[i].margin[0]
                             - parent.children[i].margin[2])
                             .max(0.0);
-                        if parent.children[i].flex_basis.is_none()
+                        if matches!(parent.children[i].flex_basis, FlexBasis::Auto)
                             || parent.children[i].rect.height <= 0.0
                         {
                             // Only stretch items without explicit height
@@ -1469,7 +1533,7 @@ fn build_inline_boxes(_parent: &LayoutNode, children: &[LayoutNode]) -> Vec<Inli
                 baseline_offset: 0.0, // filled in Step A4
             });
         }
-        // Block children are not part of inline formatting context — skip them
+        // Block children are not part of inline formatting context  Eskip them
     }
 
     boxes
@@ -1971,7 +2035,7 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
     let mut texts = Vec::new();
 
     // If this node has inline layout (line_boxes), walk them instead of recursing
-    // into children for text collection — the line boxes hold the authoritative
+    // into children for text collection  Ethe line boxes hold the authoritative
     // positions and word-split text fragments.
     if let Some(ref line_boxes) = node.line_boxes {
         let base_x = node.rect.x + node.padding[3] + node.border[3];
@@ -2005,11 +2069,11 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
                         x_offset += *width;
                     }
                     InlineBox::Element { width, .. } => {
-                        // Inline elements are just spacing in the line — skip for text
+                        // Inline elements are just spacing in the line  Eskip for text
                         x_offset += *width;
                     }
                     InlineBox::Whitespace { width, .. } => {
-                        // Whitespace is just horizontal spacing — skip
+                        // Whitespace is just horizontal spacing  Eskip
                         x_offset += *width;
                     }
                 }
@@ -2263,7 +2327,7 @@ mod tests {
 
         test_compute_layout(&mut root, 800.0);
 
-        // Both children have basis=0 and no grow → both get full container width split evenly via shrink
+        // Both children have basis=0 and no grow ↁEboth get full container width split evenly via shrink
         // Actually with no grow, no basis, the free_space = 800 - 0 = 800 > 0 but total_grow = 0
         // So no distribution happens, items stay at 0 width. Let's verify horizontal positioning:
         assert!(root.children[0].rect.x <= root.children[1].rect.x);
@@ -2298,7 +2362,7 @@ mod tests {
 
     #[test]
     fn test_flex_grow_weighted() {
-        // grow:2 and grow:1 → 2:1 ratio of free space
+        // grow:2 and grow:1 ↁE2:1 ratio of free space
         let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 900.0, 0.0));
         root.display = DisplayType::Flex;
         root.padding = [0.0; 4];
@@ -2313,7 +2377,7 @@ mod tests {
 
         test_compute_layout(&mut root, 900.0);
 
-        // 2:1 ratio → child1 gets 600px, child2 gets 300px
+        // 2:1 ratio ↁEchild1 gets 600px, child2 gets 300px
         assert!((root.children[0].rect.width - 600.0).abs() < 1.0);
         assert!((root.children[1].rect.width - 300.0).abs() < 1.0);
     }
@@ -2327,9 +2391,9 @@ mod tests {
         root.padding = [0.0; 4];
 
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 100.0));
-        child1.flex_basis = Some(100.0);
+        child1.flex_basis = FlexBasis::Pixels(100.0);
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 50.0));
-        child2.flex_basis = Some(50.0);
+        child2.flex_basis = FlexBasis::Pixels(50.0);
 
         root.add_child(child1);
         root.add_child(child2);
@@ -2352,11 +2416,11 @@ mod tests {
         root.padding = [0.0; 4];
 
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
-        child1.flex_basis = Some(0.0);
+        child1.flex_basis = FlexBasis::Pixels(0.0);
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
-        child2.flex_basis = Some(0.0);
+        child2.flex_basis = FlexBasis::Pixels(0.0);
         let mut child3 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
-        child3.flex_basis = Some(0.0);
+        child3.flex_basis = FlexBasis::Pixels(0.0);
 
         root.add_child(child1);
         root.add_child(child2);
@@ -2364,7 +2428,7 @@ mod tests {
 
         test_compute_layout(&mut root, 600.0);
 
-        // All items have 0 basis + no grow → all at width 0
+        // All items have 0 basis + no grow ↁEall at width 0
         // Space between: 600px / 2 gaps = 300px per gap
         assert!((root.children[0].rect.x - 0.0).abs() < 1.0);
         assert!((root.children[1].rect.x - 300.0).abs() < 1.0);
@@ -2380,7 +2444,7 @@ mod tests {
         root.padding = [0.0; 4];
 
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 0.0));
-        child1.flex_basis = Some(200.0);
+        child1.flex_basis = FlexBasis::Pixels(200.0);
 
         root.add_child(child1);
 
@@ -2392,16 +2456,16 @@ mod tests {
 
     #[test]
     fn test_flex_shrink_overflow() {
-        // Total basis (600+400=1000) exceeds container (800) → shrink proportionally
+        // Total basis (600+400=1000) exceeds container (800) ↁEshrink proportionally
         let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 0.0));
         root.display = DisplayType::Flex;
         root.padding = [0.0; 4];
 
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
-        child1.flex_basis = Some(600.0);
+        child1.flex_basis = FlexBasis::Pixels(600.0);
         child1.flex_shrink = 1.0;
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
-        child2.flex_basis = Some(400.0);
+        child2.flex_basis = FlexBasis::Pixels(400.0);
         child2.flex_shrink = 1.0;
 
         root.add_child(child1);
@@ -2410,24 +2474,24 @@ mod tests {
         test_compute_layout(&mut root, 800.0);
 
         // Overflow = 200px. Shrink weight: 1*600=600 and 1*400=400, total=1000
-        // child1 shrinks by: 200 * 600/1000 = 120 → width = 480
-        // child2 shrinks by: 200 * 400/1000 = 80 → width = 320
+        // child1 shrinks by: 200 * 600/1000 = 120 ↁEwidth = 480
+        // child2 shrinks by: 200 * 400/1000 = 80 ↁEwidth = 320
         assert!((root.children[0].rect.width - 480.0).abs() < 2.0);
         assert!((root.children[1].rect.width - 320.0).abs() < 2.0);
     }
 
     #[test]
     fn test_flex_with_basis_and_grow() {
-        // basis: 100 + 100 = 200, container: 800 → free_space = 600, split by grow 1:1
+        // basis: 100 + 100 = 200, container: 800 ↁEfree_space = 600, split by grow 1:1
         let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 0.0));
         root.display = DisplayType::Flex;
         root.padding = [0.0; 4];
 
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
-        child1.flex_basis = Some(100.0);
+        child1.flex_basis = FlexBasis::Pixels(100.0);
         child1.flex_grow = 1.0;
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
-        child2.flex_basis = Some(100.0);
+        child2.flex_basis = FlexBasis::Pixels(100.0);
         child2.flex_grow = 1.0;
 
         root.add_child(child1);
@@ -2451,9 +2515,9 @@ mod tests {
         root.padding = [0.0; 4];
 
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 100.0));
-        child1.flex_basis = Some(300.0);
+        child1.flex_basis = FlexBasis::Pixels(300.0);
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 80.0));
-        child2.flex_basis = Some(200.0);
+        child2.flex_basis = FlexBasis::Pixels(200.0);
 
         root.add_child(child1);
         root.add_child(child2);
@@ -2469,18 +2533,18 @@ mod tests {
 
     #[test]
     fn test_flex_wrap_basic() {
-        // Three items, each ~300px basis in 800px container → third wraps to second line
+        // Three items, each ~300px basis in 800px container ↁEthird wraps to second line
         let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 0.0));
         root.display = DisplayType::Flex;
         root.flex_wrap = FlexWrap::Wrap;
         root.padding = [0.0; 4];
 
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 50.0));
-        child1.flex_basis = Some(300.0);
+        child1.flex_basis = FlexBasis::Pixels(300.0);
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 60.0));
-        child2.flex_basis = Some(300.0);
+        child2.flex_basis = FlexBasis::Pixels(300.0);
         let mut child3 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 40.0));
-        child3.flex_basis = Some(300.0);
+        child3.flex_basis = FlexBasis::Pixels(300.0);
 
         root.add_child(child1);
         root.add_child(child2);
@@ -2488,7 +2552,7 @@ mod tests {
 
         test_compute_layout(&mut root, 800.0);
 
-        // First two items on line 1 (y ≈ 0)
+        // First two items on line 1 (y ≁E0)
         assert!((root.children[0].rect.y - 0.0).abs() < 1.0);
         assert!((root.children[1].rect.y - 0.0).abs() < 1.0);
         // Third item wraps to line 2 (y > first line items height)
@@ -2505,20 +2569,20 @@ mod tests {
         root.flex_wrap = FlexWrap::Wrap;
         root.padding = [0.0; 4];
 
-        // Line 1: two items with basis 500 total, grow=1 each → fill 800
+        // Line 1: two items with basis 500 total, grow=1 each ↁEfill 800
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 50.0));
-        child1.flex_basis = Some(200.0);
+        child1.flex_basis = FlexBasis::Pixels(200.0);
         child1.flex_grow = 1.0;
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 50.0));
-        child2.flex_basis = Some(300.0);
+        child2.flex_basis = FlexBasis::Pixels(300.0);
         child2.flex_grow = 1.0;
 
-        // Line 2: two items with basis 700 total, grow=1 each → fill 800
+        // Line 2: two items with basis 700 total, grow=1 each ↁEfill 800
         let mut child3 = LayoutNode::new(Rect::new(0.0, 0.0, 350.0, 50.0));
-        child3.flex_basis = Some(350.0);
+        child3.flex_basis = FlexBasis::Pixels(350.0);
         child3.flex_grow = 1.0;
         let mut child4 = LayoutNode::new(Rect::new(0.0, 0.0, 350.0, 50.0));
-        child4.flex_basis = Some(350.0);
+        child4.flex_basis = FlexBasis::Pixels(350.0);
         child4.flex_grow = 1.0;
 
         root.add_child(child1);
@@ -2528,10 +2592,10 @@ mod tests {
 
         test_compute_layout(&mut root, 800.0);
 
-        // Line 1: basis total = 500, free = 300. Each grows by 150 → widths: 350, 450
+        // Line 1: basis total = 500, free = 300. Each grows by 150 ↁEwidths: 350, 450
         assert!((root.children[0].rect.width - 350.0).abs() < 2.0);
         assert!((root.children[1].rect.width - 450.0).abs() < 2.0);
-        // Line 2: basis total = 700, free = 100. Each grows by 50 → widths: 400, 400
+        // Line 2: basis total = 700, free = 100. Each grows by 50 ↁEwidths: 400, 400
         assert!((root.children[2].rect.width - 400.0).abs() < 2.0);
         assert!((root.children[3].rect.width - 400.0).abs() < 2.0);
         // Items on line 2 have larger y
@@ -2547,11 +2611,11 @@ mod tests {
         root.padding = [0.0; 4];
 
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 50.0));
-        child1.flex_basis = Some(300.0);
+        child1.flex_basis = FlexBasis::Pixels(300.0);
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 60.0));
-        child2.flex_basis = Some(300.0);
+        child2.flex_basis = FlexBasis::Pixels(300.0);
         let mut child3 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 40.0));
-        child3.flex_basis = Some(300.0);
+        child3.flex_basis = FlexBasis::Pixels(300.0);
 
         root.add_child(child1);
         root.add_child(child2);
@@ -2580,9 +2644,9 @@ mod tests {
         root.padding = [0.0; 4];
 
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 50.0));
-        child1.flex_basis = Some(200.0);
+        child1.flex_basis = FlexBasis::Pixels(200.0);
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 50.0));
-        child2.flex_basis = Some(200.0);
+        child2.flex_basis = FlexBasis::Pixels(200.0);
 
         root.add_child(child1);
         root.add_child(child2);
@@ -2605,13 +2669,13 @@ mod tests {
 
         // First line: two items that fit
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 400.0, 50.0));
-        child1.flex_basis = Some(400.0);
+        child1.flex_basis = FlexBasis::Pixels(400.0);
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 400.0, 60.0));
-        child2.flex_basis = Some(400.0);
+        child2.flex_basis = FlexBasis::Pixels(400.0);
 
         // Third item wraps to line 2
         let mut child3 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 40.0));
-        child3.flex_basis = Some(300.0);
+        child3.flex_basis = FlexBasis::Pixels(300.0);
 
         root.add_child(child1);
         root.add_child(child2);
@@ -2623,7 +2687,7 @@ mod tests {
         assert!((root.children[0].rect.y - 0.0).abs() < 1.0);
         assert!((root.children[1].rect.y - 0.0).abs() < 1.0);
         // Line 2 item should start at y = max(line1 cross_size) + row_gap
-        // child1 cross ~50, child2 cross ~60 → line height ≈ 60 + 16 gap = 76
+        // child1 cross ~50, child2 cross ~60 ↁEline height ≁E60 + 16 gap = 76
         assert!(root.children[2].rect.y >= root.children[1].rect.bottom());
         // Verify the gap is included: child3.y should be > child2.bottom() by row_gap
         let gap_between = root.children[2].rect.y - root.children[1].rect.bottom();
@@ -2639,10 +2703,10 @@ mod tests {
         root.padding = [0.0; 4];
 
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 50.0));
-        child1.flex_basis = Some(100.0);
+        child1.flex_basis = FlexBasis::Pixels(100.0);
         child1.flex_grow = 1.0;
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 50.0));
-        child2.flex_basis = Some(100.0);
+        child2.flex_basis = FlexBasis::Pixels(100.0);
         child2.flex_grow = 1.0;
 
         root.add_child(child1);
@@ -2651,7 +2715,7 @@ mod tests {
         test_compute_layout(&mut root, 840.0);
 
         // Total basis = 200, gap = 20, free_space = 840 - 200 - 20 = 620
-        // Each grows by 310 → widths: 410, 410
+        // Each grows by 310 ↁEwidths: 410, 410
         assert!((root.children[0].rect.width - 410.0).abs() < 2.0);
         assert!((root.children[1].rect.width - 410.0).abs() < 2.0);
         // child2.x should be at 410 + 20 = 430
@@ -2669,13 +2733,13 @@ mod tests {
 
         // Line 1: two items totaling 800px (fills container exactly)
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 500.0, 40.0));
-        child1.flex_basis = Some(500.0);
+        child1.flex_basis = FlexBasis::Pixels(500.0);
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 50.0));
-        child2.flex_basis = Some(300.0);
+        child2.flex_basis = FlexBasis::Pixels(300.0);
 
         // Line 2: one item that wraps
         let mut child3 = LayoutNode::new(Rect::new(0.0, 0.0, 400.0, 40.0));
-        child3.flex_basis = Some(400.0);
+        child3.flex_basis = FlexBasis::Pixels(400.0);
 
         root.add_child(child1);
         root.add_child(child2);
@@ -2683,8 +2747,8 @@ mod tests {
 
         test_compute_layout(&mut root, 800.0);
 
-        // Lines total cross-size ≈ max(50, 50) + max(40, 0) = ~90 (plus gaps)
-        // Container height is 300, so excess ≈ 210px should be distributed as centering
+        // Lines total cross-size ≁Emax(50, 50) + max(40, 0) = ~90 (plus gaps)
+        // Container height is 300, so excess ≁E210px should be distributed as centering
         // First line items should be pushed down by about half the excess
         assert!(root.children[0].rect.y > 50.0); // shifted down from top
         // Second line should also be below first line
@@ -2701,15 +2765,15 @@ mod tests {
         root.padding = [0.0; 4];
 
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 500.0, 50.0));
-        child1.flex_basis = Some(500.0);
+        child1.flex_basis = FlexBasis::Pixels(500.0);
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 400.0, 60.0));
-        child2.flex_basis = Some(400.0);
+        child2.flex_basis = FlexBasis::Pixels(400.0);
 
         // Wraps to line 2
         let mut child3 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 50.0));
-        child3.flex_basis = Some(300.0);
+        child3.flex_basis = FlexBasis::Pixels(300.0);
         let mut child4 = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 40.0));
-        child4.flex_basis = Some(200.0);
+        child4.flex_basis = FlexBasis::Pixels(200.0);
 
         root.add_child(child1);
         root.add_child(child2);
@@ -2735,15 +2799,15 @@ mod tests {
         root.justify_content = JustifyContent::Center;
         root.padding = [0.0; 4];
 
-        // Line 1: two items (600 total), centered → offset of 100px
+        // Line 1: two items (600 total), centered ↁEoffset of 100px
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 50.0));
-        child1.flex_basis = Some(300.0);
+        child1.flex_basis = FlexBasis::Pixels(300.0);
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 50.0));
-        child2.flex_basis = Some(300.0);
+        child2.flex_basis = FlexBasis::Pixels(300.0);
 
-        // Line 2: one item (400), centered → offset of 200px
+        // Line 2: one item (400), centered ↁEoffset of 200px
         let mut child3 = LayoutNode::new(Rect::new(0.0, 0.0, 400.0, 50.0));
-        child3.flex_basis = Some(400.0);
+        child3.flex_basis = FlexBasis::Pixels(400.0);
 
         root.add_child(child1);
         root.add_child(child2);
@@ -2751,9 +2815,9 @@ mod tests {
 
         test_compute_layout(&mut root, 800.0);
 
-        // Line 1: total width 600, centered → x starts at (800-600)/2 = 100
+        // Line 1: total width 600, centered ↁEx starts at (800-600)/2 = 100
         assert!((root.children[0].rect.x - 100.0).abs() < 2.0);
-        // Line 2: total width 400, centered → x starts at (800-400)/2 = 200
+        // Line 2: total width 400, centered ↁEx starts at (800-400)/2 = 200
         assert!((root.children[2].rect.x - 200.0).abs() < 2.0);
     }
 
@@ -2766,10 +2830,10 @@ mod tests {
         root.padding = [0.0; 4];
 
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 50.0));
-        child1.flex_basis = Some(200.0);
+        child1.flex_basis = FlexBasis::Pixels(200.0);
         // This item is wider than the container itself
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 700.0, 60.0));
-        child2.flex_basis = Some(700.0);
+        child2.flex_basis = FlexBasis::Pixels(700.0);
 
         root.add_child(child1);
         root.add_child(child2);
@@ -2797,15 +2861,15 @@ mod tests {
 
         // Line 1: fills container width
         let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 500.0, 40.0));
-        child1.flex_basis = Some(500.0);
+        child1.flex_basis = FlexBasis::Pixels(500.0);
         let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 50.0));
-        child2.flex_basis = Some(300.0);
+        child2.flex_basis = FlexBasis::Pixels(300.0);
 
         // Line 2: wraps
         let mut child3 = LayoutNode::new(Rect::new(0.0, 0.0, 400.0, 30.0));
-        child3.flex_basis = Some(400.0);
+        child3.flex_basis = FlexBasis::Pixels(400.0);
         let mut child4 = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 45.0));
-        child4.flex_basis = Some(200.0);
+        child4.flex_basis = FlexBasis::Pixels(200.0);
 
         root.add_child(child1);
         root.add_child(child2);
@@ -2838,7 +2902,7 @@ mod tests {
         text_child.text = Some("Hello".to_string());
 
         let empty_child = LayoutNode::new(Rect::new(10.0, 50.0, 200.0, 30.0));
-        // No text — should be skipped
+        // No text  Eshould be skipped
 
         root.add_child(text_child);
         root.add_child(empty_child);
@@ -3296,7 +3360,7 @@ mod tests {
         let lines = break_into_lines(boxes, 800.0, &mut renderer);
 
         assert_eq!(lines.len(), 1, "Same-size text fits on one line");
-        // All text is 16px → max_font_size = 16.0
+        // All text is 16px ↁEmax_font_size = 16.0
         // ascender = 16.0 * 0.8 = 12.8, baseline_y = 0 + 12.8 = 12.8
         assert!(
             (lines[0].baseline_y - 12.8).abs() < 0.5,
@@ -3329,7 +3393,7 @@ mod tests {
                 text: "Large".to_string(),
                 width: 0.0,
                 color: None,
-                font_size: 24.0, // larger — determines line metrics
+                font_size: 24.0, // larger  Edetermines line metrics
             },
         ];
 
@@ -3612,7 +3676,7 @@ mod tests {
         let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
         root.padding = [0.0; 4];
         root.border = [0.0; 4];
-        // Set a green background on the container — this should NOT be used as text color
+        // Set a green background on the container  Ethis should NOT be used as text color
         root.background_color = Some([0, 255, 0, 255]);
 
         let line_boxes = vec![LineBox {
@@ -3649,7 +3713,7 @@ mod tests {
         text_child.color = Some([128, 0, 128, 255]); // purple foreground
 
         root.add_child(text_child);
-        // line_boxes is None → fallback behavior
+        // line_boxes is None ↁEfallback behavior
 
         let texts = collect_text_nodes(&root);
 
@@ -4144,5 +4208,127 @@ mod tests {
         assert_eq!(gc2_rect.0.y, 10.0);
         assert_eq!(gc2_rect.0.width, 30.0);
         assert_eq!(gc2_rect.0.height, 30.0);
+    }
+
+    // ------ Box Sizing Tests ------
+
+    #[test]
+    fn test_block_border_box_width() {
+        // With border-box, the content width = total width - padding - border
+        let arena = crate::html::parse_html(
+            "<div style='width:200px; box-sizing:border-box; padding:10px'><p>content</p></div>",
+        );
+        let stylesheet = crate::css::parser::parse_stylesheet(
+            "div { width: 200px; box-sizing: border-box; padding: 10px; }",
+        );
+        let styles = crate::css::compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let div_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
+        });
+        drop(nodes);
+
+        let div_id = div_id.expect("Expected to find a <div> node");
+
+        let root_layout = build_layout_tree(
+            div_id as u32,
+            &styles,
+            |id| {
+                let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(id));
+                arena.get(handle)
+            },
+            800.0,
+        );
+
+        // Verify the layout node has border-box and explicit width
+        assert_eq!(root_layout.box_sizing, BoxSizing::BorderBox);
+        assert_eq!(root_layout.explicit_width, Some(200.0));
+    }
+
+    // ------ Flex Percentage Basis Tests ------
+
+    #[test]
+    fn test_flex_percentage_basis_two_columns() {
+        // Two flex items with 50% flex-basis each should split the container evenly
+        let arena = crate::html::parse_html(
+            "<div style='display:flex'><div style='flex-basis:50%'>left</div><div style='flex-basis:50%'>right</div></div>",
+        );
+        let stylesheet = crate::css::parser::parse_stylesheet(
+            "div { display: flex; } div > div { flex-basis: 50%; }",
+        );
+        let styles = crate::css::compute_styles_for_tree(&arena, &stylesheet);
+
+        let nodes = arena.nodes.borrow();
+        let container_id = nodes.iter().position(|n| {
+            n.is_element()
+                && n.tag_name()
+                    .map(|t| t.to_string() == "div")
+                    .unwrap_or(false)
+        });
+        drop(nodes);
+
+        let container_id = container_id.expect("Expected to find a <div> container");
+
+        let mut root_layout = build_layout_tree(
+            container_id as u32,
+            &styles,
+            |id| {
+                let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(id));
+                arena.get(handle)
+            },
+            800.0,
+        );
+
+        test_compute_layout(&mut root_layout, 800.0);
+
+        // Each child with 50% basis should get ~400px (50% of 800)
+        if root_layout.children.len() >= 2 {
+            assert!(
+                (root_layout.children[0].rect.width - 400.0).abs() < 10.0,
+                "First child width should be ~400px (50%% of 800), got {}",
+                root_layout.children[0].rect.width
+            );
+            assert!(
+                (root_layout.children[1].rect.width - 400.0).abs() < 10.0,
+                "Second child width should be ~400px (50%% of 800), got {}",
+                root_layout.children[1].rect.width
+            );
+        }
+    }
+
+    // ------ Min/Max Width Clamping Tests ------
+
+    #[test]
+    fn test_flex_min_width_clamp() {
+        // Flex items with min-width constraint should not shrink below that value
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 400.0, 0.0));
+        root.display = DisplayType::Flex;
+        root.padding = [0.0; 4];
+
+        let mut child1 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
+        child1.flex_basis = FlexBasis::Pixels(100.0);
+        child1.flex_shrink = 1.0;
+        child1.min_width = Some(150.0);
+
+        let mut child2 = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
+        child2.flex_basis = FlexBasis::Pixels(300.0);
+        child2.flex_shrink = 1.0;
+
+        root.add_child(child1);
+        root.add_child(child2);
+
+        test_compute_layout(&mut root, 400.0);
+
+        // Without min-width clamp, child1 would shrink below 150px.
+        // With min_width=150, it should not go below that.
+        assert!(
+            root.children[0].rect.width >= 150.0 - 1.0,
+            "Child with min_width should not shrink below 150px, got {}",
+            root.children[0].rect.width
+        );
     }
 }

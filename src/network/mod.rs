@@ -247,8 +247,15 @@ mod tests {
         let result = fetch("https://www.amazon.co.jp").await;
         assert!(result.is_ok(), "Fetch should succeed");
         let fetch_result = result.unwrap();
-        assert!(!fetch_result.final_url.is_empty(), "final_url should be set");
-        assert!(fetch_result.final_url.contains("amazon"), "Should redirect to amazon domain: {}", fetch_result.final_url);
+        assert!(
+            !fetch_result.final_url.is_empty(),
+            "final_url should be set"
+        );
+        assert!(
+            fetch_result.final_url.contains("amazon"),
+            "Should redirect to amazon domain: {}",
+            fetch_result.final_url
+        );
         // Note: Amazon may return empty content or a WAF challenge page for automated requests.
         // Content validation is skipped in CI/automated environments.
     }
@@ -259,7 +266,9 @@ mod tests {
         let result = fetch("http://example.com").await;
         assert!(result.is_ok());
         let fetch_result = result.unwrap();
-        assert!(fetch_result.content.contains("<!DOCTYPE") || fetch_result.content.contains("<html"));
+        assert!(
+            fetch_result.content.contains("<!DOCTYPE") || fetch_result.content.contains("<html")
+        );
         assert!(fetch_result.final_url.starts_with("http://example.com"));
     }
 

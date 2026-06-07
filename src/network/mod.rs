@@ -151,6 +151,17 @@ pub fn extract_css(html_content: &str) -> String {
     css_parts.join("\n")
 }
 
+/// Fetch image bytes from a URL with a 15-second timeout and the standard User-Agent.
+pub async fn fetch_image(url: &str) -> Result<Vec<u8>, NetworkError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("Mozilla/5.0 Mistilteinn/0.1")
+        .build()
+        .map_err(NetworkError::Http)?;
+    let bytes = client.get(url).send().await?.bytes().await?;
+    Ok(bytes.to_vec())
+}
+
 /// Fetch a single CSS file with a shorter timeout (10s) and the standard User-Agent.
 async fn fetch_css_file(url: &str) -> Result<String, NetworkError> {
     let client = reqwest::Client::builder()
@@ -417,5 +428,29 @@ mod tests {
         let result = fetch_external_css("https://example.com", html).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_resolve_image_relative_path() {
+        assert_eq!(
+            resolve_url("https://example.com/page/", "images/logo.png"),
+            "https://example.com/page/images/logo.png"
+        );
+    }
+
+    #[test]
+    fn test_resolve_image_root_path() {
+        assert_eq!(
+            resolve_url("https://example.com/page/index.html", "/assets/img.png"),
+            "https://example.com/assets/img.png"
+        );
+    }
+
+    #[test]
+    fn test_resolve_image_already_absolute() {
+        assert_eq!(
+            resolve_url("https://example.com", "https://cdn.example.com/image.jpg"),
+            "https://cdn.example.com/image.jpg"
+        );
     }
 }

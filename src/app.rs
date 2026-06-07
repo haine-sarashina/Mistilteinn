@@ -259,6 +259,30 @@ impl MistilteinnApp {
                 );
             }
 
+            // Composite cached images from page cache (scrolling, no network fetch)
+            for img_info in &image_nodes {
+                let resolved_src = if !page.page_url.is_empty() {
+                    crate::network::resolve_url(&page.page_url, &img_info.src)
+                } else {
+                    img_info.src.clone()
+                };
+
+                if let Some(cached) = page.image_cache.get(&resolved_src) {
+                    let img_x = img_info.x - scroll_offset.0;
+                    let img_y = img_info.y - scroll_offset.1;
+                    crate::render::composite_image(
+                        &cached.rgba,
+                        cached.width,
+                        cached.height,
+                        &mut composite_buffer,
+                        view_width as u32,
+                        view_height as u32,
+                        img_x,
+                        img_y,
+                    );
+                }
+            }
+
             // Upload the composite bitmap to GPU
             renderer.set_text_bitmap(view_width, view_height, &composite_buffer);
             log::info!(
@@ -350,16 +374,25 @@ impl MistilteinnApp {
             css
         };
 
-        self.load_page_async(&html, &final_css).await;
+        self.load_page_async(&html, &final_css, Some(&final_url))
+            .await;
         self.tab_manager.set_active_tab_loading(false);
     }
 
     /// Load a page asynchronously (fetches and composites images).
-    pub async fn load_page_async(&mut self, html_source: &str, css_source: &str) {
+    pub async fn load_page_async(
+        &mut self,
+        html_source: &str,
+        css_source: &str,
+        base_url: Option<&str>,
+    ) {
         let w = self.window_width() as f32 - TAB_BAR_WIDTH as f32;
         let h = self.window_height() as f32 - ADDRESS_BAR_HEIGHT as f32;
 
-        let new_page = crate::page::Page::new(html_source, css_source, w, h);
+        let mut new_page = crate::page::Page::new(html_source, css_source, w, h);
+        if let Some(url) = &base_url {
+            new_page.page_url = url.to_string();
+        }
         self.tab_manager.set_active_tab_page(new_page);
 
         // Read scroll offset before borrowing page
@@ -467,51 +500,79 @@ impl MistilteinnApp {
                 );
             }
 
-            // Fetch and composite image nodes into the buffer
-            for img_info in &image_nodes {
-                let img_x = img_info.x - scroll_offset.0;
-                let img_y = img_info.y - scroll_offset.1;
-                match reqwest::get(&img_info.src).await {
-                    Ok(response) => {
-                        let bytes = match response.bytes().await {
-                            Ok(b) => b,
-                            Err(e) => {
-                                log::warn!(
-                                    "Failed to read image bytes for {}: {:?}",
-                                    img_info.src,
-                                    e
-                                );
-                                continue;
-                            }
-                        };
-
-                        if let Ok(img) = image::load_from_memory(&bytes) {
-                            let rgba = img.to_rgba8();
-                            let (iw, ih) = rgba.dimensions();
-                            crate::render::composite_image(
-                                rgba.as_raw(),
-                                iw,
-                                ih,
-                                &mut composite_buffer,
-                                view_width,
-                                view_height,
-                                img_x,
-                                img_y,
-                            );
-                            log::info!(
-                                "Loaded image: {} ({}x{}) at ({}, {})",
-                                img_info.src,
-                                iw,
-                                ih,
-                                img_x,
-                                img_y
-                            );
-                        } else {
-                            log::warn!("Failed to decode image: {}", img_info.src);
-                        }
+            // Resolve image URLs against base_url before concurrent fetching
+            let resolved_srcs: Vec<String> = image_nodes
+                .iter()
+                .map(|img| {
+                    if let Some(base) = base_url {
+                        crate::network::resolve_url(base, &img.src)
+                    } else {
+                        img.src.clone()
                     }
-                    Err(e) => {
-                        log::warn!("Failed to fetch image {}: {:?}", img_info.src, e);
+                })
+                .collect();
+
+            // Build concurrent fetch futures
+            let fetch_futures =
+                resolved_srcs
+                    .iter()
+                    .zip(image_nodes.iter())
+                    .map(|(src, img_info)| {
+                        let src_clone = src.clone();
+                        let img_x = img_info.x - scroll_offset.0;
+                        let img_y = img_info.y - scroll_offset.1;
+                        async move {
+                            match crate::network::fetch_image(&src_clone).await {
+                                Ok(bytes) => {
+                                    if let Ok(img) = image::load_from_memory(&bytes) {
+                                        let rgba = img.to_rgba8();
+                                        let (iw, ih) = rgba.dimensions();
+                                        log::info!("Decoded image: {} ({}x{})", src_clone, iw, ih);
+                                        Some((src_clone, rgba.into_raw(), iw, ih, img_x, img_y))
+                                    } else {
+                                        log::warn!("Failed to decode image: {}", src_clone);
+                                        None
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to fetch image {}: {:?}", src_clone, e);
+                                    None
+                                }
+                            }
+                        }
+                    });
+
+            let results = futures::future::join_all(fetch_futures).await;
+
+            // Composite all successful images and collect for caching
+            let mut items_to_cache = Vec::new();
+            for result in results.into_iter().flatten() {
+                let (src, pixels, iw, ih, ix, iy) = result;
+                crate::render::composite_image(
+                    &pixels,
+                    iw,
+                    ih,
+                    &mut composite_buffer,
+                    view_width,
+                    view_height,
+                    ix,
+                    iy,
+                );
+                items_to_cache.push((src, pixels, iw, ih));
+            }
+
+            // Write to page image cache
+            if let Some(tab) = self.tab_manager.active_tab_mut() {
+                if let Some(ref mut page) = tab.page {
+                    for (src, rgba, width, height) in items_to_cache {
+                        page.image_cache.insert(
+                            src,
+                            crate::page::CachedImage {
+                                rgba,
+                                width,
+                                height,
+                            },
+                        );
                     }
                 }
             }

@@ -8,6 +8,14 @@ use crate::css;
 use crate::html::{self, DomArena, DomHandle, NodeId};
 use crate::layout::Rect;
 
+/// Cached decoded image data.
+#[derive(Clone)]
+pub struct CachedImage {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// A fully parsed and laid-out page ready for rendering.
 pub struct Page {
     pub arena: DomArena,
@@ -16,6 +24,8 @@ pub struct Page {
     pub layout_root: crate::layout::LayoutNode,
     pub view_width: f32,
     pub view_height: f32,
+    pub page_url: String,
+    pub image_cache: FxHashMap<String, CachedImage>,
 }
 
 impl Page {
@@ -89,6 +99,8 @@ impl Page {
             layout_root,
             view_width,
             view_height,
+            page_url: String::new(),
+            image_cache: FxHashMap::default(),
         }
     }
 
@@ -274,5 +286,26 @@ mod tests {
             img_node.unwrap().image_src.as_deref(),
             Some("https://example.com/logo.png")
         );
+    }
+
+    #[test]
+    fn page_has_empty_image_cache() {
+        let page = Page::new("<html><body></body></html>", "", 800.0, 600.0);
+        assert!(page.image_cache.is_empty());
+    }
+
+    #[test]
+    fn page_caches_images() {
+        let mut page = Page::new("<html><body></body></html>", "", 800.0, 600.0);
+        let dummy_rgba = vec![255u8, 0, 0, 255]; // 1x1 red pixel
+        page.image_cache.insert(
+            "test.png".to_string(),
+            CachedImage {
+                rgba: dummy_rgba,
+                width: 1,
+                height: 1,
+            },
+        );
+        assert_eq!(page.image_cache.len(), 1);
     }
 }

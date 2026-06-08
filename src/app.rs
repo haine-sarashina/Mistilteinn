@@ -2,6 +2,7 @@ use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
     window::WindowAttributes,
 };
 
@@ -13,8 +14,10 @@ const TAB_BAR_WIDTH: u32 = 200;
 const ADDRESS_BAR_HEIGHT: u32 = 40;
 const TAB_BUTTON_HEIGHT: f32 = 45.0;
 const TAB_BUTTON_SPACING: f32 = 4.0;
+const GROUP_HEADER_HEIGHT: f32 = 30.0;
 const TAB_BUTTON_X: f32 = 10.0;
 const TAB_BUTTON_RIGHT_MARGIN: f32 = 20.0;
+const TAB_GROUP_COLOR_STRIP_WIDTH: f32 = 4.0;
 const LOADING_BAR_HEIGHT: f32 = 3.0;
 const LOADING_BAR_COLOR_R: f32 = 80.0 / 255.0;
 const LOADING_BAR_COLOR_G: f32 = 140.0 / 255.0;
@@ -25,7 +28,32 @@ pub struct MistilteinnApp {
     renderer: Option<Renderer>,
     pub start_url: Option<String>,
     tab_manager: crate::browser::tab::TabManager,
+    group_manager: crate::browser::tab_group::GroupManager,
     tokio_handle: Option<tokio::runtime::Handle>,
+    /// Tracks the current cursor position for hit-testing chrome elements.
+    cursor_pos: (f32, f32),
+    /// Whether Ctrl key is currently pressed (for keyboard shortcuts).
+    ctrl_pressed: bool,
+}
+
+/// Hit-test result for tab bar clicks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HitTestResult {
+    /// Clicked on a group header (toggle collapse)
+    GroupHeader(crate::browser::tab_group::GroupId),
+    /// Clicked on a tab button
+    TabButton(crate::browser::tab::TabId),
+    /// Clicked on empty space in tab bar
+    Empty,
+}
+
+impl HitTestResult {
+    fn into_tab_id(self) -> Option<crate::browser::tab::TabId> {
+        match self {
+            HitTestResult::TabButton(id) => Some(id),
+            _ => None,
+        }
+    }
 }
 
 impl MistilteinnApp {
@@ -56,27 +84,87 @@ impl MistilteinnApp {
             a: 255.0,
         });
 
-        // Per-tab button rects — stacked below address bar height within tab bar
+        // Per-tab button rects — organized by groups
         let mut y = ADDRESS_BAR_HEIGHT as f32 + TAB_BUTTON_SPACING;
-        for tab in self.tab_manager.all_tabs() {
-            let is_active = active_id == Some(tab.id);
-            let (r, g, b) = if is_active {
-                (100.0 / 255.0, 100.0 / 255.0, 150.0 / 255.0)
-            } else {
-                (60.0 / 255.0, 60.0 / 255.0, 65.0 / 255.0)
-            };
+
+        // Render each group's tabs (in insertion order)
+        for group in self.group_manager.all_groups() {
+            // Group header bar — colored background
+            let (hdr_r, hdr_g, hdr_b) = group.color.to_dark_rgb();
 
             rects.push(layout_to_clip(
                 TAB_BUTTON_X,
                 y,
                 TAB_BAR_WIDTH as f32 - TAB_BUTTON_X - TAB_BUTTON_RIGHT_MARGIN,
-                TAB_BUTTON_HEIGHT,
+                GROUP_HEADER_HEIGHT,
                 window_width as f32,
                 window_height as f32,
             ));
-            colors.push(ColorF { r, g, b, a: 255.0 });
+            colors.push(ColorF {
+                r: hdr_r,
+                g: hdr_g,
+                b: hdr_b,
+                a: 255.0,
+            });
 
-            y += TAB_BUTTON_HEIGHT + TAB_BUTTON_SPACING;
+            // Colored left strip on group header — indicates group color
+            let (strip_r, strip_g, strip_b) = group.color.to_rgb();
+
+            rects.push(layout_to_clip(
+                TAB_BUTTON_X,
+                y,
+                TAB_GROUP_COLOR_STRIP_WIDTH,
+                GROUP_HEADER_HEIGHT,
+                window_width as f32,
+                window_height as f32,
+            ));
+            colors.push(ColorF {
+                r: strip_r,
+                g: strip_g,
+                b: strip_b,
+                a: 255.0,
+            });
+
+            y += GROUP_HEADER_HEIGHT + TAB_BUTTON_SPACING;
+
+            // Render tabs in this group (if not collapsed)
+            let (strip_r, strip_g, strip_b) = group.color.to_rgb();
+            if !group.collapsed {
+                for tab_id in &group.tab_ids {
+                    if let Some(tab) = self.tab_manager.get_tab(*tab_id) {
+                        Self::push_tab_button_rects(
+                            &mut rects,
+                            &mut colors,
+                            tab,
+                            active_id,
+                            y,
+                            window_width,
+                            window_height,
+                            Some((strip_r, strip_g, strip_b)),
+                        );
+                        y += TAB_BUTTON_HEIGHT + TAB_BUTTON_SPACING;
+                    }
+                }
+            }
+
+            y += TAB_BUTTON_SPACING; // extra spacing after each group
+        }
+
+        // Render ungrouped tabs at bottom
+        for tab in self.tab_manager.all_tabs() {
+            if tab.group_id.is_none() {
+                Self::push_tab_button_rects(
+                    &mut rects,
+                    &mut colors,
+                    tab,
+                    active_id,
+                    y,
+                    window_width,
+                    window_height,
+                    None, // no group color strip
+                );
+                y += TAB_BUTTON_HEIGHT + TAB_BUTTON_SPACING;
+            }
         }
 
         // Address bar background — right of tab bar, top
@@ -611,26 +699,133 @@ impl MistilteinnApp {
             .unwrap_or(800)
     }
 
-    /// Hit-test the tab bar area to find which tab button (if any) was clicked.
-    /// Returns the TabId of the clicked tab.
-    fn hit_test_tab_buttons(&self, x: f32, y: f32) -> Option<crate::browser::tab::TabId> {
+    /// Pushes rectangle(s) for a single tab button into the rects/colors vectors.
+    fn push_tab_button_rects(
+        rects: &mut Vec<RectClip>,
+        colors: &mut Vec<ColorF>,
+        tab: &crate::browser::tab::Tab,
+        active_id: Option<crate::browser::tab::TabId>,
+        y: f32,
+        window_width: u32,
+        window_height: u32,
+        group_color: Option<(f32, f32, f32)>,
+    ) {
+        let is_active = active_id == Some(tab.id);
+        let (r, g, b) = if is_active {
+            (100.0 / 255.0, 100.0 / 255.0, 150.0 / 255.0)
+        } else {
+            (60.0 / 255.0, 60.0 / 255.0, 65.0 / 255.0)
+        };
+
+        rects.push(layout_to_clip(
+            TAB_BUTTON_X,
+            y,
+            TAB_BAR_WIDTH as f32 - TAB_BUTTON_X - TAB_BUTTON_RIGHT_MARGIN,
+            TAB_BUTTON_HEIGHT,
+            window_width as f32,
+            window_height as f32,
+        ));
+        colors.push(ColorF { r, g, b, a: 255.0 });
+
+        // Colored strip on left for grouped tabs
+        if let Some((sr, sg, sb)) = group_color {
+            rects.push(layout_to_clip(
+                TAB_BUTTON_X,
+                y,
+                TAB_GROUP_COLOR_STRIP_WIDTH,
+                TAB_BUTTON_HEIGHT,
+                window_width as f32,
+                window_height as f32,
+            ));
+            colors.push(ColorF {
+                r: sr,
+                g: sg,
+                b: sb,
+                a: 255.0,
+            });
+        }
+    }
+
+    /// Hit-test the tab bar area accounting for group headers and collapsed groups.
+    fn hit_test_tab_bar(&self, x: f32, y: f32) -> HitTestResult {
         let mut button_y = ADDRESS_BAR_HEIGHT as f32 + TAB_BUTTON_SPACING;
-        for tab in self.tab_manager.all_tabs() {
+
+        // Check group headers first, then visible tabs
+        for group in self.group_manager.all_groups() {
+            // Check if click is on the group header
             if x >= TAB_BUTTON_X
                 && x <= (TAB_BAR_WIDTH as f32 - TAB_BUTTON_RIGHT_MARGIN)
                 && y >= button_y
-                && y <= button_y + TAB_BUTTON_HEIGHT
+                && y <= button_y + GROUP_HEADER_HEIGHT
             {
-                return Some(tab.id);
+                return HitTestResult::GroupHeader(group.id);
             }
-            button_y += TAB_BUTTON_HEIGHT + TAB_BUTTON_SPACING;
+            button_y += GROUP_HEADER_HEIGHT + TAB_BUTTON_SPACING;
+
+            // Check tabs in this group (if not collapsed)
+            if !group.collapsed {
+                for tab_id in &group.tab_ids {
+                    if let Some(tab) = self.tab_manager.get_tab(*tab_id) {
+                        if x >= TAB_BUTTON_X
+                            && x <= (TAB_BAR_WIDTH as f32 - TAB_BUTTON_RIGHT_MARGIN)
+                            && y >= button_y
+                            && y <= button_y + TAB_BUTTON_HEIGHT
+                        {
+                            return HitTestResult::TabButton(tab.id);
+                        }
+                        button_y += TAB_BUTTON_HEIGHT + TAB_BUTTON_SPACING;
+                    }
+                }
+            }
+
+            button_y += TAB_BUTTON_SPACING; // extra spacing after each group
         }
-        None
+
+        // Check ungrouped tabs
+        for tab in self.tab_manager.all_tabs() {
+            if tab.group_id.is_none() {
+                if x >= TAB_BUTTON_X
+                    && x <= (TAB_BAR_WIDTH as f32 - TAB_BUTTON_RIGHT_MARGIN)
+                    && y >= button_y
+                    && y <= button_y + TAB_BUTTON_HEIGHT
+                {
+                    return HitTestResult::TabButton(tab.id);
+                }
+                button_y += TAB_BUTTON_HEIGHT + TAB_BUTTON_SPACING;
+            }
+        }
+
+        HitTestResult::Empty
     }
 
     /// Check if a position falls within the page content area (not on chrome).
     fn is_in_content_area(&self, x: f32, y: f32) -> bool {
         x >= TAB_BAR_WIDTH as f32 && y >= ADDRESS_BAR_HEIGHT as f32
+    }
+
+    /// Create a default tab group and assign the active tab to it.
+    fn create_group_for_active_tab(&mut self) {
+        if let Some(active_id) = self.tab_manager.active_tab_id() {
+            use crate::browser::tab_group::GroupColor;
+            // Cycle through colors based on existing group count
+            let color_count = GroupColor::variants().len();
+            let color_idx = self.group_manager.all_groups().count() % color_count;
+            let color = GroupColor::variants()[color_idx];
+
+            let group_name = format!("Group {}", self.group_manager.all_groups().count() + 1);
+            let group_id = self.group_manager.create_group(group_name.clone(), color);
+
+            // Assign active tab to this group
+            self.tab_manager.assign_to_group(active_id, group_id);
+            self.group_manager.add_tab_to_group(group_id, active_id);
+
+            log::info!(
+                "Created group '{}' with color {:?} for active tab",
+                group_name,
+                color
+            );
+            self.recompose();
+        }
     }
 }
 
@@ -639,6 +834,9 @@ impl ApplicationHandler for MistilteinnApp {
         if self.renderer.is_none() {
             // Initialize tab manager and create the first tab
             self.tab_manager = crate::browser::tab::TabManager::new();
+            self.group_manager = crate::browser::tab_group::GroupManager::new();
+            self.cursor_pos = (0.0, 0.0);
+            self.ctrl_pressed = false;
             self.tab_manager.create_tab();
 
             let window = event_loop
@@ -748,24 +946,69 @@ impl ApplicationHandler for MistilteinnApp {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                // Get mouse position from cursor position event — we need to track it.
-                // For now, handle based on last known position (simplification).
-                // A proper implementation would store cursor_pos in MistilteinnApp.
-                if let Some(ref renderer) = self.renderer {
-                    // Re-request redraw so chrome rects are updated if tabs changed
-                    renderer.window().request_redraw();
-                }
+                let (cx, cy) = self.cursor_pos;
 
                 match button {
                     MouseButton::Left => {
-                        // Store click state for tab hit-testing on next frame
-                        log::info!("Mouse click detected: {:?}", state);
+                        if state == ElementState::Pressed {
+                            // Hit-test the tab bar first
+                            if cx < TAB_BAR_WIDTH as f32 && cy > 0.0 {
+                                match self.hit_test_tab_bar(cx, cy) {
+                                    HitTestResult::GroupHeader(group_id) => {
+                                        // Toggle group collapse
+                                        if let Some(is_now_collapsed) =
+                                            self.group_manager.toggle_collapse(group_id)
+                                        {
+                                            log::info!(
+                                                "Toggled group {:?} collapsed={}",
+                                                group_id,
+                                                is_now_collapsed
+                                            );
+                                            self.recompose();
+                                            if let Some(ref renderer) = self.renderer {
+                                                renderer.window().request_redraw();
+                                            }
+                                            return;
+                                        }
+                                    }
+                                    HitTestResult::TabButton(tab_id) => {
+                                        self.tab_manager.activate_tab(tab_id);
+                                        self.recompose();
+                                        log::info!("Activated tab {:?}", tab_id);
+                                    }
+                                    HitTestResult::Empty => {}
+                                }
+                            }
+                        }
+                    }
+                    MouseButton::Right => {
+                        // Right-click on a tab closes it
+                        if state == ElementState::Pressed && cx < TAB_BAR_WIDTH as f32 {
+                            if let Some(clicked_tab) = self.hit_test_tab_bar(cx, cy).into_tab_id() {
+                                if self.tab_manager.active_tab_id() != Some(clicked_tab) {
+                                    // Remove from group if assigned
+                                    if let Some(tab) = self.tab_manager.get_tab(clicked_tab) {
+                                        if let Some(gid) = tab.group_id {
+                                            self.group_manager
+                                                .remove_tab_from_group(gid, clicked_tab);
+                                        }
+                                    }
+                                    self.tab_manager.close_tab(clicked_tab);
+                                    self.recompose();
+                                    log::info!("Closed tab {:?}", clicked_tab);
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
+
+                if let Some(ref renderer) = self.renderer {
+                    renderer.window().request_redraw();
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                // Track cursor position for hit testing (used with MouseInput)
+                self.cursor_pos = (position.x as f32, position.y as f32);
             }
             WindowEvent::RedrawRequested => {
                 if let Some(ref mut renderer) = self.renderer
@@ -775,6 +1018,38 @@ impl ApplicationHandler for MistilteinnApp {
                 }
                 if let Some(ref renderer) = self.renderer {
                     renderer.window().request_redraw();
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } => {
+                if event.physical_key == PhysicalKey::Code(KeyCode::ControlLeft)
+                    || event.physical_key == PhysicalKey::Code(KeyCode::ControlRight)
+                {
+                    self.ctrl_pressed = event.state == ElementState::Pressed;
+                    return;
+                }
+                if event.state == ElementState::Pressed && self.ctrl_pressed {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Tab) => {
+                            // Ctrl+Tab: switch to next tab
+                            let tabs: Vec<_> = self.tab_manager.all_tabs().map(|t| t.id).collect();
+                            if let Some(current) = self.tab_manager.active_tab_id() {
+                                let idx = tabs.iter().position(|&id| id == current).unwrap_or(0);
+                                let next_idx = (idx + 1) % tabs.len();
+                                self.tab_manager.activate_tab(tabs[next_idx]);
+                                self.recompose();
+                                log::info!("Switched to tab {:?}", tabs[next_idx]);
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::KeyG) => {
+                            // Ctrl+G: create group for active tab
+                            self.create_group_for_active_tab();
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -789,7 +1064,10 @@ pub fn run(start_url: Option<String>) {
         renderer: None,
         start_url,
         tab_manager: crate::browser::tab::TabManager::new(),
+        group_manager: crate::browser::tab_group::GroupManager::new(),
         tokio_handle: None,
+        cursor_pos: (0.0, 0.0),
+        ctrl_pressed: false,
     };
     event_loop.run_app(&mut app).expect("Event loop failed");
 }

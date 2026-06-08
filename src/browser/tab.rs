@@ -1,6 +1,8 @@
 use crate::page::Page;
 use rustc_hash::FxHashMap;
 
+use super::tab_group::GroupId;
+
 /// Represents a single browser tab.
 ///
 /// Each tab holds its own browsing context including DOM, layout tree,
@@ -14,6 +16,8 @@ pub struct Tab {
     pub is_loading: bool,
     pub history: Vec<String>,
     pub history_index: usize,
+    /// Which group this tab belongs to, if any.
+    pub group_id: Option<GroupId>,
 }
 
 impl std::fmt::Debug for Tab {
@@ -26,6 +30,7 @@ impl std::fmt::Debug for Tab {
             .field("scroll_offset", &self.scroll_offset)
             .field("history_len", &self.history.len())
             .field("history_index", &self.history_index)
+            .field("group_id", &self.group_id.map(|g| g.0))
             .finish()
     }
 }
@@ -111,10 +116,29 @@ impl TabManager {
                 is_loading: false,
                 history: Vec::new(),
                 history_index: 0,
+                group_id: None,
             },
         );
         self.active_tab = Some(id);
         id
+    }
+
+    /// Assigns a tab to a group, returning the old group if any.
+    pub fn assign_to_group(&mut self, tab_id: TabId, group_id: GroupId) -> Option<GroupId> {
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            tab.group_id.replace(group_id)
+        } else {
+            None
+        }
+    }
+
+    /// Unassigns a tab from its group.
+    pub fn unassign_group(&mut self, tab_id: TabId) -> Option<GroupId> {
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            tab.group_id.take()
+        } else {
+            None
+        }
     }
 
     /// Closes a tab by ID.
@@ -140,6 +164,11 @@ impl TabManager {
     /// Returns all tabs.
     pub fn all_tabs(&self) -> impl Iterator<Item = &Tab> {
         self.tabs.values()
+    }
+
+    /// Gets a specific tab by ID.
+    pub fn get_tab(&self, id: TabId) -> Option<&Tab> {
+        self.tabs.get(&id)
     }
 
     /// Get a mutable reference to the active tab, if any.
@@ -268,5 +297,11 @@ mod tests {
         let _tab2 = manager.create_tab();
         manager.activate_tab(tab1);
         assert_eq!(manager.active_tab().map(|t| t.id), Some(tab1));
+    }
+
+    #[test]
+    fn new_tab_has_no_group() {
+        let manager = TabManager::new();
+        assert!(manager.all_tabs().next().is_none());
     }
 }

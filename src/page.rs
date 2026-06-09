@@ -108,6 +108,15 @@ impl Page {
     pub fn collect_rects(&self) -> Vec<(Rect, Option<[u8; 4]>)> {
         crate::layout::collect_render_rects(&self.layout_root)
     }
+
+    /// Estimate the memory footprint of this page's data structures.
+    ///
+    /// Pass the composite buffer size (in bytes) so the profiler can include it.
+    /// Only available when the `memprof` feature is enabled.
+    #[cfg(feature = "memprof")]
+    pub fn profile(&self, composite_buffer_bytes: usize) -> crate::memprof::MemoryProfile {
+        crate::memprof::profile_page(self, composite_buffer_bytes)
+    }
 }
 
 #[cfg(test)]

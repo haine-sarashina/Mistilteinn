@@ -38,10 +38,12 @@ pub enum DomNodeType {
 pub struct DomNode {
     pub node_type: DomNodeType,
     pub attrs: FxHashMap<LocalName, String>,
-    children: Vec<NodeId>,
-    parent: Option<NodeId>,
+    #[cfg_attr(feature = "memprof", allow(dead_code))]
+    pub(crate) children: Vec<NodeId>,
+    #[cfg_attr(feature = "memprof", allow(dead_code))]
+    pub(crate) parent: Option<NodeId>,
     /// For `<template>` elements: handle of the implicit content fragment.
-    template_content: Option<NodeId>,
+    pub(crate) template_content: Option<NodeId>,
 }
 
 impl DomNode {

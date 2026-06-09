@@ -3,6 +3,8 @@ mod browser;
 mod css;
 mod html;
 mod layout;
+#[cfg(feature = "memprof")]
+mod memprof;
 mod network;
 mod page;
 mod render;

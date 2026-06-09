@@ -421,6 +421,18 @@ impl MistilteinnApp {
                 log::info!("Page loaded and rendered");
             }
         }
+
+        // Memory profiling (only when memprof feature is enabled)
+        #[cfg(feature = "memprof")]
+        {
+            if let Some(ref page) = self.tab_manager.get_active_tab_page() {
+                let comp_size = (page.view_width as usize)
+                    .saturating_mul(page.view_height as usize)
+                    .saturating_mul(4);
+                let profile = page.profile(comp_size);
+                log::info!("{}", profile.summary());
+            }
+        }
     }
 
     /// Load a page from a URL by fetching it over the network.
@@ -702,6 +714,18 @@ impl MistilteinnApp {
             log::error!("Render after load_page_async failed: {:?}", e);
         } else {
             log::info!("Page loaded (async) and rendered");
+        }
+
+        // Memory profiling (only when memprof feature is enabled)
+        #[cfg(feature = "memprof")]
+        {
+            if let Some(ref page) = self.tab_manager.get_active_tab_page() {
+                let comp_size = (page.view_width as usize)
+                    .saturating_mul(page.view_height as usize)
+                    .saturating_mul(4);
+                let profile = page.profile(comp_size);
+                log::info!("{}", profile.summary());
+            }
         }
     }
 

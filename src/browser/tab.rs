@@ -193,6 +193,11 @@ impl TabManager {
         self.active_tab_mut().map(|t| &mut t.scroll_offset)
     }
 
+    /// Get an immutable copy of the active tab's scroll offset, if any.
+    pub fn get_active_tab_scroll(&self) -> Option<(f32, f32)> {
+        self.active_tab().map(|t| t.scroll_offset)
+    }
+
     /// Returns the ID of the currently active tab, if any.
     pub fn active_tab_id(&self) -> Option<TabId> {
         self.active_tab

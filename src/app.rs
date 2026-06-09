@@ -3,7 +3,7 @@ use winit::{
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::WindowAttributes,
+    window::{CursorIcon, WindowAttributes},
 };
 
 use crate::render::text::TextRenderer;
@@ -34,6 +34,10 @@ pub struct MistilteinnApp {
     cursor_pos: (f32, f32),
     /// Whether Ctrl key is currently pressed (for keyboard shortcuts).
     ctrl_pressed: bool,
+    /// The tab id currently under the cursor (for hover highlight).
+    hovered_tab_id: Option<crate::browser::tab::TabId>,
+    /// Whether the address bar is currently under the cursor.
+    hovered_address_bar: bool,
 }
 
 /// Hit-test result for tab bar clicks.
@@ -54,6 +58,17 @@ impl HitTestResult {
             _ => None,
         }
     }
+}
+
+/// Cursor kinds for interactive elements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorKind {
+    /// Default arrow cursor.
+    Default,
+    /// Pointer (hand) cursor for links.
+    Pointer,
+    /// I-beam cursor for text inputs.
+    IBeam,
 }
 
 impl MistilteinnApp {
@@ -137,6 +152,7 @@ impl MistilteinnApp {
                             &mut colors,
                             tab,
                             active_id,
+                            self.hovered_tab_id,
                             y,
                             window_width,
                             window_height,
@@ -158,6 +174,7 @@ impl MistilteinnApp {
                     &mut colors,
                     tab,
                     active_id,
+                    self.hovered_tab_id,
                     y,
                     window_width,
                     window_height,
@@ -176,10 +193,15 @@ impl MistilteinnApp {
             window_width as f32,
             window_height as f32,
         ));
+        let (addr_r, addr_g, addr_b) = if self.hovered_address_bar {
+            (65.0 / 255.0, 65.0 / 255.0, 75.0 / 255.0)
+        } else {
+            (55.0 / 255.0, 55.0 / 255.0, 60.0 / 255.0)
+        };
         colors.push(ColorF {
-            r: 55.0 / 255.0,
-            g: 55.0 / 255.0,
-            b: 60.0 / 255.0,
+            r: addr_r,
+            g: addr_g,
+            b: addr_b,
             a: 255.0,
         });
 
@@ -705,14 +727,19 @@ impl MistilteinnApp {
         colors: &mut Vec<ColorF>,
         tab: &crate::browser::tab::Tab,
         active_id: Option<crate::browser::tab::TabId>,
+        hovered_id: Option<crate::browser::tab::TabId>,
         y: f32,
         window_width: u32,
         window_height: u32,
         group_color: Option<(f32, f32, f32)>,
     ) {
         let is_active = active_id == Some(tab.id);
+        let is_hovered = hovered_id == Some(tab.id);
+        // Color priority: active > hovered > inactive
         let (r, g, b) = if is_active {
             (100.0 / 255.0, 100.0 / 255.0, 150.0 / 255.0)
+        } else if is_hovered {
+            (80.0 / 255.0, 80.0 / 255.0, 120.0 / 255.0)
         } else {
             (60.0 / 255.0, 60.0 / 255.0, 65.0 / 255.0)
         };
@@ -827,6 +854,18 @@ impl MistilteinnApp {
             self.recompose();
         }
     }
+
+    /// Sets the winit window cursor icon from a CursorKind value.
+    #[allow(deprecated)]
+    fn set_winit_cursor(renderer: Option<&Renderer>, kind: CursorKind) {
+        if let Some(r) = renderer {
+            r.window().set_cursor_icon(match kind {
+                CursorKind::Default => CursorIcon::Default,
+                CursorKind::Pointer => CursorIcon::Pointer,
+                CursorKind::IBeam => CursorIcon::Text,
+            });
+        }
+    }
 }
 
 impl ApplicationHandler for MistilteinnApp {
@@ -837,6 +876,8 @@ impl ApplicationHandler for MistilteinnApp {
             self.group_manager = crate::browser::tab_group::GroupManager::new();
             self.cursor_pos = (0.0, 0.0);
             self.ctrl_pressed = false;
+            self.hovered_tab_id = None;
+            self.hovered_address_bar = false;
             self.tab_manager.create_tab();
 
             let window = event_loop
@@ -1008,7 +1049,64 @@ impl ApplicationHandler for MistilteinnApp {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_pos = (position.x as f32, position.y as f32);
+                let cx = position.x as f32;
+                let cy = position.y as f32;
+                self.cursor_pos = (cx, cy);
+
+                // Hit-test tab bar for hover highlight
+                let new_hovered_tab = if cx < TAB_BAR_WIDTH as f32 && cy > 0.0 {
+                    match self.hit_test_tab_bar(cx, cy) {
+                        HitTestResult::TabButton(id) => Some(id),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                let tab_changed = self.hovered_tab_id != new_hovered_tab;
+                self.hovered_tab_id = new_hovered_tab;
+
+                // Hit-test address bar for hover highlight
+                let new_hovered_addr = cx >= TAB_BAR_WIDTH as f32 && cy < ADDRESS_BAR_HEIGHT as f32;
+                let addr_changed = self.hovered_address_bar != new_hovered_addr;
+                self.hovered_address_bar = new_hovered_addr;
+
+                if tab_changed || addr_changed {
+                    self.recompose();
+                    if let Some(ref renderer) = self.renderer {
+                        renderer.window().request_redraw();
+                    }
+                }
+
+                // Hit-test content area for interactive elements (links, inputs) to change cursor
+                if self.is_in_content_area(cx, cy) {
+                    if let Some(ref page) = self.tab_manager.get_active_tab_page() {
+                        let scroll_offset = self
+                            .tab_manager
+                            .get_active_tab_scroll()
+                            .unwrap_or((0.0, 0.0));
+                        // Adjust coordinates: remove chrome offset, add scroll offset
+                        let content_x = cx - TAB_BAR_WIDTH as f32 + scroll_offset.0;
+                        let content_y = cy - ADDRESS_BAR_HEIGHT as f32 + scroll_offset.1;
+
+                        let new_cursor = crate::layout::hit_test_interactive(
+                            &page.layout_root,
+                            content_x,
+                            content_y,
+                        )
+                        .map(|interaction| match interaction {
+                            crate::layout::InteractionType::Link => CursorKind::Pointer,
+                            crate::layout::InteractionType::Input => CursorKind::IBeam,
+                            _ => CursorKind::Default,
+                        })
+                        .unwrap_or(CursorKind::Default);
+
+                        Self::set_winit_cursor(self.renderer.as_ref(), new_cursor);
+                    }
+                } else {
+                    // Outside content area: reset to default cursor
+                    Self::set_winit_cursor(self.renderer.as_ref(), CursorKind::Default);
+                }
             }
             WindowEvent::RedrawRequested => {
                 if let Some(ref mut renderer) = self.renderer
@@ -1068,6 +1166,8 @@ pub fn run(start_url: Option<String>) {
         tokio_handle: None,
         cursor_pos: (0.0, 0.0),
         ctrl_pressed: false,
+        hovered_tab_id: None,
+        hovered_address_bar: false,
     };
     event_loop.run_app(&mut app).expect("Event loop failed");
 }

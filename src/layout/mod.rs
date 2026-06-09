@@ -103,6 +103,17 @@ pub struct LineBox {
     pub boxes: Vec<InlineBox>,
 }
 
+/// Kinds of interactive elements that change the mouse cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractionType {
+    /// No interaction (default).
+    None,
+    /// A hyperlink (<a> tag) — shows pointer cursor.
+    Link,
+    /// An input element (<input>, <textarea>, <button>) — shows I-beam cursor.
+    Input,
+}
+
 /// A node in the layout tree.
 #[derive(Debug, Clone)]
 pub struct LayoutNode {
@@ -166,6 +177,8 @@ pub struct LayoutNode {
     pub grid_row_gap: f32,
     /// CSS order property (for flex/grid item ordering)
     pub order: i32,
+    /// Interaction type for cursor changes (link, input, etc.).
+    pub interaction_type: InteractionType,
 }
 
 impl LayoutNode {
@@ -208,6 +221,7 @@ impl LayoutNode {
             grid_column_gap: 0.0,
             grid_row_gap: 0.0,
             order: 0,
+            interaction_type: InteractionType::None,
         }
     }
 
@@ -407,6 +421,14 @@ fn build_layout_children<N, F>(
                         layout_node.image_src = node.get_attr("src");
                     }
 
+                    // Set interaction type based on tag name for cursor changes
+                    let tag = node.tag_name().to_lowercase();
+                    layout_node.interaction_type = match tag.as_str() {
+                        "a" => InteractionType::Link,
+                        "input" | "textarea" | "button" => InteractionType::Input,
+                        _ => InteractionType::None,
+                    };
+
                     let text = node.text_content().map(|t| t.to_string());
                     if text.is_some() && node.children_ids().is_empty() {
                         layout_node.text = text;
@@ -447,6 +469,14 @@ fn build_layout_children<N, F>(
                     if node.tag_name() == "img" {
                         layout_node.image_src = node.get_attr("src");
                     }
+
+                    // Set interaction type based on tag name for cursor changes
+                    let tag = node.tag_name().to_lowercase();
+                    layout_node.interaction_type = match tag.as_str() {
+                        "a" => InteractionType::Link,
+                        "input" | "textarea" | "button" => InteractionType::Input,
+                        _ => InteractionType::None,
+                    };
 
                     let text = node.text_content().map(|t| t.to_string());
                     if text.is_some() && node.children_ids().is_empty() {
@@ -2407,6 +2437,35 @@ pub fn line_box_metrics(line: &LineBox) -> (f32, f32, f32, f32) {
     let line_bottom = line.y + line.height;
     let line_height = line.height;
     (line_top, baseline_y, line_bottom, line_height)
+}
+
+/// Hit-test the layout tree for interactive elements at a given position.
+///
+/// Walks the tree in depth-first order (children first, since they render on top).
+/// Returns the `InteractionType` of the topmost interactive element containing the point,
+/// or `None` if no interactive element is found.
+pub fn hit_test_interactive(root: &LayoutNode, x: f32, y: f32) -> Option<InteractionType> {
+    // Check children first (topmost/rendered-last wins)
+    for child in root.children.iter().rev() {
+        if child.rect.contains(x, y) {
+            if let Some(found) = hit_test_interactive(child, x, y) {
+                return Some(found);
+            }
+        }
+    }
+    // Also check absolutely positioned children (they render on top of normal flow)
+    for abs_child in root.absolute_children.iter().rev() {
+        if abs_child.rect.contains(x, y) {
+            if let Some(found) = hit_test_interactive(abs_child, x, y) {
+                return Some(found);
+            }
+        }
+    }
+    // Check this node itself
+    if root.interaction_type != InteractionType::None && root.rect.contains(x, y) {
+        return Some(root.interaction_type);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -4723,5 +4782,102 @@ mod tests {
         // Default order is 0
         let node = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0));
         assert_eq!(node.order, 0);
+    }
+
+    // ---- Hit Test Interactive Tests ----
+
+    #[test]
+    fn test_hit_test_interactive_no_interaction() {
+        let root = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        assert_eq!(hit_test_interactive(&root, 50.0, 50.0), None);
+    }
+
+    #[test]
+    fn test_hit_test_interactive_link_found() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        let mut link = LayoutNode::new(Rect::new(10.0, 10.0, 80.0, 30.0));
+        link.interaction_type = InteractionType::Link;
+        root.add_child(link);
+
+        assert_eq!(
+            hit_test_interactive(&root, 50.0, 25.0),
+            Some(InteractionType::Link)
+        );
+    }
+
+    #[test]
+    fn test_hit_test_interactive_input_found() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        let mut input = LayoutNode::new(Rect::new(10.0, 50.0, 100.0, 20.0));
+        input.interaction_type = InteractionType::Input;
+        root.add_child(input);
+
+        assert_eq!(
+            hit_test_interactive(&root, 60.0, 60.0),
+            Some(InteractionType::Input)
+        );
+    }
+
+    #[test]
+    fn test_hit_test_interactive_outside_rect() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        let mut link = LayoutNode::new(Rect::new(10.0, 10.0, 80.0, 30.0));
+        link.interaction_type = InteractionType::Link;
+        root.add_child(link);
+
+        // Point outside the link rect should return None
+        assert_eq!(hit_test_interactive(&root, 200.0, 200.0), None);
+    }
+
+    #[test]
+    fn test_hit_test_interactive_topmost_wins() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        // First child (link) occupies a larger area
+        let mut link = LayoutNode::new(Rect::new(10.0, 10.0, 100.0, 100.0));
+        link.interaction_type = InteractionType::Link;
+        root.add_child(link);
+        // Second child (input) overlaps and renders on top (added later)
+        let mut input = LayoutNode::new(Rect::new(20.0, 20.0, 80.0, 80.0));
+        input.interaction_type = InteractionType::Input;
+        root.add_child(input);
+
+        // Point in overlap area should return Input (topmost)
+        assert_eq!(
+            hit_test_interactive(&root, 50.0, 50.0),
+            Some(InteractionType::Input)
+        );
+        // Point in link-only area should return Link
+        assert_eq!(
+            hit_test_interactive(&root, 15.0, 15.0),
+            Some(InteractionType::Link)
+        );
+    }
+
+    #[test]
+    fn test_hit_test_interactive_nested() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        let mut parent_node = LayoutNode::new(Rect::new(10.0, 10.0, 100.0, 100.0));
+        let mut child_link = LayoutNode::new(Rect::new(20.0, 20.0, 40.0, 40.0));
+        child_link.interaction_type = InteractionType::Link;
+        parent_node.add_child(child_link);
+        root.add_child(parent_node);
+
+        assert_eq!(
+            hit_test_interactive(&root, 30.0, 30.0),
+            Some(InteractionType::Link)
+        );
+    }
+
+    #[test]
+    fn test_hit_test_interactive_absolute_child() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        let mut abs_link = LayoutNode::new(Rect::new(50.0, 50.0, 60.0, 30.0));
+        abs_link.interaction_type = InteractionType::Link;
+        root.absolute_children.push(abs_link);
+
+        assert_eq!(
+            hit_test_interactive(&root, 70.0, 60.0),
+            Some(InteractionType::Link)
+        );
     }
 }

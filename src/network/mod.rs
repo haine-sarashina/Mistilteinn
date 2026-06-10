@@ -42,12 +42,25 @@ pub async fn fetch(url: &str) -> Result<FetchResult, NetworkError> {
 }
 
 /// Resolve a potentially relative URL against a base URL.
-/// - If the href is already absolute (starts with http://, https://, or //), return as-is.
+/// - If the href is already absolute (starts with http:// or https://), return as-is.
+/// - If it starts with "//", inherit the scheme from the base URL (protocol-relative).
 /// - If it starts with "/", prepend the scheme + host from the base URL.
 /// - Otherwise, append to the base URL's directory.
 pub fn resolve_url(base_url: &str, href: &str) -> String {
-    if href.starts_with("http://") || href.starts_with("https://") || href.starts_with("//") {
+    if href.starts_with("http://") || href.starts_with("https://") {
         return href.to_string();
+    }
+
+    // Protocol-relative URL: inherit scheme from base
+    if href.starts_with("//") {
+        let scheme = if base_url.starts_with("https://") {
+            "https:"
+        } else if base_url.starts_with("http://") {
+            "http:"
+        } else {
+            return href.to_string();
+        };
+        return format!("{}{}", scheme, href);
     }
 
     if let Some(slash_href) = href.strip_prefix('/') {
@@ -468,11 +481,38 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_protocol_relative_url() {
+    fn test_resolve_protocol_relative_url_https() {
+        // Protocol-relative URL should inherit https scheme from base
         assert_eq!(
             resolve_url("https://example.com/page", "//cdn.example.com/style.css"),
-            "//cdn.example.com/style.css"
+            "https://cdn.example.com/style.css"
         );
+    }
+
+    #[test]
+    fn test_resolve_protocol_relative_url_http() {
+        // Protocol-relative URL should inherit http scheme from base
+        assert_eq!(
+            resolve_url("http://example.com/page", "//cdn.example.com/style.css"),
+            "http://cdn.example.com/style.css"
+        );
+    }
+
+    #[test]
+    fn test_extract_external_css_urls_max_limit() {
+        // Generate HTML with 60 <link> tags — only MAX_EXTERNAL_SHEETS (50) should be fetched
+        let mut html = String::from("<html><head>");
+        for i in 0..60 {
+            html.push_str(&format!(r#"<link rel="stylesheet" href="/css/style{}.css">"#, i));
+        }
+        html.push_str("</head><body></body></html>");
+
+        let urls = extract_external_css_urls(&html);
+        // extract_external_css_urls returns all URLs; fetch_external_css caps at MAX_EXTERNAL_SHEETS
+        assert_eq!(urls.len(), 60, "extract should find all 60 URLs");
+
+        // Verify the cap constant
+        assert_eq!(MAX_EXTERNAL_SHEETS, 50);
     }
 
     #[test]

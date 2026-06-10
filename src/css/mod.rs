@@ -63,6 +63,11 @@ pub fn parse_color_value(color_str: &str) -> Option<CSSColor> {
         }
     }
 
+    // rgb(r, g, b) and rgba(r, g, b, a) function notation
+    if let Some(result) = parse_rgb_function(&lower) {
+        return Some(result);
+    }
+
     // Named colors
     let named = parse_named_color(&lower);
     if let Some(_rgb) = named {
@@ -70,6 +75,59 @@ pub fn parse_color_value(color_str: &str) -> Option<CSSColor> {
     }
 
     None
+}
+
+/// Parses `rgb(r, g, b)` or `rgba(r, g, b, a)` function notation.
+/// Supports integer values (0-255) for R/G/B and float (0.0-1.0) for alpha.
+/// Also handles percent values for R/G/B (0%-100% maps to 0-255).
+fn parse_rgb_function(color: &str) -> Option<CSSColor> {
+    let (is_rgba, inner) = if let Some(inner) = color.strip_prefix("rgba(").and_then(|s| s.strip_suffix(')')) {
+        (true, inner)
+    } else if let Some(inner) = color.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
+        (false, inner)
+    } else {
+        return None;
+    };
+
+    let parts: Vec<&str> = inner.split(',').collect();
+    let expected_count = if is_rgba { 4 } else { 3 };
+    if parts.len() != expected_count {
+        return None;
+    }
+
+    // Parse R, G, B components (integer 0-255 or percentage)
+    let parse_component = |s: &str| -> Option<u8> {
+        let val = s.trim();
+        if val.ends_with('%') {
+            // Percentage: 0%-100% maps to 0-255
+            if let Ok(pct) = val[..val.len()-1].trim().parse::<f32>() {
+                return Some((pct / 100.0 * 255.0).clamp(0.0, 255.0) as u8);
+            }
+        } else {
+            // Integer: 0-255
+            if let Ok(n) = val.parse::<i32>() {
+                return Some(n.clamp(0, 255) as u8);
+            }
+        }
+        None
+    };
+
+    let r = parse_component(parts[0])?;
+    let g = parse_component(parts[1])?;
+    let b = parse_component(parts[2])?;
+
+    if is_rgba {
+        // Parse alpha: float 0.0-1.0
+        let alpha_str = parts[3].trim();
+        let alpha: f32 = alpha_str.parse().ok()?;
+        if !(0.0..=1.0).contains(&alpha) {
+            return None;
+        }
+        Some(CSSColor::Rgba { r, g, b, a: alpha })
+    } else {
+        // rgb() without alpha defaults to fully opaque
+        Some(CSSColor::Rgba { r, g, b, a: 1.0 })
+    }
 }
 
 fn parse_named_color(color: &str) -> Option<(u8, u8, u8)> {
@@ -1165,6 +1223,111 @@ mod tests {
     #[test]
     fn parse_color_invalid() {
         assert!(parse_color_value("invalid").is_none());
+    }
+
+    // ------ rgb()/rgba() Parsing Tests ------
+
+    #[test]
+    fn parse_color_rgb_basic() {
+        let result = parse_color_value("rgb(255, 0, 0)");
+        assert_eq!(result, Some(CSSColor::Rgba { r: 255, g: 0, b: 0, a: 1.0 }));
+    }
+
+    #[test]
+    fn parse_color_rgb_white() {
+        let result = parse_color_value("rgb(255, 255, 255)");
+        assert_eq!(result, Some(CSSColor::Rgba { r: 255, g: 255, b: 255, a: 1.0 }));
+    }
+
+    #[test]
+    fn parse_color_rgb_black() {
+        let result = parse_color_value("rgb(0, 0, 0)");
+        assert_eq!(result, Some(CSSColor::Rgba { r: 0, g: 0, b: 0, a: 1.0 }));
+    }
+
+    #[test]
+    fn parse_color_rgba_full_alpha() {
+        let result = parse_color_value("rgba(0, 0, 255, 1.0)");
+        assert_eq!(result, Some(CSSColor::Rgba { r: 0, g: 0, b: 255, a: 1.0 }));
+    }
+
+    #[test]
+    fn parse_color_rgba_half_alpha() {
+        let result = parse_color_value("rgba(0, 0, 255, 0.5)");
+        assert_eq!(result, Some(CSSColor::Rgba { r: 0, g: 0, b: 255, a: 0.5 }));
+    }
+
+    #[test]
+    fn parse_color_rgba_zero_alpha() {
+        let result = parse_color_value("rgba(255, 128, 0, 0.0)");
+        assert_eq!(result, Some(CSSColor::Rgba { r: 255, g: 128, b: 0, a: 0.0 }));
+    }
+
+    #[test]
+    fn parse_color_rgb_with_spaces() {
+        // Extra whitespace inside parentheses
+        let result = parse_color_value("rgb( 100 , 200 , 50 )");
+        assert_eq!(result, Some(CSSColor::Rgba { r: 100, g: 200, b: 50, a: 1.0 }));
+    }
+
+    #[test]
+    fn parse_color_rgb_clamp_over() {
+        // Values > 255 should clamp to 255
+        let result = parse_color_value("rgb(300, -10, 256)");
+        assert_eq!(result, Some(CSSColor::Rgba { r: 255, g: 0, b: 255, a: 1.0 }));
+    }
+
+    #[test]
+    fn parse_color_rgba_clamp_alpha() {
+        // Alpha > 1.0 or < 0.0 should be rejected
+        assert!(parse_color_value("rgba(0, 0, 0, 1.5)").is_none());
+        assert!(parse_color_value("rgba(0, 0, 0, -0.1)").is_none());
+    }
+
+    #[test]
+    fn parse_color_rgb_percentage() {
+        // rgb(100%, 0%, 0%) should be red
+        let result = parse_color_value("rgb(100%, 0%, 0%)");
+        assert_eq!(result, Some(CSSColor::Rgba { r: 255, g: 0, b: 0, a: 1.0 }));
+    }
+
+    #[test]
+    fn parse_color_rgb_percentage_50() {
+        // rgb(50%, 50%, 50%) should be gray (~128 each)
+        let result = parse_color_value("rgb(50%, 50%, 50%)");
+        assert_eq!(result, Some(CSSColor::Rgba { r: 127, g: 127, b: 127, a: 1.0 }));
+    }
+
+    #[test]
+    fn parse_color_rgb_to_rgba_conversion() {
+        // rgb(100, 200, 50).to_rgba() should have alpha=255
+        let result = parse_color_value("rgb(100, 200, 50)");
+        assert_eq!(result.unwrap().to_rgba(), (100, 200, 50, 255));
+    }
+
+    #[test]
+    fn parse_color_rgba_to_rgba_conversion() {
+        // rgba(100, 200, 50, 0.5).to_rgba() should have alpha=127
+        let result = parse_color_value("rgba(100, 200, 50, 0.5)");
+        assert_eq!(result.unwrap().to_rgba(), (100, 200, 50, 127));
+    }
+
+    #[test]
+    fn parse_color_rgb_invalid_too_few_args() {
+        assert!(parse_color_value("rgb(255, 0)").is_none());
+    }
+
+    #[test]
+    fn parse_color_rgb_invalid_non_numeric() {
+        assert!(parse_color_value("rgb(foo, bar, baz)").is_none());
+    }
+
+    #[test]
+    fn parse_color_rgba_case_insensitive() {
+        // RGB(), RGBA(), Rgb() should all work (case-insensitive)
+        assert!(parse_color_value("RGB(10, 20, 30)").is_some());
+        assert!(parse_color_value("RGBA(10, 20, 30, 0.5)").is_some());
+        assert!(parse_color_value("Rgb(40, 50, 60)").is_some());
     }
 
     // ------ Cascade & Inheritance Tests ------

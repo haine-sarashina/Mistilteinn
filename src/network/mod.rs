@@ -13,6 +13,12 @@ pub enum NetworkError {
 /// Max number of external stylesheets to fetch per page.
 const MAX_EXTERNAL_SHEETS: usize = 50;
 
+/// Maximum nesting depth for @import resolution to prevent infinite recursion.
+const MAX_IMPORT_DEPTH: usize = 10;
+
+/// Maximum total number of @import requests across all levels.
+const MAX_TOTAL_IMPORTS: usize = 50;
+
 /// Result of a network fetch, including the resolved (post-redirect) URL.
 pub struct FetchResult {
     pub content: String,
@@ -174,6 +180,88 @@ async fn fetch_css_file(url: &str) -> Result<String, NetworkError> {
     Ok(response)
 }
 
+/// Recursively resolve @import rules in CSS text.
+///
+/// Parses the CSS to find any `@import` directives, fetches each referenced URL,
+/// and recursively resolves imports within those fetched files. Imported CSS is
+/// merged BEFORE the original CSS text so the original has higher source-order priority
+/// per the CSS specification.
+///
+/// - `css_text`: the CSS source to process
+/// - `base_url`: the base URL for resolving relative import URLs
+/// - `visited`: set of already-visited URLs (prevents circular imports)
+/// - `depth`: current recursion depth (0 = top-level)
+pub async fn resolve_imports(
+    css_text: &str,
+    base_url: &str,
+    visited: &mut std::collections::HashSet<String>,
+    depth: usize,
+) -> String {
+    // Check depth limit
+    if depth > MAX_IMPORT_DEPTH {
+        log::warn!("Max @import depth ({}) reached — stopping recursion", MAX_IMPORT_DEPTH);
+        return css_text.to_string();
+    }
+
+    // Check total import count limit
+    if visited.len() > MAX_TOTAL_IMPORTS {
+        log::warn!("Max total @import count ({}) reached — stopping resolution", MAX_TOTAL_IMPORTS);
+        return css_text.to_string();
+    }
+
+    // Parse the CSS to find @import rules
+    let stylesheet = crate::css::parser::parse_stylesheet(css_text);
+
+    if stylesheet.imports.is_empty() {
+        // No imports — return original text unchanged
+        return css_text.to_string();
+    }
+
+    log::info!(
+        "Found {} @import rule(s) at depth {}, resolving...",
+        stylesheet.imports.len(),
+        depth
+    );
+
+    let mut imported_css_parts = Vec::new();
+
+    for import_rule in &stylesheet.imports {
+        let resolved_url = resolve_url(base_url, &import_rule.url);
+
+        // Skip already-visited URLs (prevents circular imports)
+        if visited.contains(&resolved_url) {
+            log::info!("Skipping already-visited @import URL: {}", resolved_url);
+            continue;
+        }
+
+        visited.insert(resolved_url.clone());
+
+        match fetch_css_file(&resolved_url).await {
+            Ok(content) => {
+                log::info!(
+                    "Fetched @import stylesheet: {} ({} bytes)",
+                    resolved_url,
+                    content.len()
+                );
+                // Recursively resolve imports in the fetched content via Box::pin
+                // to avoid infinitely-sized future type from direct async recursion.
+                let resolved = Box::pin(resolve_imports(&content, &resolved_url, visited, depth + 1)).await;
+                imported_css_parts.push(resolved);
+            }
+            Err(e) => {
+                log::warn!("Failed to fetch @import stylesheet {}: {:?}", resolved_url, e);
+            }
+        }
+    }
+
+    // Merge: imported CSS comes BEFORE original CSS (original has higher source-order priority)
+    let merged_imports = imported_css_parts.join("\n");
+    if merged_imports.is_empty() {
+        return css_text.to_string();
+    }
+    format!("{}\n{}", merged_imports, css_text)
+}
+
 /// Fetch all external stylesheets concurrently and merge their content with inline CSS.
 /// Resolves relative URLs against `base_url` before fetching.
 /// Caps the number of fetched stylesheets at `MAX_EXTERNAL_SHEETS`.
@@ -245,7 +333,17 @@ pub async fn fetch_external_css(
         merged.push(result);
     }
 
-    Ok(merged.join("\n"))
+    let merged_css = merged.join("\n");
+
+    // Resolve @import rules in the merged CSS
+    let mut visited = std::collections::HashSet::new();
+    // Mark all already-fetched external URLs as visited so we don't re-fetch them
+    for url in &resolved_urls {
+        visited.insert(url.clone());
+    }
+    let final_css = resolve_imports(&merged_css, base_url, &mut visited, 0).await;
+
+    Ok(final_css)
 }
 
 #[cfg(test)]

@@ -1087,7 +1087,7 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
         });
     }
 
-    parser::Stylesheet { rules }
+    parser::Stylesheet { rules, imports: Vec::new() }
 }
 
 /// Merges UA stylesheet rules with author stylesheet rules.
@@ -1101,7 +1101,9 @@ pub fn merge_stylesheets_with_author(
     let mut rules = Vec::new();
     rules.extend_from_slice(&ua.rules);
     rules.extend_from_slice(&author.rules);
-    parser::Stylesheet { rules }
+    // UA stylesheet has no imports; pass through author imports (already resolved at fetch time)
+    let imports = author.imports.clone();
+    parser::Stylesheet { rules, imports }
 }
 
 #[cfg(test)]

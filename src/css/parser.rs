@@ -153,10 +153,17 @@ pub struct CSSRule {
     pub declarations: Vec<Declaration>,
 }
 
-/// A parsed stylesheet: a collection of CSSRules.
+/// A CSS @import rule: points to an external stylesheet URL.
+#[derive(Debug, Clone)]
+pub struct ImportRule {
+    pub url: String,
+}
+
+/// A parsed stylesheet: a collection of CSSRules and @import rules.
 #[derive(Debug, Clone)]
 pub struct Stylesheet {
     pub rules: Vec<CSSRule>,
+    pub imports: Vec<ImportRule>,
 }
 
 // ------ Helpers ------
@@ -192,15 +199,71 @@ fn token_to_string(token: &Token<'_>) -> String {
     }
 }
 
+// ------ @import Parsing ------
+
+/// Tries to parse an `@import` rule from the prelude text (before `{` or `;`).
+/// Handles:
+/// - `@import "url.css";`
+/// - `@import 'url.css';`
+/// - `@import url("url.css");`
+/// - `@import url(url.css);`
+/// Returns `Some(ImportRule)` if the text is a valid @import directive.
+fn try_parse_import(prelude: &str) -> Option<ImportRule> {
+    let trimmed = prelude.trim();
+    // Check for '@' followed by 'import' (case-insensitive)
+    if !trimmed.starts_with('@') {
+        return None;
+    }
+    let after_at = &trimmed[1..].trim_start();
+    // Only compare the first 6 characters — the rest is the URL part
+    if !after_at.starts_with("import") && !after_at.starts_with("IMPORT") && !after_at.starts_with("Import") {
+        return None;
+    }
+    // Case-insensitive check for "import"
+    let import_prefix: String = after_at.chars().take(6).collect();
+    if !import_prefix.eq_ignore_ascii_case("import") {
+        return None;
+    }
+    let after_import = if after_at.len() > 6 { &after_at[6..] } else { "" };
+    let after_import = after_import.trim_start();
+
+    // Try url(...) form
+    if after_import.to_lowercase().starts_with("url(") {
+        let rest = &after_import[4..];
+        // Strip optional quotes inside url()
+        let unquoted = rest.trim_start_matches('"').trim_start_matches('\'');
+        let url_str = unquoted.strip_suffix(')').unwrap_or(unquoted).trim_end_matches('"').trim_end_matches('\'').to_string();
+        if !url_str.is_empty() {
+            return Some(ImportRule { url: url_str });
+        }
+    }
+
+    // Try quoted string form: @import "..." or @import '...'
+    let first_char = after_import.chars().next()?;
+    if first_char == '"' || first_char == '\'' {
+        let quote = first_char;
+        let inner = &after_import[1..];
+        if let Some(end) = inner.find(quote) {
+            let url_str = inner[..end].to_string();
+            if !url_str.is_empty() {
+                return Some(ImportRule { url: url_str });
+            }
+        }
+    }
+
+    None
+}
+
 // ------ Stylesheet Parser ------
 
 /// Parses a full CSS stylesheet into a [`Stylesheet`].
 ///
 /// Uses string-based splitting to find `{ ... }` block pairs, then parses
 /// selectors from prelude text using cssparser tokens, and declarations
-/// from block text using the string-based parser.
+/// from block text using the string-based parser. Also extracts `@import` rules.
 pub fn parse_stylesheet(source: &str) -> Stylesheet {
     let mut rules = Vec::new();
+    let mut imports = Vec::new();
     let mut pos = 0;
 
     while pos < source.len() {
@@ -210,6 +273,28 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
         pos += rest.len() - trimmed.len();
         if trimmed.is_empty() {
             break;
+        }
+
+        // Check if the first meaningful character is '@' — handle @import before scanning for '{'.
+        // This prevents find_matching_open_brace from finding a '{' in a later rule and skipping over
+        // an @import that appears between two block rules.
+        let starts_with_at = trimmed.chars().next() == Some('@');
+        if starts_with_at {
+            // Find the semicolon that terminates this at-rule
+            if let Some(semi_pos) = trimmed.find(';') {
+                let prelude = &trimmed[..semi_pos];
+                if let Some(import_rule) = try_parse_import(prelude) {
+                    imports.push(import_rule);
+                }
+                pos += semi_pos + 1; // advance past ';'
+                continue;
+            } else {
+                // No semicolon — end of source. Try to parse @import from remaining text.
+                if let Some(import_rule) = try_parse_import(trimmed) {
+                    imports.push(import_rule);
+                }
+                break;
+            }
         }
 
         // Find the opening `{` for the block
@@ -241,7 +326,7 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
         }
     }
 
-    Stylesheet { rules }
+    Stylesheet { rules, imports }
 }
 
 /// Finds the position of the `{` that opens a declaration block.
@@ -750,5 +835,68 @@ mod tests {
     #[test]
     fn parse_color_invalid() {
         assert!(crate::css::parse_color_value("invalid").is_none());
+    }
+
+    // -- @import parsing tests --
+
+    #[test]
+    fn parse_import_double_quotes() {
+        let ss = parse_stylesheet("@import \"styles.css\";");
+        assert_eq!(ss.imports.len(), 1);
+        assert_eq!(ss.imports[0].url, "styles.css");
+    }
+
+    #[test]
+    fn parse_import_url_function() {
+        let ss = parse_stylesheet("@import url(\"theme.css\");");
+        assert_eq!(ss.imports.len(), 1);
+        assert_eq!(ss.imports[0].url, "theme.css");
+    }
+
+    #[test]
+    fn parse_import_single_quotes() {
+        let ss = parse_stylesheet("@import 'base.css';");
+        assert_eq!(ss.imports.len(), 1);
+        assert_eq!(ss.imports[0].url, "base.css");
+    }
+
+    #[test]
+    fn parse_import_absolute_url() {
+        let ss = parse_stylesheet("@import url(https://cdn.example.com/lib.css);");
+        assert_eq!(ss.imports.len(), 1);
+        assert_eq!(ss.imports[0].url, "https://cdn.example.com/lib.css");
+    }
+
+    #[test]
+    fn parse_multiple_imports_with_rules() {
+        let ss = parse_stylesheet(
+            "@import \"a.css\"; div { color: red; } @import url(\"b.css\"); span { margin: 0; }",
+        );
+        assert_eq!(ss.imports.len(), 2);
+        assert_eq!(ss.imports[0].url, "a.css");
+        assert_eq!(ss.imports[1].url, "b.css");
+        assert_eq!(ss.rules.len(), 2);
+    }
+
+    #[test]
+    fn parse_import_interspersed_with_rules() {
+        let ss = parse_stylesheet("p { margin: 1em; } @import \"mid.css\"; h1 { font-size: 2em; }");
+        assert_eq!(ss.imports.len(), 1);
+        assert_eq!(ss.imports[0].url, "mid.css");
+        assert_eq!(ss.rules.len(), 2);
+    }
+
+    #[test]
+    fn parse_no_imports_empty_vector() {
+        let ss = parse_stylesheet("div { color: red; } span { display: block; }");
+        assert_eq!(ss.imports.len(), 0);
+        assert_eq!(ss.rules.len(), 2);
+    }
+
+    #[test]
+    fn parse_import_url_function_unquoted() {
+        let ss = parse_stylesheet("@import url(base.css);");
+        assert_eq!(ss.imports.len(), 1);
+        assert_eq!(ss.imports[0].url, "base.css");
     }
 }

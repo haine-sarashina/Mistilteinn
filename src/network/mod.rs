@@ -212,13 +212,19 @@ pub async fn resolve_imports(
 ) -> String {
     // Check depth limit
     if depth > MAX_IMPORT_DEPTH {
-        log::warn!("Max @import depth ({}) reached — stopping recursion", MAX_IMPORT_DEPTH);
+        log::warn!(
+            "Max @import depth ({}) reached — stopping recursion",
+            MAX_IMPORT_DEPTH
+        );
         return css_text.to_string();
     }
 
     // Check total import count limit
     if visited.len() > MAX_TOTAL_IMPORTS {
-        log::warn!("Max total @import count ({}) reached — stopping resolution", MAX_TOTAL_IMPORTS);
+        log::warn!(
+            "Max total @import count ({}) reached — stopping resolution",
+            MAX_TOTAL_IMPORTS
+        );
         return css_text.to_string();
     }
 
@@ -258,11 +264,16 @@ pub async fn resolve_imports(
                 );
                 // Recursively resolve imports in the fetched content via Box::pin
                 // to avoid infinitely-sized future type from direct async recursion.
-                let resolved = Box::pin(resolve_imports(&content, &resolved_url, visited, depth + 1)).await;
+                let resolved =
+                    Box::pin(resolve_imports(&content, &resolved_url, visited, depth + 1)).await;
                 imported_css_parts.push(resolved);
             }
             Err(e) => {
-                log::warn!("Failed to fetch @import stylesheet {}: {:?}", resolved_url, e);
+                log::warn!(
+                    "Failed to fetch @import stylesheet {}: {:?}",
+                    resolved_url,
+                    e
+                );
             }
         }
     }
@@ -503,7 +514,10 @@ mod tests {
         // Generate HTML with 60 <link> tags — only MAX_EXTERNAL_SHEETS (50) should be fetched
         let mut html = String::from("<html><head>");
         for i in 0..60 {
-            html.push_str(&format!(r#"<link rel="stylesheet" href="/css/style{}.css">"#, i));
+            html.push_str(&format!(
+                r#"<link rel="stylesheet" href="/css/style{}.css">"#,
+                i
+            ));
         }
         html.push_str("</head><body></body></html>");
 

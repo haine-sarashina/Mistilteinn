@@ -114,14 +114,19 @@ impl Selector {
     ///
     /// Simplified — does not handle combinators fully (only checks the last
     /// simple-selector chain component).
+    ///
+    /// The `is_first_child` closure is used to evaluate `:first-child`.
+    /// Other pseudo-classes (`:hover`, `:focus`, `:visited`, etc.) return
+    /// `false` during static style computation — they require runtime context.
     pub fn matches_element(
         &self,
         tag_name: &str,
         classes: impl Fn(&str) -> bool,
         has_id: impl Fn(&str) -> bool,
+        is_first_child: impl Fn() -> bool,
     ) -> bool {
         if let Some((_, last)) = self.complex.last() {
-            Self::simple_matches(last, tag_name, classes, has_id)
+            Self::simple_matches(last, tag_name, classes, has_id, is_first_child)
         } else {
             false
         }
@@ -132,6 +137,7 @@ impl Selector {
         tag_name: &str,
         classes: impl Fn(&str) -> bool,
         has_id: impl Fn(&str) -> bool,
+        is_first_child: impl Fn() -> bool,
     ) -> bool {
         match sel {
             SimpleSelector::Universal => true,
@@ -139,7 +145,14 @@ impl Selector {
             SimpleSelector::Class(c) => classes(c),
             SimpleSelector::Id(i) => has_id(i),
             SimpleSelector::Attribute { .. } => true,
-            SimpleSelector::PseudoClass { .. } | SimpleSelector::PseudoElement(_) => true,
+            SimpleSelector::PseudoClass { name, .. } => match name.as_str() {
+                "first-child" => is_first_child(),
+                // :hover, :focus, :visited, :active, etc. require runtime context.
+                // Return false during static style computation — they should not
+                // permanently apply their styles.
+                _ => false,
+            },
+            SimpleSelector::PseudoElement(_) => false,
         }
     }
 }
@@ -216,7 +229,10 @@ fn try_parse_import(prelude: &str) -> Option<ImportRule> {
     }
     let after_at = &trimmed[1..].trim_start();
     // Only compare the first 6 characters — the rest is the URL part
-    if !after_at.starts_with("import") && !after_at.starts_with("IMPORT") && !after_at.starts_with("Import") {
+    if !after_at.starts_with("import")
+        && !after_at.starts_with("IMPORT")
+        && !after_at.starts_with("Import")
+    {
         return None;
     }
     // Case-insensitive check for "import"
@@ -224,7 +240,11 @@ fn try_parse_import(prelude: &str) -> Option<ImportRule> {
     if !import_prefix.eq_ignore_ascii_case("import") {
         return None;
     }
-    let after_import = if after_at.len() > 6 { &after_at[6..] } else { "" };
+    let after_import = if after_at.len() > 6 {
+        &after_at[6..]
+    } else {
+        ""
+    };
     let after_import = after_import.trim_start();
 
     // Try url(...) form
@@ -232,7 +252,12 @@ fn try_parse_import(prelude: &str) -> Option<ImportRule> {
         let rest = &after_import[4..];
         // Strip optional quotes inside url()
         let unquoted = rest.trim_start_matches('"').trim_start_matches('\'');
-        let url_str = unquoted.strip_suffix(')').unwrap_or(unquoted).trim_end_matches('"').trim_end_matches('\'').to_string();
+        let url_str = unquoted
+            .strip_suffix(')')
+            .unwrap_or(unquoted)
+            .trim_end_matches('"')
+            .trim_end_matches('\'')
+            .to_string();
         if !url_str.is_empty() {
             return Some(ImportRule { url: url_str });
         }
@@ -757,26 +782,26 @@ mod tests {
     #[test]
     fn parse_selector_matching() {
         let sel = Selector::simple(SimpleSelector::Type("div".to_string()));
-        assert!(sel.matches_element("div", |_| false, |_| false));
-        assert!(!sel.matches_element("span", |_| false, |_| false));
+        assert!(sel.matches_element("div", |_| false, |_| false, || false));
+        assert!(!sel.matches_element("span", |_| false, |_| false, || false));
     }
 
     #[test]
     fn parse_class_matching() {
         let sel = Selector::simple(SimpleSelector::Class("btn".to_string()));
-        assert!(sel.matches_element("div", |c| c == "btn", |_| false));
+        assert!(sel.matches_element("div", |c| c == "btn", |_| false, || false));
     }
 
     #[test]
     fn parse_id_matching() {
         let sel = Selector::simple(SimpleSelector::Id("header".to_string()));
-        assert!(sel.matches_element("div", |_| false, |i| i == "header"));
+        assert!(sel.matches_element("div", |_| false, |i| i == "header", || false));
     }
 
     #[test]
     fn parse_universal_matching() {
         let sel = Selector::simple(SimpleSelector::Universal);
-        assert!(sel.matches_element("anything", |_| false, |_| false));
+        assert!(sel.matches_element("anything", |_| false, |_| false, || false));
     }
 
     #[test]
@@ -804,6 +829,38 @@ mod tests {
         let ss = parse_stylesheet("h1, h2, h3 { color: red }");
         let rule = &ss.rules[0];
         assert_eq!(rule.selectors.len(), 3);
+    }
+
+    // -- Pseudo-class matching behavior tests --
+
+    #[test]
+    fn hover_does_not_match_static() {
+        // :hover should NOT match during static (non-interactive) style computation.
+        // It requires runtime mouse position context to evaluate.
+        let ss = parse_stylesheet("a:hover { color: red }");
+        let sel = &ss.rules[0].selectors[0];
+        // :hover is the last simple selector in the chain (after `a` type)
+        assert!(sel.complex.iter().any(
+            |(_, s)| matches!(s, SimpleSelector::PseudoClass { name, .. } if name == "hover")
+        ));
+        // During static computation, :hover should not match
+        assert!(!sel.matches_element("a", |_| false, |_| false, || false));
+        // Even if the element is a first child, :hover still doesn't match statically
+        assert!(!sel.matches_element("a", |_| false, |_| false, || true));
+    }
+
+    #[test]
+    fn first_child_matches_when_true() {
+        let ss = parse_stylesheet("li:first-child { font-weight: bold }");
+        let sel = &ss.rules[0].selectors[0];
+        assert!(sel.matches_element("li", |_| false, |_| false, || true));
+    }
+
+    #[test]
+    fn first_child_does_not_match_when_false() {
+        let ss = parse_stylesheet("li:first-child { font-weight: bold }");
+        let sel = &ss.rules[0].selectors[0];
+        assert!(!sel.matches_element("li", |_| false, |_| false, || false));
     }
 
     // -- Color tests --

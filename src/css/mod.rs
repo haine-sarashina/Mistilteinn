@@ -81,7 +81,10 @@ pub fn parse_color_value(color_str: &str) -> Option<CSSColor> {
 /// Supports integer values (0-255) for R/G/B and float (0.0-1.0) for alpha.
 /// Also handles percent values for R/G/B (0%-100% maps to 0-255).
 fn parse_rgb_function(color: &str) -> Option<CSSColor> {
-    let (is_rgba, inner) = if let Some(inner) = color.strip_prefix("rgba(").and_then(|s| s.strip_suffix(')')) {
+    let (is_rgba, inner) = if let Some(inner) = color
+        .strip_prefix("rgba(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         (true, inner)
     } else if let Some(inner) = color.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
         (false, inner)
@@ -100,7 +103,7 @@ fn parse_rgb_function(color: &str) -> Option<CSSColor> {
         let val = s.trim();
         if val.ends_with('%') {
             // Percentage: 0%-100% maps to 0-255
-            if let Ok(pct) = val[..val.len()-1].trim().parse::<f32>() {
+            if let Ok(pct) = val[..val.len() - 1].trim().parse::<f32>() {
                 return Some((pct / 100.0 * 255.0).clamp(0.0, 255.0) as u8);
             }
         } else {
@@ -312,6 +315,16 @@ pub fn compute_styles_for_tree(
             }
         })
         .collect();
+
+    // Pre-compute which nodes are first children of their parents.
+    // Used for :first-child pseudo-class evaluation.
+    let mut first_children: std::collections::HashSet<u32> =
+        std::collections::HashSet::with_capacity(element_ids.len());
+    for node in &*nodes_ref {
+        if let Some(&first_child) = node.children.first() {
+            first_children.insert(first_child.index() as u32);
+        }
+    }
     drop(nodes_ref);
 
     // Phase 1: Cascade — for each element, find matching rules and apply
@@ -336,6 +349,7 @@ pub fn compute_styles_for_tree(
                     &tag,
                     |c| node_has_class(&node, c),
                     |i| node_get_id(&node) == Some(i),
+                    || first_children.contains(&node_id),
                 ) {
                     matched.push((rule, selector.specificity()));
                 }
@@ -1145,7 +1159,10 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
         });
     }
 
-    parser::Stylesheet { rules, imports: Vec::new() }
+    parser::Stylesheet {
+        rules,
+        imports: Vec::new(),
+    }
 }
 
 /// Merges UA stylesheet rules with author stylesheet rules.
@@ -1230,51 +1247,115 @@ mod tests {
     #[test]
     fn parse_color_rgb_basic() {
         let result = parse_color_value("rgb(255, 0, 0)");
-        assert_eq!(result, Some(CSSColor::Rgba { r: 255, g: 0, b: 0, a: 1.0 }));
+        assert_eq!(
+            result,
+            Some(CSSColor::Rgba {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 1.0
+            })
+        );
     }
 
     #[test]
     fn parse_color_rgb_white() {
         let result = parse_color_value("rgb(255, 255, 255)");
-        assert_eq!(result, Some(CSSColor::Rgba { r: 255, g: 255, b: 255, a: 1.0 }));
+        assert_eq!(
+            result,
+            Some(CSSColor::Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 1.0
+            })
+        );
     }
 
     #[test]
     fn parse_color_rgb_black() {
         let result = parse_color_value("rgb(0, 0, 0)");
-        assert_eq!(result, Some(CSSColor::Rgba { r: 0, g: 0, b: 0, a: 1.0 }));
+        assert_eq!(
+            result,
+            Some(CSSColor::Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 1.0
+            })
+        );
     }
 
     #[test]
     fn parse_color_rgba_full_alpha() {
         let result = parse_color_value("rgba(0, 0, 255, 1.0)");
-        assert_eq!(result, Some(CSSColor::Rgba { r: 0, g: 0, b: 255, a: 1.0 }));
+        assert_eq!(
+            result,
+            Some(CSSColor::Rgba {
+                r: 0,
+                g: 0,
+                b: 255,
+                a: 1.0
+            })
+        );
     }
 
     #[test]
     fn parse_color_rgba_half_alpha() {
         let result = parse_color_value("rgba(0, 0, 255, 0.5)");
-        assert_eq!(result, Some(CSSColor::Rgba { r: 0, g: 0, b: 255, a: 0.5 }));
+        assert_eq!(
+            result,
+            Some(CSSColor::Rgba {
+                r: 0,
+                g: 0,
+                b: 255,
+                a: 0.5
+            })
+        );
     }
 
     #[test]
     fn parse_color_rgba_zero_alpha() {
         let result = parse_color_value("rgba(255, 128, 0, 0.0)");
-        assert_eq!(result, Some(CSSColor::Rgba { r: 255, g: 128, b: 0, a: 0.0 }));
+        assert_eq!(
+            result,
+            Some(CSSColor::Rgba {
+                r: 255,
+                g: 128,
+                b: 0,
+                a: 0.0
+            })
+        );
     }
 
     #[test]
     fn parse_color_rgb_with_spaces() {
         // Extra whitespace inside parentheses
         let result = parse_color_value("rgb( 100 , 200 , 50 )");
-        assert_eq!(result, Some(CSSColor::Rgba { r: 100, g: 200, b: 50, a: 1.0 }));
+        assert_eq!(
+            result,
+            Some(CSSColor::Rgba {
+                r: 100,
+                g: 200,
+                b: 50,
+                a: 1.0
+            })
+        );
     }
 
     #[test]
     fn parse_color_rgb_clamp_over() {
         // Values > 255 should clamp to 255
         let result = parse_color_value("rgb(300, -10, 256)");
-        assert_eq!(result, Some(CSSColor::Rgba { r: 255, g: 0, b: 255, a: 1.0 }));
+        assert_eq!(
+            result,
+            Some(CSSColor::Rgba {
+                r: 255,
+                g: 0,
+                b: 255,
+                a: 1.0
+            })
+        );
     }
 
     #[test]
@@ -1288,14 +1369,30 @@ mod tests {
     fn parse_color_rgb_percentage() {
         // rgb(100%, 0%, 0%) should be red
         let result = parse_color_value("rgb(100%, 0%, 0%)");
-        assert_eq!(result, Some(CSSColor::Rgba { r: 255, g: 0, b: 0, a: 1.0 }));
+        assert_eq!(
+            result,
+            Some(CSSColor::Rgba {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 1.0
+            })
+        );
     }
 
     #[test]
     fn parse_color_rgb_percentage_50() {
         // rgb(50%, 50%, 50%) should be gray (~128 each)
         let result = parse_color_value("rgb(50%, 50%, 50%)");
-        assert_eq!(result, Some(CSSColor::Rgba { r: 127, g: 127, b: 127, a: 1.0 }));
+        assert_eq!(
+            result,
+            Some(CSSColor::Rgba {
+                r: 127,
+                g: 127,
+                b: 127,
+                a: 1.0
+            })
+        );
     }
 
     #[test]

@@ -155,6 +155,45 @@ impl Selector {
             SimpleSelector::PseudoElement(_) => false,
         }
     }
+
+    /// Like [`matches_element`] but also evaluates `:hover` at runtime.
+    ///
+    /// The `is_hovered` closure returns `true` if the element currently being
+    /// tested is under the mouse cursor (or is an ancestor of such an element).
+    pub fn matches_element_with_hover(
+        &self,
+        tag_name: &str,
+        classes: impl Fn(&str) -> bool,
+        has_id: impl Fn(&str) -> bool,
+        is_first_child: impl Fn() -> bool,
+        is_hovered: impl Fn() -> bool,
+    ) -> bool {
+        if let Some((_, last)) = self.complex.last() {
+            Self::simple_matches_with_hover(last, tag_name, classes, has_id, is_first_child, is_hovered)
+        } else {
+            false
+        }
+    }
+
+    fn simple_matches_with_hover(
+        sel: &SimpleSelector,
+        tag_name: &str,
+        classes: impl Fn(&str) -> bool,
+        has_id: impl Fn(&str) -> bool,
+        is_first_child: impl Fn() -> bool,
+        is_hovered: impl Fn() -> bool,
+    ) -> bool {
+        match sel {
+            SimpleSelector::PseudoClass { name, .. } => match name.as_str() {
+                "first-child" => is_first_child(),
+                "hover" => is_hovered(),
+                // Other pseudo-classes still return false during computation.
+                _ => false,
+            },
+            // For non-pseudo selectors, delegate to the regular matcher.
+            _ => Self::simple_matches(sel, tag_name, classes, has_id, is_first_child),
+        }
+    }
 }
 
 // ------ CSS Rule ------
@@ -861,6 +900,54 @@ mod tests {
         let ss = parse_stylesheet("li:first-child { font-weight: bold }");
         let sel = &ss.rules[0].selectors[0];
         assert!(!sel.matches_element("li", |_| false, |_| false, || false));
+    }
+
+    // -- Hover with dynamic context tests --
+
+    #[test]
+    fn hover_matches_with_hover_context() {
+        // :hover should match when the is_hovered closure returns true
+        let ss = parse_stylesheet("a:hover { color: red }");
+        let sel = &ss.rules[0].selectors[0];
+        assert!(sel.matches_element_with_hover(
+            "a", |_| false, |_| false, || false, || true
+        ));
+    }
+
+    #[test]
+    fn hover_does_not_match_without_hover_context() {
+        // :hover should NOT match when the is_hovered closure returns false
+        let ss = parse_stylesheet("a:hover { color: red }");
+        let sel = &ss.rules[0].selectors[0];
+        assert!(!sel.matches_element_with_hover(
+            "a", |_| false, |_| false, || false, || false
+        ));
+    }
+
+    #[test]
+    fn hover_class_combo_matches_when_hovered() {
+        // NOTE: The parser only checks the last component of a selector chain.
+        // For `a.special:hover`, only `:hover` is checked (last component).
+        // This is consistent with existing matches_element behavior.
+
+        // :hover on its own should match when hovered
+        let ss = parse_stylesheet("a:hover { color: blue }");
+        let sel = &ss.rules[0].selectors[0];
+        assert!(sel.matches_element_with_hover(
+            "a", |_| false, |_| false, || false, || true
+        ));
+        // Should NOT match when not hovered
+        assert!(!sel.matches_element_with_hover(
+            "a", |_| false, |_| false, || false, || false
+        ));
+
+        // Test :hover with class on a different tag type
+        let ss2 = parse_stylesheet(".special:hover { color: green }");
+        let sel2 = &ss2.rules[0].selectors[0];
+        // Only :hover (last) is checked, so it matches based on hover state only
+        assert!(sel2.matches_element_with_hover(
+            "div", |_| false, |_| false, || false, || true
+        ));
     }
 
     // -- Color tests --

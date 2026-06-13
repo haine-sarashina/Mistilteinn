@@ -38,6 +38,9 @@ pub struct MistilteinnApp {
     hovered_tab_id: Option<crate::browser::tab::TabId>,
     /// Whether the address bar is currently under the cursor.
     hovered_address_bar: bool,
+    /// The deepest DOM node ID in page content that was last determined to be under the cursor.
+    /// Used to detect when :hover needs to be recomputed.
+    prev_hovered_dom_id: Option<u32>,
 }
 
 /// Hit-test result for tab bar clicks.
@@ -902,6 +905,7 @@ impl ApplicationHandler for MistilteinnApp {
             self.ctrl_pressed = false;
             self.hovered_tab_id = None;
             self.hovered_address_bar = false;
+            self.prev_hovered_dom_id = None;
             self.tab_manager.create_tab();
 
             let window = event_loop
@@ -1103,7 +1107,8 @@ impl ApplicationHandler for MistilteinnApp {
                 }
 
                 // Hit-test content area for interactive elements (links, inputs) to change cursor
-                if self.is_in_content_area(cx, cy) {
+                // and compute :hover state. Extract all info first to avoid borrow conflicts.
+                let (content_cursor, hovered_dom_path) = if self.is_in_content_area(cx, cy) {
                     if let Some(ref page) = self.tab_manager.get_active_tab_page() {
                         let scroll_offset = self
                             .tab_manager
@@ -1113,7 +1118,7 @@ impl ApplicationHandler for MistilteinnApp {
                         let content_x = cx - TAB_BAR_WIDTH as f32 + scroll_offset.0;
                         let content_y = cy - ADDRESS_BAR_HEIGHT as f32 + scroll_offset.1;
 
-                        let new_cursor = crate::layout::hit_test_interactive(
+                        let cursor_kind = crate::layout::hit_test_interactive(
                             &page.layout_root,
                             content_x,
                             content_y,
@@ -1125,11 +1130,59 @@ impl ApplicationHandler for MistilteinnApp {
                         })
                         .unwrap_or(CursorKind::Default);
 
-                        Self::set_winit_cursor(self.renderer.as_ref(), new_cursor);
+                        // :hover — hit-test for DOM node path (includes ancestors)
+                        let dom_path = crate::layout::hit_test_dom_path(
+                            &page.layout_root,
+                            content_x,
+                            content_y,
+                        );
+
+                        (Some(cursor_kind), Some(dom_path))
+                    } else {
+                        (None, None)
                     }
                 } else {
-                    // Outside content area: reset to default cursor
+                    (None, None)
+                };
+
+                // Apply cursor change
+                if let Some(kind) = content_cursor {
+                    Self::set_winit_cursor(self.renderer.as_ref(), kind);
+                } else {
                     Self::set_winit_cursor(self.renderer.as_ref(), CursorKind::Default);
+                }
+
+                // Recompute :hover styles if the hovered DOM node changed
+                if let Some(hovered_dom_path) = hovered_dom_path {
+                    let new_hovered_id = hovered_dom_path.last().copied();
+                    let hover_changed = new_hovered_id != self.prev_hovered_dom_id;
+                    self.prev_hovered_dom_id = new_hovered_id;
+
+                    if hover_changed {
+                        if let Some(tab) = self.tab_manager.active_tab_mut() {
+                            if let Some(ref mut pg) = tab.page {
+                                pg.recompute_with_hover(&hovered_dom_path);
+                            }
+                        }
+                        self.recompose();
+                        if let Some(ref renderer) = self.renderer {
+                            renderer.window().request_redraw();
+                        }
+                    }
+                } else {
+                    // Outside content area: clear hover state if it was set
+                    if self.prev_hovered_dom_id.is_some() {
+                        self.prev_hovered_dom_id = None;
+                        if let Some(tab) = self.tab_manager.active_tab_mut() {
+                            if let Some(ref mut pg) = tab.page {
+                                pg.recompute_with_hover(&[]);
+                            }
+                        }
+                        self.recompose();
+                        if let Some(ref renderer) = self.renderer {
+                            renderer.window().request_redraw();
+                        }
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1192,6 +1245,7 @@ pub fn run(start_url: Option<String>) {
         ctrl_pressed: false,
         hovered_tab_id: None,
         hovered_address_bar: false,
+        prev_hovered_dom_id: None,
     };
     event_loop.run_app(&mut app).expect("Event loop failed");
 }

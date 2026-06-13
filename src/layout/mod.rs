@@ -179,6 +179,8 @@ pub struct LayoutNode {
     pub order: i32,
     /// Interaction type for cursor changes (link, input, etc.).
     pub interaction_type: InteractionType,
+    /// Reference back to the DOM node ID (set only for element nodes, not text/image leaves).
+    pub dom_node_id: Option<u32>,
 }
 
 impl LayoutNode {
@@ -222,6 +224,7 @@ impl LayoutNode {
             grid_row_gap: 0.0,
             order: 0,
             interaction_type: InteractionType::None,
+            dom_node_id: None,
         }
     }
 
@@ -429,6 +432,9 @@ fn build_layout_children<N, F>(
                         _ => InteractionType::None,
                     };
 
+                    // Track DOM node ID for hit-testing / :hover
+                    layout_node.dom_node_id = Some(child_id);
+
                     let text = node.text_content().map(|t| t.to_string());
                     if text.is_some() && node.children_ids().is_empty() {
                         layout_node.text = text;
@@ -477,6 +483,9 @@ fn build_layout_children<N, F>(
                         "input" | "textarea" | "button" => InteractionType::Input,
                         _ => InteractionType::None,
                     };
+
+                    // Track DOM node ID for hit-testing / :hover
+                    layout_node.dom_node_id = Some(child_id);
 
                     let text = node.text_content().map(|t| t.to_string());
                     if text.is_some() && node.children_ids().is_empty() {
@@ -2466,6 +2475,52 @@ pub fn hit_test_interactive(root: &LayoutNode, x: f32, y: f32) -> Option<Interac
         return Some(root.interaction_type);
     }
     None
+}
+
+/// Hit-test the layout tree at a position and return all DOM node IDs along
+/// the hit path (from root ancestor to deepest matching node).
+///
+/// Used for `:hover` evaluation — the returned path includes all ancestors
+/// of the element under the cursor, so selectors like `div:hover > a` work.
+/// Text nodes don't have `dom_node_id`, so the innermost element ancestor
+/// of any text at the hit position will be the last entry.
+pub fn hit_test_dom_path(root: &LayoutNode, x: f32, y: f32) -> Vec<u32> {
+    let mut path = Vec::new();
+    hit_test_dom_path_inner(root, x, y, &mut path);
+    // Path is collected in root-to-leaf order (push before recurse).
+    path
+}
+
+fn hit_test_dom_path_inner(node: &LayoutNode, x: f32, y: f32, path: &mut Vec<u32>) {
+    if !node.rect.contains(x, y) {
+        return;
+    }
+
+    // Record this node's DOM ID if it has one
+    if let Some(id) = node.dom_node_id {
+        path.push(id);
+    }
+
+    // Check absolute children first (they render on top of normal flow).
+    // Only recurse into the first matching child (topmost wins).
+    let mut found = false;
+    for abs_child in node.absolute_children.iter().rev() {
+        if !found && abs_child.rect.contains(x, y) {
+            hit_test_dom_path_inner(abs_child, x, y, path);
+            found = true;
+        }
+    }
+
+    // If no absolute child matched, try normal-flow children (last = on top).
+    // Only recurse into the first matching child.
+    if !found {
+        for child in node.children.iter().rev() {
+            if child.rect.contains(x, y) {
+                hit_test_dom_path_inner(child, x, y, path);
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4879,5 +4934,107 @@ mod tests {
             hit_test_interactive(&root, 70.0, 60.0),
             Some(InteractionType::Link)
         );
+    }
+
+    // ---- hit_test_dom_path Tests ----
+
+    #[test]
+    fn test_hit_test_dom_path_basic() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        root.dom_node_id = Some(0); // document/root node
+
+        let mut link = LayoutNode::new(Rect::new(20.0, 20.0, 60.0, 30.0));
+        link.dom_node_id = Some(2); // e.g., <a href="#">
+
+        let mut child = LayoutNode::new(Rect::new(10.0, 10.0, 180.0, 180.0));
+        child.dom_node_id = Some(1); // e.g., <body>
+        child.add_child(link);
+        root.add_child(child);
+
+        // Hit inside the link should return [root, body, link]
+        let path = hit_test_dom_path(&root, 30.0, 30.0);
+        assert_eq!(path, vec![0u32, 1, 2]);
+    }
+
+    #[test]
+    fn test_hit_test_dom_path_outside_child() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        root.dom_node_id = Some(0);
+
+        let mut child = LayoutNode::new(Rect::new(50.0, 50.0, 100.0, 100.0));
+        child.dom_node_id = Some(1);
+        root.add_child(child);
+
+        // Hit at (20, 20) is inside root but outside child → path should be [root] only
+        let path = hit_test_dom_path(&root, 20.0, 20.0);
+        assert_eq!(path, vec![0u32]);
+    }
+
+    #[test]
+    fn test_hit_test_dom_path_outside_all() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        root.dom_node_id = Some(0);
+
+        // Hit completely outside the root rect
+        let path = hit_test_dom_path(&root, 200.0, 200.0);
+        assert!(path.is_empty());
+    }
+
+    #[test]
+    fn test_hit_test_dom_path_text_node_skipped() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        root.dom_node_id = Some(0);
+
+        // <a> element with text child (text node has no dom_node_id)
+        let mut link = LayoutNode::new(Rect::new(10.0, 10.0, 80.0, 30.0));
+        link.dom_node_id = Some(1); // the <a> element
+
+        let text = LayoutNode::new(Rect::new(15.0, 15.0, 70.0, 20.0));
+        // text node: dom_node_id stays None (default)
+        link.add_child(text);
+        root.add_child(link);
+
+        // Hit inside text node → path should be [root, link] (text node skipped)
+        let path = hit_test_dom_path(&root, 20.0, 20.0);
+        assert_eq!(path, vec![0u32, 1]);
+    }
+
+    #[test]
+    fn test_hit_test_dom_path_topmost_child_wins() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        root.dom_node_id = Some(0);
+
+        // Two overlapping children - first one added is below the second
+        let mut below = LayoutNode::new(Rect::new(10.0, 10.0, 100.0, 100.0));
+        below.dom_node_id = Some(1);
+        root.add_child(below);
+
+        let mut above = LayoutNode::new(Rect::new(20.0, 20.0, 80.0, 80.0));
+        above.dom_node_id = Some(2); // rendered on top
+        root.add_child(above);
+
+        // Hit in overlap area → should find [root, above] (topmost)
+        let path = hit_test_dom_path(&root, 30.0, 30.0);
+        assert_eq!(path, vec![0u32, 2]);
+    }
+
+    #[test]
+    fn test_hit_test_dom_path_absolute_child_on_top() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        root.dom_node_id = Some(0);
+
+        // Normal child
+        let mut normal = LayoutNode::new(Rect::new(10.0, 10.0, 100.0, 100.0));
+        normal.dom_node_id = Some(1);
+        root.add_child(normal);
+
+        // Absolute child (renders on top of normal flow)
+        let mut abs = LayoutNode::new(Rect::new(30.0, 30.0, 60.0, 60.0));
+        abs.dom_node_id = Some(2);
+        root.absolute_children.push(abs);
+
+        // Hit in overlap → should find absolute child (on top)
+        let path = hit_test_dom_path(&root, 40.0, 40.0);
+        assert_eq!(path, vec![0u32, 2]);
     }
 }

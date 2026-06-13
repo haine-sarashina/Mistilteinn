@@ -299,6 +299,34 @@ pub fn compute_styles_for_tree(
     arena: &crate::html::DomArena,
     stylesheet: &parser::Stylesheet,
 ) -> FxHashMap<u32, ComputedValues> {
+    compute_styles_for_tree_internal(arena, stylesheet, |_| false)
+}
+
+/// Compute styles with runtime hover context.
+///
+/// `hovered_ids` is the set of DOM node IDs currently under the mouse cursor,
+/// including ancestors (for selectors like `div:hover > a`).
+pub fn compute_styles_for_tree_with_hover(
+    arena: &crate::html::DomArena,
+    stylesheet: &parser::Stylesheet,
+    hovered_ids: &[u32],
+) -> FxHashMap<u32, ComputedValues> {
+    let hover_set: std::collections::HashSet<u32> = hovered_ids.iter().copied().collect();
+    compute_styles_for_tree_internal(arena, stylesheet, |id| hover_set.contains(&id))
+}
+
+/// Internal implementation of style computation with a configurable hover predicate.
+///
+/// The `is_hovered` closure returns `true` for elements that should match `:hover`.
+/// Pass `|_id| false` for static (no-hover) computation.
+fn compute_styles_for_tree_internal<F>(
+    arena: &crate::html::DomArena,
+    stylesheet: &parser::Stylesheet,
+    is_hovered: F,
+) -> FxHashMap<u32, ComputedValues>
+where
+    F: Fn(u32) -> bool,
+{
     let mut result = FxHashMap::default();
 
     // Collect all element node IDs by iterating the arena in index order.
@@ -345,11 +373,12 @@ pub fn compute_styles_for_tree(
 
         for rule in &stylesheet.rules {
             for selector in &rule.selectors {
-                if selector.matches_element(
+                if selector.matches_element_with_hover(
                     &tag,
                     |c| node_has_class(&node, c),
                     |i| node_get_id(&node) == Some(i),
                     || first_children.contains(&node_id),
+                    || is_hovered(node_id),
                 ) {
                     matched.push((rule, selector.specificity()));
                 }
@@ -2274,5 +2303,78 @@ mod tests {
     fn test_order_default() {
         let computed = ComputedValues::default();
         assert_eq!(computed.order, 0);
+    }
+
+    // -- Hover style computation tests --
+
+    #[test]
+    fn test_hover_style_applied_when_hovered() {
+        use crate::html;
+        // Simple page with an <a> tag and :hover CSS rule
+        let html = r##"<html><body><a href="#">Link</a></body></html>"##;
+        let css_str = "a:hover { color: red }";
+
+        let arena = html::parse_html(html);
+        let author_stylesheet = parser::parse_stylesheet(css_str);
+        let ua_stylesheet = user_agent_stylesheet();
+        let stylesheet = merge_stylesheets_with_author(&ua_stylesheet, &author_stylesheet);
+
+        // Without hover — the <a> should NOT have red color from :hover rule
+        let styles_no_hover = compute_styles_for_tree(&arena, &stylesheet);
+
+        // With hover — mark node_id 3 (the <a>) as hovered
+        // Node IDs: 0=document, 1=html, 2=body, 3=a
+        let nodes_ref = arena.nodes.borrow();
+        // Find the <a> element node ID by scanning
+        let link_node_id = nodes_ref
+            .iter()
+            .enumerate()
+            .find(|(_, n)| n.is_element())
+            .map(|(i, _)| i as u32);
+        drop(nodes_ref);
+
+        // Compute with the <a> marked as hovered (try node 3 which should be the <a>)
+        let styles_with_hover = compute_styles_for_tree_with_hover(&arena, &stylesheet, &[3]);
+
+        // The hovered node should have styles computed from the :hover rule
+        // Check that it has a non-default color
+        if let Some(computed) = styles_with_hover.get(&3) {
+            assert_eq!(computed.color, Some([255, 0, 0, 255]), "Hovered <a> should have red color");
+        } else {
+            panic!("Node 3 (<a>) should have computed styles");
+        }
+
+        // Without hover, the color should NOT be red (no other rule sets it)
+        if let Some(computed) = styles_no_hover.get(&3) {
+            assert_ne!(computed.color, Some([255, 0, 0, 255]), "Non-hovered <a> should NOT have red color");
+        }
+    }
+
+    #[test]
+    fn test_static_compute_same_as_hover_with_empty_set() {
+        use crate::html;
+        let html = r#"<html><body><div>Hello</div></body></html>"#;
+        let css_str = "div:hover { background-color: blue }";
+
+        let arena = html::parse_html(html);
+        let author_stylesheet = parser::parse_stylesheet(css_str);
+        let ua_stylesheet = user_agent_stylesheet();
+        let stylesheet = merge_stylesheets_with_author(&ua_stylesheet, &author_stylesheet);
+
+        // Static computation should produce same result as hover with empty set
+        let static_styles = compute_styles_for_tree(&arena, &stylesheet);
+        let no_hover_styles = compute_styles_for_tree_with_hover(&arena, &stylesheet, &[]);
+
+        // Both should have the same number of entries and same background_color for each node
+        assert_eq!(static_styles.len(), no_hover_styles.len());
+        for (&id, computed) in &static_styles {
+            if let Some(other) = no_hover_styles.get(&id) {
+                assert_eq!(
+                    computed.background_color, other.background_color,
+                    "Node {} background_color mismatch", id
+                );
+                assert_eq!(computed.color, other.color, "Node {} color mismatch", id);
+            }
+        }
     }
 }

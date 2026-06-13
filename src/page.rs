@@ -26,6 +26,8 @@ pub struct Page {
     pub view_height: f32,
     pub page_url: String,
     pub image_cache: FxHashMap<String, CachedImage>,
+    /// Merged (UA + author) stylesheet for style recomputation (e.g., :hover).
+    pub stylesheet: crate::css::parser::Stylesheet,
 }
 
 impl Page {
@@ -101,7 +103,53 @@ impl Page {
             view_height,
             page_url: String::new(),
             image_cache: FxHashMap::default(),
+            stylesheet,
         }
+    }
+
+    /// Recompute styles and rebuild the layout tree with the given set of
+    /// hovered DOM node IDs. If `hovered_ids` is empty, computes static styles
+    /// (equivalent to initial load).
+    pub fn recompute_with_hover(&mut self, hovered_ids: &[u32]) {
+        // Recompute styles with hover awareness
+        self.styles = css::compute_styles_for_tree_with_hover(
+            &self.arena,
+            &self.stylesheet,
+            hovered_ids,
+        );
+
+        // Rebuild layout tree from new computed styles
+        let get_node = |id: u32| self.arena.get(DomHandle(NodeId::from_raw(id)));
+        self.layout_root = crate::layout::build_layout_tree(0, &self.styles, get_node, self.view_width);
+
+        // Re-extract absolute children and recompute layout
+        crate::layout::extract_absolute_children(&mut self.layout_root);
+        let mut text_renderer = crate::render::text::TextRenderer::new();
+        crate::layout::compute_layout(&mut self.layout_root, self.view_width, &mut text_renderer);
+        crate::layout::apply_relative_positioning(&mut self.layout_root);
+
+        // Recompute absolute positions
+        let containing_block = Rect::new(
+            self.layout_root.padding[3] + self.layout_root.border[3],
+            self.layout_root.padding[0] + self.layout_root.border[0],
+            (self.layout_root.rect.width
+                - self.layout_root.padding[1]
+                - self.layout_root.padding[3]
+                - self.layout_root.border[1]
+                - self.layout_root.border[3])
+                .max(0.0),
+            (self.layout_root.rect.height
+                - self.layout_root.padding[0]
+                - self.layout_root.padding[2]
+                - self.layout_root.border[0]
+                - self.layout_root.border[2])
+                .max(0.0),
+        );
+        crate::layout::compute_absolute_positions(
+            &mut self.layout_root,
+            containing_block,
+            &mut text_renderer,
+        );
     }
 
     /// Collect renderable rectangles with colors from the layout tree.

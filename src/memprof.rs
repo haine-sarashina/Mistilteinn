@@ -22,18 +22,33 @@ pub struct MemoryProfile {
     pub image_cache_bytes: usize,
     pub composite_buffer_bytes: usize,
     pub total_bytes: usize,
+    /// Count of DOM nodes in the arena (including document, doctype, comments).
+    pub dom_node_count: usize,
+    /// Count of computed style entries.
+    pub style_entry_count: usize,
+    /// Count of layout nodes in the tree (including root).
+    pub layout_node_count: usize,
+    /// Count of renderable rectangles collected from the layout tree.
+    pub render_rect_count: usize,
+    /// Count of cached images.
+    pub cached_image_count: usize,
 }
 
 impl MemoryProfile {
     /// Format the profile as a human-readable summary (in KiB/MiB).
     pub fn summary(&self) -> String {
         format!(
-            "Memory profile — DOM: {}, Styles: {}, Layout: {}, Images: {}, Composite: {}, Total: {}",
+            "Memory profile — DOM: {} ({} nodes), Styles: {} ({} entries), Layout: {} ({} nodes), Images: {} ({} cached), Composite: {}, RenderRects: {}, Total: {}",
             Self::human_size(self.dom_arena_bytes),
+            self.dom_node_count,
             Self::human_size(self.style_map_bytes),
+            self.style_entry_count,
             Self::human_size(self.layout_tree_bytes),
+            self.layout_node_count,
             Self::human_size(self.image_cache_bytes),
+            self.cached_image_count,
             Self::human_size(self.composite_buffer_bytes),
+            self.render_rect_count,
             Self::human_size(self.total_bytes),
         )
     }
@@ -64,6 +79,14 @@ pub fn profile_page(page: &Page, composite_buffer_bytes: usize) -> MemoryProfile
 
     let total = dom + styles + layout + images + composite_buffer_bytes;
 
+    // Diagnostic counts
+    let dom_node_count = page.arena.nodes.borrow().len();
+    let style_entry_count = page.styles.len();
+    let layout_node_count = count_layout_nodes(&page.layout_root);
+    let render_rects = page.collect_rects();
+    let render_rect_count = render_rects.len();
+    let cached_image_count = page.image_cache.len();
+
     MemoryProfile {
         dom_arena_bytes: dom,
         style_map_bytes: styles,
@@ -71,6 +94,11 @@ pub fn profile_page(page: &Page, composite_buffer_bytes: usize) -> MemoryProfile
         image_cache_bytes: images,
         composite_buffer_bytes,
         total_bytes: total,
+        dom_node_count,
+        style_entry_count,
+        layout_node_count,
+        render_rect_count,
+        cached_image_count,
     }
 }
 
@@ -233,6 +261,18 @@ fn estimate_image_cache(cache: &rustc_hash::FxHashMap<String, CachedImage>) -> u
     total
 }
 
+/// Count the total number of layout nodes in the tree (including root).
+fn count_layout_nodes(node: &LayoutNode) -> usize {
+    let mut count = 1; // count this node
+    for child in &node.children {
+        count += count_layout_nodes(child);
+    }
+    for abs_child in &node.absolute_children {
+        count += count_layout_nodes(abs_child);
+    }
+    count
+}
+
 // --------------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------------
@@ -296,6 +336,11 @@ mod tests {
             image_cache_bytes: 1024 * 1024,
             composite_buffer_bytes: 1024 * 1024 * 2,
             total_bytes: 0,
+            dom_node_count: 10,
+            style_entry_count: 5,
+            layout_node_count: 8,
+            render_rect_count: 4,
+            cached_image_count: 2,
         };
         let s = profile.summary();
         assert!(s.contains("DOM"));

@@ -38,8 +38,7 @@ pub struct Renderer {
     text_pipeline: wgpu::RenderPipeline,
     /// Bind group layout for the text pipeline (texture + sampler).
     text_bind_group_layout: wgpu::BindGroupLayout,
-    /// Vertex buffer for a fullscreen quad (2 triangles).
-    quad_vertex_buffer: wgpu::Buffer,
+
 }
 
 impl Renderer {
@@ -182,20 +181,7 @@ impl Renderer {
         let text_pipeline = Self::create_text_pipeline(&device, surface_format);
         let text_bind_group_layout = text_pipeline.get_bind_group_layout(0);
 
-        // Create fullscreen quad vertex buffer
-        // Vertex format: [x, y, uv_x, uv_y] as f32 — 6 vertices for 2 triangles
-        let quad_vertices: [f32; 24] = [
-            // Triangle 1
-            -1.0, -1.0, 0.0, 0.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, // Triangle 2
-            -1.0, -1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0,
-        ];
-        let quad_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Quad Vertex Buffer"),
-            size: quad_vertices.len() as u64 * std::mem::size_of::<f32>() as u64,
-            usage: wgpu::BufferUsages::VERTEX,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&quad_vertex_buffer, 0, bytemuck::cast_slice(&quad_vertices));
+
 
         log::info!(
             "Renderer initialized — surface format: {:?}, size: {}x{}",
@@ -220,7 +206,6 @@ impl Renderer {
             text_sampler,
             text_pipeline,
             text_bind_group_layout,
-            quad_vertex_buffer,
         })
     }
 
@@ -251,7 +236,7 @@ impl Renderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -596,58 +581,47 @@ mod shader {
         @group(0) @binding(1)
         var<uniform> rect_colors: RectColor;
 
+        struct VertexOutput {
+            @builtin(position) position: vec4f,
+            @location(0) color: vec4f,
+        }
+
         @vertex
         fn vs_main(
             @builtin(vertex_index) vertex_index: u32,
-        ) -> @builtin(position) vec4f {
-            // 6 vertices per rectangle (2 triangles)
+        ) -> VertexOutput {
+            var out: VertexOutput;
             let tri = vertex_index % 6u;
             let rect_idx = (vertex_index / 6u) * 2u + tri / 2u;
             if rect_idx > 2047u {
-                return vec4f(0.0, 0.0, 0.0, 1.0);
+                out.position = vec4f(0.0, 0.0, 0.0, 1.0);
+                out.color = vec4f(0.0, 0.0, 0.0, 0.0);
+                return out;
             }
             let r = rect_data.rects[rect_idx];
-            // Two triangles per rect
-            let offsets = array<vec2f, 3>(
-                vec2f(0.0, 0.0),
-                vec2f(1.0, 0.0),
-                vec2f(1.0, 1.0),
-            );
-            let offset2 = array<vec2f, 3>(
-                vec2f(0.0, 0.0),
-                vec2f(1.0, 1.0),
-                vec2f(0.0, 1.0),
-            );
-            let off = if tri < 3u {
-                offsets[tri]
-            } else {
-                offset2[tri - 3u]
-            };
+            var off: vec2f;
+            switch tri {
+                case 0u: { off = vec2f(0.0, 0.0); }
+                case 1u: { off = vec2f(1.0, 0.0); }
+                case 2u: { off = vec2f(1.0, 1.0); }
+                case 3u: { off = vec2f(0.0, 0.0); }
+                case 4u: { off = vec2f(1.0, 1.0); }
+                case 5u: { off = vec2f(0.0, 1.0); }
+                default: { off = vec2f(0.0, 0.0); }
+            }
             let px = r.x + off.x * r.z;
             let py = r.y + off.y * r.w;
-            return vec4f(px, py, 0.0, 1.0);
+            out.position = vec4f(px, py, 0.0, 1.0);
+            out.color = rect_colors.colors[rect_idx];
+            return out;
         }
     "#;
 
     /// Fragment shader that outputs the rectangle color.
     pub const RECT_FRAGMENT: &str = r#"
-        struct RectColor {
-            colors: array<vec4f, 2048>,
-        }
-
-        @group(0) @binding(1)
-        var<uniform> rect_colors: RectColor;
-
         @fragment
-        fn fs_main(
-            @builtin(vertex_index) vertex_index: u32,
-        ) -> @location(0) vec4f {
-            let tri = vertex_index % 6u;
-            let rect_idx = (vertex_index / 6u) * 2u + tri / 2u;
-            if rect_idx > 2047u {
-                return vec4f(1.0, 1.0, 1.0, 1.0);
-            }
-            return rect_colors.colors[rect_idx];
+        fn fs_main(in: VertexOutput) -> @location(0) vec4f {
+            return in.color;
         }
     "#;
 
@@ -660,17 +634,37 @@ mod shader {
 
         @vertex
         fn vs_text_quad(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-            var positions = array<vec2f, 6>(
-                vec2f(-1.0, -1.0), vec2f(-1.0, 1.0), vec2f(1.0, 1.0),
-                vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(1.0, -1.0),
-            );
-            var uvs = array<vec2f, 6>(
-                vec2f(0.0, 0.0), vec2f(0.0, 1.0), vec2f(1.0, 1.0),
-                vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(1.0, 0.0),
-            );
             var out: VertexOutput;
-            out.position = vec4f(positions[vertex_index], 0.0, 1.0);
-            out.uv = uvs[vertex_index];
+            switch vertex_index {
+                case 0u: {
+                    out.position = vec4f(-1.0, -1.0, 0.0, 1.0);
+                    out.uv = vec2f(0.0, 0.0);
+                }
+                case 1u: {
+                    out.position = vec4f(-1.0, 1.0, 0.0, 1.0);
+                    out.uv = vec2f(0.0, 1.0);
+                }
+                case 2u: {
+                    out.position = vec4f(1.0, 1.0, 0.0, 1.0);
+                    out.uv = vec2f(1.0, 1.0);
+                }
+                case 3u: {
+                    out.position = vec4f(-1.0, -1.0, 0.0, 1.0);
+                    out.uv = vec2f(0.0, 0.0);
+                }
+                case 4u: {
+                    out.position = vec4f(1.0, 1.0, 0.0, 1.0);
+                    out.uv = vec2f(1.0, 1.0);
+                }
+                case 5u: {
+                    out.position = vec4f(1.0, -1.0, 0.0, 1.0);
+                    out.uv = vec2f(1.0, 0.0);
+                }
+                default: {
+                    out.position = vec4f(0.0, 0.0, 0.0, 1.0);
+                    out.uv = vec2f(0.0, 0.0);
+                }
+            }
             return out;
         }
     "#;

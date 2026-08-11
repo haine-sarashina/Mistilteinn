@@ -2504,7 +2504,7 @@ dependencies = [
 
 [[package]]
 name = "mistilteinn"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "cssparser 0.34.0",

@@ -27,10 +27,18 @@ jobs:
         run: |
           Compress-Archive -Path target/release/mistilteinn.exe -DestinationPath mistilteinn-x86_64-pc-windows-msvc.zip
 
+      - name: Install cargo-wix
+        run: cargo install cargo-wix
+
+      - name: Build MSI installer
+        run: cargo wix --no-build -p mistilteinn
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: mistilteinn-x86_64-pc-windows-msvc.zip
+          files: |
+            mistilteinn-x86_64-pc-windows-msvc.zip
+            target/wix/*.msi
           draft: false
           prerelease: false
           generate_release_notes: true

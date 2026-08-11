@@ -125,7 +125,7 @@ impl Renderer {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::Mailbox,
+            present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 1,
@@ -618,7 +618,11 @@ mod shader {
                 vec2f(1.0, 1.0),
                 vec2f(0.0, 1.0),
             );
-            let off = if tri < 3u { offsets[tri] } else { offset2[tri - 3u] };
+            let off = if tri < 3u {
+                offsets[tri]
+            } else {
+                offset2[tri - 3u]
+            };
             let px = r.x + off.x * r.z;
             let py = r.y + off.y * r.w;
             return vec4f(px, py, 0.0, 1.0);

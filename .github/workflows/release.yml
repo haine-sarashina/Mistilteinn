@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Create ZIP archive
+        run: |
+          Compress-Archive -Path target/release/mistilteinn.exe -DestinationPath mistilteinn-x86_64-pc-windows-msvc.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mistilteinn-x86_64-pc-windows-msvc.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true

@@ -908,12 +908,26 @@ impl ApplicationHandler for MistilteinnApp {
             self.prev_hovered_dom_id = None;
             self.tab_manager.create_tab();
 
+            // Load the window icon
+            let icon_bytes = include_bytes!("../assets/icon.jpg");
+            let icon = image::load_from_memory(icon_bytes)
+                .ok()
+                .map(|img| img.into_rgba8())
+                .and_then(|rgba| {
+                    let (width, height) = rgba.dimensions();
+                    winit::window::Icon::from_rgba(rgba.into_raw(), width, height).ok()
+                });
+
+            let mut window_attributes = WindowAttributes::default()
+                .with_title("Mistilteinn")
+                .with_inner_size(winit::dpi::PhysicalSize::new(1280, 800));
+            
+            if let Some(icon) = icon {
+                window_attributes = window_attributes.with_window_icon(Some(icon));
+            }
+
             let window = event_loop
-                .create_window(
-                    WindowAttributes::default()
-                        .with_title("Mistilteinn")
-                        .with_inner_size(winit::dpi::PhysicalSize::new(1280, 800)),
-                )
+                .create_window(window_attributes)
                 .expect("Failed to create window");
 
             log::info!("Window created (1280x800)");

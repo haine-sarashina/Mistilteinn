@@ -41,5 +41,8 @@ smallvec = "1.13"
 hashbrown = "0.15"
 bytemuck = "1.14"
 
+# Auto-update
+self_update = { version = "0.41", features = ["archive-zip", "rustls"] }
+rfd = "0.14"
 [features]
 memprof = []

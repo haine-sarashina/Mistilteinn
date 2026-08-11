@@ -98,10 +98,11 @@
                       2. Comment out or remove the `ComponentRef` tag with the "License" Id
                          attribute value further down in this file.
                     -->
-                    <Component Id='License' Guid='*'>
+                    <Component Id='License' Guid='32B94A79-4B52-47CA-B561-A8DB74ADBDCD'>
                         <File Id='LicenseFile'
                             DiskId='1'
                             Source='wix\License.rtf'/>
+                        <RemoveFolder Id="RemoveAPPLICATIONFOLDER" On="uninstall"/>
                         <RegistryValue Root="HKCU" Key="Software\haine\Mistilteinn" Name="license_installed" Type="integer" Value="1" KeyPath="yes"/>
                     </Component>
                     
@@ -117,7 +118,7 @@
                                 System='yes'/>
                             <RegistryValue Root="HKCU" Key="Software\haine\Mistilteinn" Name="path_installed" Type="integer" Value="1" KeyPath="yes"/>
                         </Component>
-                        <Component Id='binary0' Guid='*'>
+                        <Component Id='binary0' Guid='816174A5-0210-4AE9-9F81-F09C874AC91E'>
                             <File
                                 Id='exe0'
                                 Name='mistilteinn.exe'
@@ -130,6 +131,7 @@
                                       WorkingDirectory="APPLICATIONFOLDER"
                                       Icon="ProductICO"/>
                             <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall"/>
+                            <RemoveFolder Id="RemoveBinFolder" On="uninstall"/>
                             <RegistryValue Root="HKCU" Key="Software\haine\Mistilteinn" Name="installed" Type="integer" Value="1" KeyPath="yes"/>
                         </Component>
                     </Directory>

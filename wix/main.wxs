@@ -101,12 +101,12 @@
                     <Component Id='License' Guid='*'>
                         <File Id='LicenseFile'
                             DiskId='1'
-                            Source='wix\License.rtf'
-                            KeyPath='yes'/>
+                            Source='wix\License.rtf'/>
+                        <RegistryValue Root="HKCU" Key="Software\haine\Mistilteinn" Name="license_installed" Type="integer" Value="1" KeyPath="yes"/>
                     </Component>
                     
                     <Directory Id='Bin' Name='bin'>
-                        <Component Id='Path' Guid='A87125BB-303A-4702-A473-0F12E358F2D1' KeyPath='yes'>
+                        <Component Id='Path' Guid='A87125BB-303A-4702-A473-0F12E358F2D1'>
                             <Environment
                                 Id='PATH'
                                 Name='PATH'
@@ -115,20 +115,22 @@
                                 Part='last'
                                 Action='set'
                                 System='yes'/>
+                            <RegistryValue Root="HKCU" Key="Software\haine\Mistilteinn" Name="path_installed" Type="integer" Value="1" KeyPath="yes"/>
                         </Component>
                         <Component Id='binary0' Guid='*'>
                             <File
                                 Id='exe0'
                                 Name='mistilteinn.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\mistilteinn.exe'
-                                KeyPath='yes'/>
+                                Source='$(var.CargoTargetBinDir)\mistilteinn.exe'/>
                             <Shortcut Id="ApplicationStartMenuShortcut"
                                       Directory="ApplicationProgramsFolder"
                                       Name="Mistilteinn"
+                                      Target="[APPLICATIONFOLDER]bin\mistilteinn.exe"
                                       WorkingDirectory="APPLICATIONFOLDER"
-                                      Icon="ProductICO"
-                                      Advertise="yes"/>
+                                      Icon="ProductICO"/>
+                            <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall"/>
+                            <RegistryValue Root="HKCU" Key="Software\haine\Mistilteinn" Name="installed" Type="integer" Value="1" KeyPath="yes"/>
                         </Component>
                     </Directory>
                 </Directory>

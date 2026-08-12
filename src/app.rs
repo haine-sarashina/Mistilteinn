@@ -1305,24 +1305,81 @@ impl ApplicationHandler for MistilteinnApp {
                     self.ctrl_pressed = event.state == ElementState::Pressed;
                     return;
                 }
-                if event.state == ElementState::Pressed && self.ctrl_pressed {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::Tab) => {
-                            // Ctrl+Tab: switch to next tab
-                            let tabs: Vec<_> = self.tab_manager.all_tabs().map(|t| t.id).collect();
-                            if let Some(current) = self.tab_manager.active_tab_id() {
-                                let idx = tabs.iter().position(|&id| id == current).unwrap_or(0);
-                                let next_idx = (idx + 1) % tabs.len();
-                                self.tab_manager.activate_tab(tabs[next_idx]);
-                                self.recompose();
-                                log::info!("Switched to tab {:?}", tabs[next_idx]);
+                
+                if event.state == ElementState::Pressed {
+                    if self.ctrl_pressed {
+                        match event.physical_key {
+                            PhysicalKey::Code(KeyCode::Tab) => {
+                                // Ctrl+Tab: switch to next tab
+                                let tabs: Vec<_> = self.tab_manager.all_tabs().map(|t| t.id).collect();
+                                if let Some(current) = self.tab_manager.active_tab_id() {
+                                    let idx = tabs.iter().position(|&id| id == current).unwrap_or(0);
+                                    let next_idx = (idx + 1) % tabs.len();
+                                    self.tab_manager.activate_tab(tabs[next_idx]);
+                                    self.recompose();
+                                    log::info!("Switched to tab {:?}", tabs[next_idx]);
+                                }
+                            }
+                            PhysicalKey::Code(KeyCode::KeyG) => {
+                                // Ctrl+G: create group for active tab
+                                self.create_group_for_active_tab();
+                            }
+                            _ => {}
+                        }
+                    } else if self.is_address_focused {
+                        use winit::keyboard::{Key, NamedKey};
+                        let mut changed = false;
+                        match &event.logical_key {
+                            Key::Named(NamedKey::Backspace) => {
+                                if self.address_cursor > 0 {
+                                    self.address_cursor -= 1;
+                                    self.address_input.remove(self.address_cursor);
+                                    changed = true;
+                                }
+                            }
+                            Key::Named(NamedKey::Delete) => {
+                                if self.address_cursor < self.address_input.len() {
+                                    self.address_input.remove(self.address_cursor);
+                                    changed = true;
+                                }
+                            }
+                            Key::Named(NamedKey::ArrowLeft) => {
+                                if self.address_cursor > 0 {
+                                    self.address_cursor -= 1;
+                                    changed = true;
+                                }
+                            }
+                            Key::Named(NamedKey::ArrowRight) => {
+                                if self.address_cursor < self.address_input.len() {
+                                    self.address_cursor += 1;
+                                    changed = true;
+                                }
+                            }
+                            Key::Named(NamedKey::Enter) => {
+                                let url = self.address_input.clone();
+                                self.load_url(&url);
+                                self.is_address_focused = false;
+                                changed = true;
+                            }
+                            Key::Character(c) => {
+                                if c.chars().count() == 1 {
+                                    let ch = c.chars().next().unwrap();
+                                    if !ch.is_control() {
+                                        self.address_input.insert(self.address_cursor, ch);
+                                        self.address_cursor += ch.len_utf8();
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        
+                        if changed {
+                            self.recompose();
+                            if let Some(ref renderer) = self.renderer {
+                                renderer.window().request_redraw();
                             }
                         }
-                        PhysicalKey::Code(KeyCode::KeyG) => {
-                            // Ctrl+G: create group for active tab
-                            self.create_group_for_active_tab();
-                        }
-                        _ => {}
                     }
                 }
             }

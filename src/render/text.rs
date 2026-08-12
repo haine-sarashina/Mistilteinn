@@ -405,6 +405,9 @@ impl TextRenderer {
                 buffer[buf_idx + 2] = ((color[2] * a * 255.0)
                     + (buffer[buf_idx + 2] as f32 / 255.0 * (1.0 - a)) * 255.0)
                     as u8;
+                buffer[buf_idx + 3] = (a * 255.0 
+                    + (buffer[buf_idx + 3] as f32 / 255.0 * (1.0 - a)) * 255.0) 
+                    as u8;
             }
         }
     }

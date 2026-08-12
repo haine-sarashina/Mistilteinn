@@ -592,7 +592,7 @@ mod shader {
         ) -> VertexOutput {
             var out: VertexOutput;
             let tri = vertex_index % 6u;
-            let rect_idx = (vertex_index / 6u) * 2u + tri / 2u;
+            let rect_idx = vertex_index / 6u;
             if rect_idx > 2047u {
                 out.position = vec4f(0.0, 0.0, 0.0, 1.0);
                 out.color = vec4f(0.0, 0.0, 0.0, 0.0);

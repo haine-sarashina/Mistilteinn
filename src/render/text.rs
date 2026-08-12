@@ -331,10 +331,11 @@ impl TextRenderer {
                             let px = ((cursor_x + g.x).round()) as i32;
                             let py = (baseline - g.y) as i32;
 
-                            // GlyphId from parley uses swash's GlyphId internally
                             if let Some(image) = render.render(&mut scaler, g.id) {
+                                let glyph_x = px + image.placement.left;
+                                let glyph_y = py - image.placement.top;
                                 Self::draw_glyph_alpha(
-                                    &image, px, py, color, buffer, width, height,
+                                    &image, glyph_x, glyph_y, color, buffer, width, height,
                                 );
                             }
 

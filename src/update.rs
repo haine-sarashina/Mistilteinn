@@ -25,12 +25,18 @@ pub fn check_and_update() {
         Ok(status) => {
             if status.updated() {
                 info!("Successfully updated to {}", status.version());
-                // Show a native message dialog notifying the user
-                rfd::MessageDialog::new()
+                let ans = rfd::MessageDialog::new()
                     .set_title("Mistilteinn Update")
-                    .set_description(&format!("新しいバージョン ({}) へのアップデートが完了しました。\n変更を適用するため、アプリを再起動してください。", status.version()))
-                    .set_buttons(rfd::MessageButtons::Ok)
+                    .set_description(&format!("新しいバージョン ({}) へのアップデートが完了しました。\n今すぐ再起動しますか？", status.version()))
+                    .set_buttons(rfd::MessageButtons::YesNo)
                     .show();
+                    
+                if ans == rfd::MessageDialogResult::Yes {
+                    if let Ok(current_exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new(current_exe).spawn();
+                        std::process::exit(0);
+                    }
+                }
             } else {
                 info!("App is already up-to-date (version {}).", status.version());
             }

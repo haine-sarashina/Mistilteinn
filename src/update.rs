@@ -13,6 +13,7 @@ pub fn check_and_update() {
             .repo_name("Mistilteinn")
             .bin_name("mistilteinn")
             .show_download_progress(true)
+            .no_confirm(true)
             .current_version(cargo_crate_version!())
             .build()?
             .update()?;

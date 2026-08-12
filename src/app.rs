@@ -978,7 +978,7 @@ impl ApplicationHandler for MistilteinnApp {
                 });
 
             let mut window_attributes = WindowAttributes::default()
-                .with_title("Mistilteinn")
+                .with_title(format!("Mistilteinn v{}", env!("CARGO_PKG_VERSION")))
                 .with_inner_size(winit::dpi::PhysicalSize::new(1280, 800));
             
             if let Some(icon) = icon {

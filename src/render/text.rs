@@ -369,7 +369,10 @@ impl TextRenderer {
         // Image placement contains the glyph bitmap dimensions and offset
         let width = image.placement.width;
         let height = image.placement.height;
-        let stride = width.next_multiple_of(8);
+        // swash Mask images are packed (1 byte per pixel), stride is exactly width.
+        // If image.content is SubpixelMask, it would be 3 bytes per pixel, etc.
+        // Assuming we are doing standard antialiasing (Mask), content size is width * height.
+        let stride = width;
 
         if (stride * height) as usize > image.data.len() {
             return;

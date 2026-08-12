@@ -1,6 +1,6 @@
 [package]
 name = "mistilteinn"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 authors = ["haine"]
 license = "MIT"
@@ -44,7 +44,7 @@ hashbrown = "0.15"
 bytemuck = "1.14"
 
 # Auto-update
-self_update = { version = "0.41", features = ["archive-zip", "rustls"] }
+self_update = { version = "0.41", features = ["archive-zip", "compression-zip-deflate", "rustls"] }
 rfd = "0.14"
 [features]
 memprof = []

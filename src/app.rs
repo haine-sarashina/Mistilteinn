@@ -41,6 +41,12 @@ pub struct MistilteinnApp {
     /// The deepest DOM node ID in page content that was last determined to be under the cursor.
     /// Used to detect when :hover needs to be recomputed.
     prev_hovered_dom_id: Option<u32>,
+    /// The current URL in the address bar.
+    address_input: String,
+    /// Whether the address bar is focused.
+    is_address_focused: bool,
+    /// The cursor position in the address input.
+    address_cursor: usize,
 }
 
 /// Hit-test result for tab bar clicks.
@@ -52,6 +58,12 @@ enum HitTestResult {
     TabButton(crate::browser::tab::TabId),
     /// Clicked on empty space in tab bar
     Empty,
+    /// Clicked on Address Bar
+    AddressBar,
+    /// Clicked on Back Button
+    BackButton,
+    /// Clicked on Forward Button
+    ForwardButton,
 }
 
 impl HitTestResult {
@@ -187,7 +199,7 @@ impl MistilteinnApp {
             }
         }
 
-        // Address bar background — right of tab bar, top
+        // Address bar area background — right of tab bar, top
         rects.push(layout_to_clip(
             TAB_BAR_WIDTH as f32,
             0.0,
@@ -196,10 +208,67 @@ impl MistilteinnApp {
             window_width as f32,
             window_height as f32,
         ));
-        let (addr_r, addr_g, addr_b) = if self.hovered_address_bar {
-            (65.0 / 255.0, 65.0 / 255.0, 75.0 / 255.0)
+        colors.push(ColorF {
+            r: 45.0 / 255.0,
+            g: 45.0 / 255.0,
+            b: 50.0 / 255.0,
+            a: 255.0,
+        });
+
+        // Back button
+        let nav_btn_width = 40.0;
+        let mut curr_x = TAB_BAR_WIDTH as f32;
+        rects.push(layout_to_clip(
+            curr_x,
+            0.0,
+            nav_btn_width,
+            ADDRESS_BAR_HEIGHT as f32,
+            window_width as f32,
+            window_height as f32,
+        ));
+        colors.push(ColorF {
+            r: 55.0 / 255.0,
+            g: 55.0 / 255.0,
+            b: 60.0 / 255.0,
+            a: 255.0,
+        });
+        curr_x += nav_btn_width;
+
+        // Forward button
+        rects.push(layout_to_clip(
+            curr_x,
+            0.0,
+            nav_btn_width,
+            ADDRESS_BAR_HEIGHT as f32,
+            window_width as f32,
+            window_height as f32,
+        ));
+        colors.push(ColorF {
+            r: 55.0 / 255.0,
+            g: 55.0 / 255.0,
+            b: 60.0 / 255.0,
+            a: 255.0,
+        });
+        curr_x += nav_btn_width;
+
+        // Inner URL Input box
+        let addr_box_margin = 6.0;
+        let addr_box_x = curr_x + addr_box_margin;
+        let addr_box_w = window_width as f32 - addr_box_x - addr_box_margin;
+        rects.push(layout_to_clip(
+            addr_box_x,
+            addr_box_margin,
+            addr_box_w,
+            ADDRESS_BAR_HEIGHT as f32 - addr_box_margin * 2.0,
+            window_width as f32,
+            window_height as f32,
+        ));
+        let (addr_r, addr_g, addr_b) = if self.is_address_focused {
+            (255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0) // White when focused
+        } else if self.hovered_address_bar {
+            (75.0 / 255.0, 75.0 / 255.0, 85.0 / 255.0)
         } else {
-            (55.0 / 255.0, 55.0 / 255.0, 60.0 / 255.0)
+            (65.0 / 255.0, 65.0 / 255.0, 70.0 / 255.0)
         };
         colors.push(ColorF {
             r: addr_r,
@@ -227,6 +296,133 @@ impl MistilteinnApp {
         }
 
         (rects, colors)
+    }
+
+    fn draw_chrome_text(
+        &self,
+        text_renderer: &mut TextRenderer,
+        buffer: &mut [u8],
+        win_w: u32,
+        win_h: u32,
+    ) {
+        let text_color = [0.9, 0.9, 0.9, 1.0]; // Light gray/white
+
+        // Draw tab titles
+        let mut y = ADDRESS_BAR_HEIGHT as f32 + TAB_BUTTON_SPACING;
+        for group in self.group_manager.all_groups() {
+            y += GROUP_HEADER_HEIGHT + TAB_BUTTON_SPACING;
+            if !group.collapsed {
+                for tab_id in &group.tab_ids {
+                    if let Some(tab) = self.tab_manager.get_tab(*tab_id) {
+                        let title = if tab.title.is_empty() { "New Tab" } else { &tab.title };
+                        text_renderer.rasterize_to_bitmap(
+                            title,
+                            14.0,
+                            "sans-serif",
+                            text_color,
+                            TAB_BUTTON_X + 15.0,
+                            y + 12.0,
+                            TAB_BAR_WIDTH as f32 - 30.0,
+                            buffer,
+                            win_w,
+                            win_h,
+                        );
+                        y += TAB_BUTTON_HEIGHT + TAB_BUTTON_SPACING;
+                    }
+                }
+            }
+            y += TAB_BUTTON_SPACING;
+        }
+        for tab in self.tab_manager.all_tabs() {
+            if tab.group_id.is_none() {
+                let title = if tab.title.is_empty() { "New Tab" } else { &tab.title };
+                text_renderer.rasterize_to_bitmap(
+                    title,
+                    14.0,
+                    "sans-serif",
+                    text_color,
+                    TAB_BUTTON_X + 15.0,
+                    y + 12.0,
+                    TAB_BAR_WIDTH as f32 - 30.0,
+                    buffer,
+                    win_w,
+                    win_h,
+                );
+                y += TAB_BUTTON_HEIGHT + TAB_BUTTON_SPACING;
+            }
+        }
+
+        // Draw Back button
+        let nav_btn_width = 40.0;
+        let mut curr_x = TAB_BAR_WIDTH as f32;
+        text_renderer.rasterize_to_bitmap(
+            "◀",
+            20.0,
+            "sans-serif",
+            text_color,
+            curr_x + 10.0,
+            8.0,
+            30.0,
+            buffer,
+            win_w,
+            win_h,
+        );
+        curr_x += nav_btn_width;
+
+        // Draw Forward button
+        text_renderer.rasterize_to_bitmap(
+            "▶",
+            20.0,
+            "sans-serif",
+            text_color,
+            curr_x + 10.0,
+            8.0,
+            30.0,
+            buffer,
+            win_w,
+            win_h,
+        );
+        curr_x += nav_btn_width;
+
+        // Draw Address input
+        let addr_box_margin = 6.0;
+        let addr_box_x = curr_x + addr_box_margin;
+        
+        // Show cursor if focused
+        let display_text = if self.is_address_focused {
+            let mut t = self.address_input.clone();
+            if self.address_cursor <= t.len() {
+                t.insert(self.address_cursor, '|');
+            } else {
+                t.push('|');
+            }
+            t
+        } else {
+            if self.address_input.is_empty() {
+                self.tab_manager.get_active_tab_page().map(|p| p.page_url.clone()).unwrap_or_default()
+            } else {
+                self.address_input.clone()
+            }
+        };
+
+        let addr_color = if self.is_address_focused {
+            [0.1, 0.1, 0.1, 1.0]
+        } else {
+            [0.8, 0.8, 0.8, 1.0]
+        };
+
+        text_renderer.rasterize_to_bitmap(
+            &display_text,
+            16.0,
+            "sans-serif",
+            addr_color,
+            addr_box_x + 10.0,
+            10.0,
+            win_w as f32 - addr_box_x - 20.0,
+            buffer,
+            win_w,
+            win_h,
+        );
     }
 
     /// Rebuild the render artifacts from the current page and upload to GPU.
@@ -263,8 +459,7 @@ impl MistilteinnApp {
         };
 
         // Use effective view dimensions (subtract chrome area offsets for layout purposes)
-        let view_w = page.view_width;
-        let view_h = page.view_height;
+
 
         // Collect render rectangles from layout tree and convert to clip space
         let rects = page.collect_rects();
@@ -316,10 +511,9 @@ impl MistilteinnApp {
         }
 
         // Now borrow renderer mutably for GPU upload
-        let Some(ref mut renderer) = self.renderer else {
-            return;
-        };
-        renderer.set_rects(&all_rects, &all_colors);
+        if let Some(ref mut renderer) = self.renderer {
+            renderer.set_rects(&all_rects, &all_colors);
+        }
 
         // Collect text nodes from layout tree and rasterize into a bitmap
         let text_nodes = crate::layout::collect_text_nodes(&page.layout_root);
@@ -327,84 +521,66 @@ impl MistilteinnApp {
         // Collect image nodes from layout tree (sync recompose does NOT fetch images)
         let image_nodes = crate::layout::collect_image_nodes(&page.layout_root);
 
-        if !text_nodes.is_empty() || !image_nodes.is_empty() {
-            let view_width = page.view_width as u32;
-            let view_height = page.view_height as u32;
+        // Allocate full-window RGBA buffer (transparent background)
+        let mut composite_buffer = vec![0u8; (win_w * win_h * 4) as usize];
+        let mut text_renderer = TextRenderer::new();
 
-            // Allocate RGBA buffer (transparent background)
-            let mut composite_buffer = vec![0u8; (view_width * view_height * 4) as usize];
+        // Rasterize text nodes into the composite buffer
+        for text_info in &text_nodes {
+            let color_f32: [f32; 4] = [
+                text_info.color[0] as f32 / 255.0,
+                text_info.color[1] as f32 / 255.0,
+                text_info.color[2] as f32 / 255.0,
+                text_info.color[3] as f32 / 255.0,
+            ];
 
-            // Rasterize text nodes into the composite buffer
-            if !text_nodes.is_empty() {
-                let mut text_renderer = TextRenderer::new();
+            // Apply scroll offset and shift by chrome dimensions
+            let text_x = text_info.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
+            let text_y = text_info.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
 
-                for text_info in &text_nodes {
-                    let color_f32: [f32; 4] = [
-                        text_info.color[0] as f32 / 255.0,
-                        text_info.color[1] as f32 / 255.0,
-                        text_info.color[2] as f32 / 255.0,
-                        text_info.color[3] as f32 / 255.0,
-                    ];
+            text_renderer.rasterize_to_bitmap(
+                &text_info.text,
+                text_info.font_size,
+                "sans-serif",
+                color_f32,
+                text_x,
+                text_y,
+                text_info.width,
+                &mut composite_buffer,
+                win_w,
+                win_h,
+            );
+        }
 
-                    // Apply scroll offset to text position too
-                    let text_x = text_info.x - scroll_offset.0;
-                    let text_y = text_info.y - scroll_offset.1;
+        // Composite cached images from page cache
+        for img_info in &image_nodes {
+            let resolved_src = if !page.page_url.is_empty() {
+                crate::network::resolve_url(&page.page_url, &img_info.src)
+            } else {
+                img_info.src.clone()
+            };
 
-                    text_renderer.rasterize_to_bitmap(
-                        &text_info.text,
-                        text_info.font_size,
-                        "sans-serif",
-                        color_f32,
-                        text_x,
-                        text_y,
-                        text_info.width,
-                        &mut composite_buffer,
-                        view_width,
-                        view_height,
-                    );
-                }
-
-                log::info!(
-                    "Rasterized {} text nodes at {}x{}",
-                    text_nodes.len(),
-                    view_width,
-                    view_height
+            if let Some(cached) = page.image_cache.get(&resolved_src) {
+                let img_x = img_info.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
+                let img_y = img_info.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
+                crate::render::composite_image(
+                    &cached.rgba,
+                    cached.width,
+                    cached.height,
+                    &mut composite_buffer,
+                    win_w,
+                    win_h,
+                    img_x,
+                    img_y,
                 );
             }
+        }
 
-            // Composite cached images from page cache (scrolling, no network fetch)
-            for img_info in &image_nodes {
-                let resolved_src = if !page.page_url.is_empty() {
-                    crate::network::resolve_url(&page.page_url, &img_info.src)
-                } else {
-                    img_info.src.clone()
-                };
+        self.draw_chrome_text(&mut text_renderer, &mut composite_buffer, win_w, win_h);
 
-                if let Some(cached) = page.image_cache.get(&resolved_src) {
-                    let img_x = img_info.x - scroll_offset.0;
-                    let img_y = img_info.y - scroll_offset.1;
-                    crate::render::composite_image(
-                        &cached.rgba,
-                        cached.width,
-                        cached.height,
-                        &mut composite_buffer,
-                        view_width as u32,
-                        view_height as u32,
-                        img_x,
-                        img_y,
-                    );
-                }
-            }
-
-            // Upload the composite bitmap to GPU
-            renderer.set_text_bitmap(view_width, view_height, &composite_buffer);
-            log::info!(
-                "Composite overlay uploaded: {} text + {} images at {}x{}",
-                text_nodes.len(),
-                image_nodes.len(),
-                view_width,
-                view_height
-            );
+        // Upload the composite bitmap to GPU
+        if let Some(ref mut renderer) = self.renderer {
+            renderer.set_text_bitmap(win_w, win_h, &composite_buffer);
         }
     }
 
@@ -518,207 +694,63 @@ impl MistilteinnApp {
         if let Some(url) = &base_url {
             new_page.page_url = url.to_string();
         }
-        self.tab_manager.set_active_tab_page(new_page);
-
-        // Read scroll offset before borrowing page
-        let scroll_offset = self
-            .tab_manager
-            .get_active_tab_scroll_mut()
-            .map(|s| *s)
-            .unwrap_or((0.0, 0.0));
-
-        // Borrow the page we just stored for composition
-        let Some(ref page) = self.tab_manager.get_active_tab_page() else {
-            return;
-        };
-        let Some(ref mut renderer) = self.renderer else {
-            return;
-        };
-        let view_w = page.view_width;
-        let view_h = page.view_height;
-
-        // Collect render rectangles from layout tree and convert to clip space
-        let rects = page.collect_rects();
-        let clip_rects: Vec<_> = rects
-            .into_iter()
-            .take(MAX_RECTS)
-            .filter_map(|(mut r, c)| {
-                // Apply scroll offset by shifting rect position
-                r.x -= scroll_offset.0;
-                r.y -= scroll_offset.1;
-                if r.width > 0.0 && r.height > 0.0 {
-                    Some((
-                        layout_to_clip(r.x, r.y, r.width, r.height, view_w, view_h),
-                        c,
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let render_rects: Vec<_> = clip_rects.iter().map(|(r, _)| *r).collect();
-        let render_colors: Vec<_> = clip_rects
+        
+        let image_nodes = crate::layout::collect_image_nodes(&new_page.layout_root);
+        let resolved_srcs: Vec<String> = image_nodes
             .iter()
-            .map(|(_, c)| {
-                if let Some(col) = c {
-                    crate::render::color_u8_to_f32(*col)
+            .map(|img| {
+                if let Some(base) = base_url {
+                    crate::network::resolve_url(base, &img.src)
                 } else {
-                    ColorF {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 0.0,
-                    }
+                    img.src.clone()
                 }
             })
             .collect();
 
-        renderer.set_rects(&render_rects, &render_colors);
-
-        // Collect text and image nodes from layout tree
-        let text_nodes = crate::layout::collect_text_nodes(&page.layout_root);
-        let image_nodes = crate::layout::collect_image_nodes(&page.layout_root);
-
-        if !text_nodes.is_empty() || !image_nodes.is_empty() {
-            let view_width = page.view_width as u32;
-            let view_height = page.view_height as u32;
-
-            // Allocate RGBA buffer (transparent background)
-            let mut composite_buffer = vec![0u8; (view_width * view_height * 4) as usize];
-
-            // Rasterize text nodes into the composite buffer
-            if !text_nodes.is_empty() {
-                let mut text_renderer = TextRenderer::new();
-
-                for text_info in &text_nodes {
-                    let color_f32: [f32; 4] = [
-                        text_info.color[0] as f32 / 255.0,
-                        text_info.color[1] as f32 / 255.0,
-                        text_info.color[2] as f32 / 255.0,
-                        text_info.color[3] as f32 / 255.0,
-                    ];
-
-                    // Apply scroll offset to text position too
-                    let text_x = text_info.x - scroll_offset.0;
-                    let text_y = text_info.y - scroll_offset.1;
-
-                    text_renderer.rasterize_to_bitmap(
-                        &text_info.text,
-                        text_info.font_size,
-                        "sans-serif",
-                        color_f32,
-                        text_x,
-                        text_y,
-                        text_info.width,
-                        &mut composite_buffer,
-                        view_width,
-                        view_height,
-                    );
-                }
-
-                log::info!(
-                    "Rasterized {} text nodes at {}x{}",
-                    text_nodes.len(),
-                    view_width,
-                    view_height
-                );
-            }
-
-            // Resolve image URLs against base_url before concurrent fetching
-            let resolved_srcs: Vec<String> = image_nodes
-                .iter()
-                .map(|img| {
-                    if let Some(base) = base_url {
-                        crate::network::resolve_url(base, &img.src)
-                    } else {
-                        img.src.clone()
-                    }
-                })
-                .collect();
-
-            // Build concurrent fetch futures
-            let fetch_futures =
-                resolved_srcs
-                    .iter()
-                    .zip(image_nodes.iter())
-                    .map(|(src, img_info)| {
-                        let src_clone = src.clone();
-                        let img_x = img_info.x - scroll_offset.0;
-                        let img_y = img_info.y - scroll_offset.1;
-                        async move {
-                            match crate::network::fetch_image(&src_clone).await {
-                                Ok(bytes) => {
-                                    if let Ok(img) = image::load_from_memory(&bytes) {
-                                        let rgba = img.to_rgba8();
-                                        let (iw, ih) = rgba.dimensions();
-                                        log::info!("Decoded image: {} ({}x{})", src_clone, iw, ih);
-                                        Some((src_clone, rgba.into_raw(), iw, ih, img_x, img_y))
-                                    } else {
-                                        log::warn!("Failed to decode image: {}", src_clone);
-                                        None
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!("Failed to fetch image {}: {:?}", src_clone, e);
-                                    None
-                                }
-                            }
+        // Fetch all images concurrently
+        let fetch_futures = resolved_srcs.iter().map(|src| {
+            let src_clone = src.clone();
+            async move {
+                match crate::network::fetch_image(&src_clone).await {
+                    Ok(bytes) => {
+                        if let Ok(img) = image::load_from_memory(&bytes) {
+                            let rgba = img.to_rgba8();
+                            let (iw, ih) = rgba.dimensions();
+                            log::info!("Decoded image: {} ({}x{})", src_clone, iw, ih);
+                            Some((src_clone, rgba.into_raw(), iw, ih))
+                        } else {
+                            None
                         }
-                    });
-
-            let results = futures::future::join_all(fetch_futures).await;
-
-            // Composite all successful images and collect for caching
-            let mut items_to_cache = Vec::new();
-            for result in results.into_iter().flatten() {
-                let (src, pixels, iw, ih, ix, iy) = result;
-                crate::render::composite_image(
-                    &pixels,
-                    iw,
-                    ih,
-                    &mut composite_buffer,
-                    view_width,
-                    view_height,
-                    ix,
-                    iy,
-                );
-                items_to_cache.push((src, pixels, iw, ih));
-            }
-
-            // Write to page image cache
-            if let Some(tab) = self.tab_manager.active_tab_mut() {
-                if let Some(ref mut page) = tab.page {
-                    for (src, rgba, width, height) in items_to_cache {
-                        page.image_cache.insert(
-                            src,
-                            crate::page::CachedImage {
-                                rgba,
-                                width,
-                                height,
-                            },
-                        );
                     }
+                    Err(_) => None,
                 }
             }
-
-            // Upload the composite bitmap to GPU
-            renderer.set_text_bitmap(view_width, view_height, &composite_buffer);
-            log::info!(
-                "Composite overlay uploaded: {} text + {} images at {}x{}",
-                text_nodes.len(),
-                image_nodes.len(),
-                view_width,
-                view_height
+        });
+        
+        let results = futures::future::join_all(fetch_futures).await;
+        for result in results.into_iter().flatten() {
+            let (src, rgba, width, height) = result;
+            new_page.image_cache.insert(
+                src,
+                crate::page::CachedImage {
+                    rgba,
+                    width,
+                    height,
+                },
             );
         }
 
-        if let Err(e) = renderer.render() {
-            log::error!("Render after load_page_async failed: {:?}", e);
-        } else {
-            log::info!("Page loaded (async) and rendered");
+        self.tab_manager.set_active_tab_page(new_page);
+        self.recompose();
+        
+        if let Some(ref mut renderer) = self.renderer {
+            if let Err(e) = renderer.render() {
+                log::error!("Render after load_page_async failed: {:?}", e);
+            } else {
+                log::info!("Page loaded (async) and rendered");
+            }
         }
-
+        
         // Memory profiling (only when memprof feature is enabled)
         #[cfg(feature = "memprof")]
         {
@@ -800,8 +832,35 @@ impl MistilteinnApp {
         }
     }
 
-    /// Hit-test the tab bar area accounting for group headers and collapsed groups.
-    fn hit_test_tab_bar(&self, x: f32, y: f32) -> HitTestResult {
+    /// Hit-test the chrome area (tab bar and address bar).
+    fn hit_test_chrome(&self, x: f32, y: f32) -> HitTestResult {
+        // Check Address bar area (top)
+        if y < ADDRESS_BAR_HEIGHT as f32 {
+            if x >= TAB_BAR_WIDTH as f32 {
+                let nav_w = 40.0;
+                let mut curr_x = TAB_BAR_WIDTH as f32;
+                // Back button
+                if x >= curr_x && x < curr_x + nav_w {
+                    return HitTestResult::BackButton;
+                }
+                curr_x += nav_w;
+                // Forward button
+                if x >= curr_x && x < curr_x + nav_w {
+                    return HitTestResult::ForwardButton;
+                }
+                curr_x += nav_w;
+                // Address bar input box
+                if x >= curr_x {
+                    return HitTestResult::AddressBar;
+                }
+            }
+        }
+
+        // Check Tab bar area (left)
+        if x > TAB_BAR_WIDTH as f32 {
+            return HitTestResult::Empty;
+        }
+
         let mut button_y = ADDRESS_BAR_HEIGHT as f32 + TAB_BUTTON_SPACING;
 
         // Check group headers first, then visible tabs
@@ -1034,32 +1093,58 @@ impl ApplicationHandler for MistilteinnApp {
                 match button {
                     MouseButton::Left => {
                         if state == ElementState::Pressed {
-                            // Hit-test the tab bar first
-                            if cx < TAB_BAR_WIDTH as f32 && cy > 0.0 {
-                                match self.hit_test_tab_bar(cx, cy) {
-                                    HitTestResult::GroupHeader(group_id) => {
-                                        // Toggle group collapse
-                                        if let Some(is_now_collapsed) =
-                                            self.group_manager.toggle_collapse(group_id)
-                                        {
-                                            log::info!(
-                                                "Toggled group {:?} collapsed={}",
-                                                group_id,
-                                                is_now_collapsed
-                                            );
-                                            self.recompose();
-                                            if let Some(ref renderer) = self.renderer {
-                                                renderer.window().request_redraw();
-                                            }
-                                            return;
+                            match self.hit_test_chrome(cx, cy) {
+                                HitTestResult::GroupHeader(group_id) => {
+                                    if let Some(is_now_collapsed) =
+                                        self.group_manager.toggle_collapse(group_id)
+                                    {
+                                        log::info!(
+                                            "Toggled group {:?} collapsed={}",
+                                            group_id,
+                                            is_now_collapsed
+                                        );
+                                        self.recompose();
+                                        if let Some(ref renderer) = self.renderer {
+                                            renderer.window().request_redraw();
+                                        }
+                                        return;
+                                    }
+                                }
+                                HitTestResult::TabButton(tab_id) => {
+                                    self.tab_manager.activate_tab(tab_id);
+                                    self.recompose();
+                                    log::info!("Activated tab {:?}", tab_id);
+                                }
+                                HitTestResult::AddressBar => {
+                                    self.is_address_focused = true;
+                                    self.address_cursor = self.address_input.len();
+                                    self.recompose();
+                                }
+                                HitTestResult::BackButton => {
+                                    self.is_address_focused = false;
+                                    if let Some(tab) = self.tab_manager.active_tab_mut() {
+                                        if let Some(url) = tab.go_back() {
+                                            let url_clone = url.clone();
+                                            self.load_url(&url_clone);
                                         }
                                     }
-                                    HitTestResult::TabButton(tab_id) => {
-                                        self.tab_manager.activate_tab(tab_id);
-                                        self.recompose();
-                                        log::info!("Activated tab {:?}", tab_id);
+                                    self.recompose();
+                                }
+                                HitTestResult::ForwardButton => {
+                                    self.is_address_focused = false;
+                                    if let Some(tab) = self.tab_manager.active_tab_mut() {
+                                        if let Some(url) = tab.go_forward() {
+                                            let url_clone = url.clone();
+                                            self.load_url(&url_clone);
+                                        }
                                     }
-                                    HitTestResult::Empty => {}
+                                    self.recompose();
+                                }
+                                HitTestResult::Empty => {
+                                    if self.is_address_focused {
+                                        self.is_address_focused = false;
+                                        self.recompose();
+                                    }
                                 }
                             }
                         }
@@ -1067,7 +1152,7 @@ impl ApplicationHandler for MistilteinnApp {
                     MouseButton::Right => {
                         // Right-click on a tab closes it
                         if state == ElementState::Pressed && cx < TAB_BAR_WIDTH as f32 {
-                            if let Some(clicked_tab) = self.hit_test_tab_bar(cx, cy).into_tab_id() {
+                            if let Some(clicked_tab) = self.hit_test_chrome(cx, cy).into_tab_id() {
                                 if self.tab_manager.active_tab_id() != Some(clicked_tab) {
                                     // Remove from group if assigned
                                     if let Some(tab) = self.tab_manager.get_tab(clicked_tab) {
@@ -1097,7 +1182,7 @@ impl ApplicationHandler for MistilteinnApp {
 
                 // Hit-test tab bar for hover highlight
                 let new_hovered_tab = if cx < TAB_BAR_WIDTH as f32 && cy > 0.0 {
-                    match self.hit_test_tab_bar(cx, cy) {
+                    match self.hit_test_chrome(cx, cy) {
                         HitTestResult::TabButton(id) => Some(id),
                         _ => None,
                     }
@@ -1260,6 +1345,9 @@ pub fn run(start_url: Option<String>) {
         hovered_tab_id: None,
         hovered_address_bar: false,
         prev_hovered_dom_id: None,
+        address_input: String::new(),
+        is_address_focused: false,
+        address_cursor: 0,
     };
     event_loop.run_app(&mut app).expect("Event loop failed");
 }

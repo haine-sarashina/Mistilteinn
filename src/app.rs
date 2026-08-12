@@ -29,7 +29,7 @@ pub struct MistilteinnApp {
     pub start_url: Option<String>,
     tab_manager: crate::browser::tab::TabManager,
     group_manager: crate::browser::tab_group::GroupManager,
-    tokio_handle: Option<tokio::runtime::Handle>,
+    tokio_rt: Option<tokio::runtime::Runtime>,
     /// Tracks the current cursor position for hit-testing chrome elements.
     cursor_pos: (f32, f32),
     /// Whether Ctrl key is currently pressed (for keyboard shortcuts).
@@ -616,15 +616,12 @@ impl MistilteinnApp {
 
     /// Load a page from a URL by fetching it over the network.
     pub fn load_url(&mut self, url: &str) {
-        let handle = match &self.tokio_handle {
-            Some(h) => h.clone(),
-            None => {
-                log::error!("No tokio handle available for loading URL");
-                return;
-            }
-        };
-        // Delegate to async version to avoid blocking the event loop synchronously.
-        handle.block_on(self.load_url_async(url));
+        let handle = self.tokio_rt.as_ref().map(|rt| rt.handle().clone());
+        if let Some(handle) = handle {
+            handle.block_on(self.load_url_async(url));
+        } else {
+            log::error!("No tokio runtime available for loading URL");
+        }
     }
 
     /// Load a page from a URL asynchronously with external CSS fetching.
@@ -994,7 +991,6 @@ impl ApplicationHandler for MistilteinnApp {
             // Use tokio runtime to run the async wgpu initialization.
             // wgpu requires an async runtime for adapter/device requests.
             let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-            self.tokio_handle = Some(rt.handle().clone());
             let renderer = rt.block_on(async {
                 match Renderer::new(window).await {
                     Ok(renderer) => Some(renderer),
@@ -1004,6 +1000,7 @@ impl ApplicationHandler for MistilteinnApp {
                     }
                 }
             });
+            self.tokio_rt = Some(rt);
             self.renderer = renderer;
 
             // Load startup URL or default demo page through the pipeline
@@ -1396,7 +1393,7 @@ pub fn run(start_url: Option<String>) {
         start_url,
         tab_manager: crate::browser::tab::TabManager::new(),
         group_manager: crate::browser::tab_group::GroupManager::new(),
-        tokio_handle: None,
+        tokio_rt: None,
         cursor_pos: (0.0, 0.0),
         ctrl_pressed: false,
         hovered_tab_id: None,

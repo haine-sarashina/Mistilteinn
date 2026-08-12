@@ -111,7 +111,7 @@ impl MistilteinnApp {
             r: 42.0 / 255.0,
             g: 42.0 / 255.0,
             b: 47.0 / 255.0,
-            a: 255.0,
+            a: 1.0,
         });
 
         // Per-tab button rects — organized by groups
@@ -134,7 +134,7 @@ impl MistilteinnApp {
                 r: hdr_r,
                 g: hdr_g,
                 b: hdr_b,
-                a: 255.0,
+                a: 1.0,
             });
 
             // Colored left strip on group header — indicates group color
@@ -152,7 +152,7 @@ impl MistilteinnApp {
                 r: strip_r,
                 g: strip_g,
                 b: strip_b,
-                a: 255.0,
+                a: 1.0,
             });
 
             y += GROUP_HEADER_HEIGHT + TAB_BUTTON_SPACING;
@@ -212,7 +212,7 @@ impl MistilteinnApp {
             r: 45.0 / 255.0,
             g: 45.0 / 255.0,
             b: 50.0 / 255.0,
-            a: 255.0,
+            a: 1.0,
         });
 
         // Back button
@@ -230,7 +230,7 @@ impl MistilteinnApp {
             r: 55.0 / 255.0,
             g: 55.0 / 255.0,
             b: 60.0 / 255.0,
-            a: 255.0,
+            a: 1.0,
         });
         curr_x += nav_btn_width;
 
@@ -247,7 +247,7 @@ impl MistilteinnApp {
             r: 55.0 / 255.0,
             g: 55.0 / 255.0,
             b: 60.0 / 255.0,
-            a: 255.0,
+            a: 1.0,
         });
         curr_x += nav_btn_width;
 
@@ -274,7 +274,7 @@ impl MistilteinnApp {
             r: addr_r,
             g: addr_g,
             b: addr_b,
-            a: 255.0,
+            a: 1.0,
         });
 
         // Loading progress bar — appears below address bar when active tab is loading
@@ -291,7 +291,7 @@ impl MistilteinnApp {
                 r: LOADING_BAR_COLOR_R,
                 g: LOADING_BAR_COLOR_G,
                 b: LOADING_BAR_COLOR_B,
-                a: 255.0,
+                a: 1.0,
             });
         }
 
@@ -811,7 +811,7 @@ impl MistilteinnApp {
             window_width as f32,
             window_height as f32,
         ));
-        colors.push(ColorF { r, g, b, a: 255.0 });
+        colors.push(ColorF { r, g, b, a: 1.0 });
 
         // Colored strip on left for grouped tabs
         if let Some((sr, sg, sb)) = group_color {
@@ -827,7 +827,7 @@ impl MistilteinnApp {
                 r: sr,
                 g: sg,
                 b: sb,
-                a: 255.0,
+                a: 1.0,
             });
         }
     }

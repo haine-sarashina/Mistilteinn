@@ -610,7 +610,7 @@ mod shader {
                 default: { off = vec2f(0.0, 0.0); }
             }
             let px = r.x + off.x * r.z;
-            let py = r.y + off.y * r.w;
+            let py = r.y - off.y * r.w;
             out.position = vec4f(px, py, 0.0, 1.0);
             out.color = rect_colors.colors[rect_idx];
             return out;
@@ -676,7 +676,7 @@ mod shader {
 
         @fragment
         fn fs_text_quad(@location(0) uv: vec2f) -> @location(0) vec4f {
-            let tex_uv = vec2f(1.0 - uv.x, 1.0 - uv.y); // Flip to match layout coords
+            let tex_uv = vec2f(uv.x, 1.0 - uv.y); // Flip Y to match layout coords
             return textureSample(text_tex, text_smp, tex_uv);
         }
     "#;

@@ -1779,10 +1779,230 @@ impl Default for LengthContext {
     }
 }
 
+/// Evaluate a `calc()` expression to pixels.
+///
+/// Handles `+`, `-`, `*`, `/`, nested parentheses and any unit
+/// [`parse_length_ctx`] understands. Percentages are rejected: resolving them
+/// needs a containing block that is not known during style computation, which
+/// is the same reason a bare `50%` is not a plain length here.
+///
+/// `s` is the text inside `calc(` … `)`.
+fn eval_calc(s: &str, ctx: LengthContext) -> Option<f32> {
+    // Tokenise into numbers-with-units, operators and parentheses. CSS requires
+    // whitespace around + and - (so `10px -5px` is two values, not a
+    // subtraction), and that also keeps signed exponents unambiguous.
+    #[derive(Debug, PartialEq)]
+    enum Tok {
+        Num(f32),
+        Op(char),
+        Open,
+        Close,
+    }
+
+    let mut toks = Vec::new();
+    let bytes: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '(' {
+            toks.push(Tok::Open);
+            i += 1;
+        } else if c == ')' {
+            toks.push(Tok::Close);
+            i += 1;
+        } else if matches!(c, '+' | '-' | '*' | '/') {
+            toks.push(Tok::Op(c));
+            i += 1;
+        } else if c.is_ascii_digit() || c == '.' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == '.') {
+                i += 1;
+            }
+            // Consume the unit, if any.
+            while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == '%' {
+                return None;
+            }
+            let lit: String = bytes[start..i].iter().collect();
+            toks.push(Tok::Num(parse_length_ctx(&lit, ctx)?));
+        } else {
+            // Anything else (a nested function, a keyword) is unsupported.
+            return None;
+        }
+    }
+    if toks.is_empty() {
+        return None;
+    }
+
+    // Recursive-descent over the token slice: expr → term (('+'|'-') term)*,
+    // term → factor (('*'|'/') factor)*, factor → number | '(' expr ')' | ±factor.
+    fn expr(toks: &[Tok], pos: &mut usize) -> Option<f32> {
+        let mut acc = term(toks, pos)?;
+        while let Some(Tok::Op(op @ ('+' | '-'))) = toks.get(*pos) {
+            let op = *op;
+            *pos += 1;
+            let rhs = term(toks, pos)?;
+            acc = if op == '+' { acc + rhs } else { acc - rhs };
+        }
+        Some(acc)
+    }
+
+    fn term(toks: &[Tok], pos: &mut usize) -> Option<f32> {
+        let mut acc = factor(toks, pos)?;
+        while let Some(Tok::Op(op @ ('*' | '/'))) = toks.get(*pos) {
+            let op = *op;
+            *pos += 1;
+            let rhs = factor(toks, pos)?;
+            if op == '*' {
+                acc *= rhs;
+            } else {
+                if rhs == 0.0 {
+                    return None;
+                }
+                acc /= rhs;
+            }
+        }
+        Some(acc)
+    }
+
+    fn factor(toks: &[Tok], pos: &mut usize) -> Option<f32> {
+        match toks.get(*pos)? {
+            Tok::Num(n) => {
+                let n = *n;
+                *pos += 1;
+                Some(n)
+            }
+            Tok::Open => {
+                *pos += 1;
+                let v = expr(toks, pos)?;
+                match toks.get(*pos) {
+                    Some(Tok::Close) => {
+                        *pos += 1;
+                        Some(v)
+                    }
+                    _ => None,
+                }
+            }
+            Tok::Op(op @ ('+' | '-')) => {
+                let neg = *op == '-';
+                *pos += 1;
+                let v = factor(toks, pos)?;
+                Some(if neg { -v } else { v })
+            }
+            _ => None,
+        }
+    }
+
+    let mut pos = 0;
+    let value = expr(&toks, &mut pos)?;
+    // Trailing tokens mean the expression was malformed.
+    if pos != toks.len() || !value.is_finite() {
+        return None;
+    }
+    Some(value)
+}
+
+/// Split a shorthand value on whitespace, keeping parenthesised functions whole.
+///
+/// `margin: calc(4px * 2) 10px` is two components, not four — a plain
+/// `split_whitespace` would tear the `calc()` apart.
+fn split_components(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '(' => {
+                depth += 1;
+                start.get_or_insert(idx);
+            }
+            ')' => depth = depth.saturating_sub(1),
+            c if c.is_whitespace() && depth == 0 => {
+                if let Some(st) = start.take() {
+                    parts.push(&s[st..idx]);
+                }
+            }
+            _ => {
+                start.get_or_insert(idx);
+            }
+        }
+    }
+    if let Some(st) = start {
+        parts.push(&s[st..]);
+    }
+    parts
+}
+
+/// Strip a wrapping `name(` … `)` from `s`, returning the contents.
+fn strip_function<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let rest = s.strip_prefix(name)?;
+    let rest = rest.strip_prefix('(')?;
+    rest.strip_suffix(')')
+}
+
+/// Which CSS comparison function is being evaluated.
+#[derive(Debug, Clone, Copy)]
+enum MathFn {
+    Min,
+    Max,
+    Clamp,
+}
+
+/// Evaluate `min()`, `max()` or `clamp()` over comma-separated length expressions.
+fn eval_math_fn(inner: &str, which: MathFn, ctx: LengthContext) -> Option<f32> {
+    // Split on top-level commas so nested calc(a, …) style parens stay intact.
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in inner.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                args.push(&inner[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(&inner[start..]);
+
+    let values: Option<Vec<f32>> = args
+        .iter()
+        .map(|a| {
+            let a = a.trim();
+            // A bare arithmetic expression is allowed inside these functions.
+            parse_length_ctx(a, ctx).or_else(|| eval_calc(a, ctx))
+        })
+        .collect();
+    let values = values?;
+    if values.is_empty() {
+        return None;
+    }
+
+    match which {
+        MathFn::Min => Some(values.iter().copied().fold(f32::INFINITY, f32::min)),
+        MathFn::Max => Some(values.iter().copied().fold(f32::NEG_INFINITY, f32::max)),
+        MathFn::Clamp => {
+            // clamp(min, preferred, max)
+            let [lo, val, hi] = values[..] else {
+                return None;
+            };
+            Some(val.clamp(lo, hi.max(lo)))
+        }
+    }
+}
+
 /// Parse a CSS length value into pixels, resolving relative units via `ctx`.
 ///
 /// Supports absolute units (`px`, `pt`, `pc`, `in`, `cm`, `mm`, `q`), font-relative
-/// units (`em`, `rem`, `ex`, `ch`), and viewport units (`vw`, `vh`, `vmin`, `vmax`).
+/// units (`em`, `rem`, `ex`, `ch`), viewport units (`vw`, `vh`, `vmin`, `vmax`),
+/// and `calc()` / `min()` / `max()` / `clamp()` over those.
 /// A bare number is treated as pixels (quirks-friendly, and correct for `0`).
 /// Returns `None` for `"auto"`, `"inherit"`, percentages, or unparseable values.
 fn parse_length_ctx(s: &str, ctx: LengthContext) -> Option<f32> {
@@ -1790,6 +2010,23 @@ fn parse_length_ctx(s: &str, ctx: LengthContext) -> Option<f32> {
     if s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("inherit") {
         return None;
     }
+
+    // Math functions. The comparison functions take a comma-separated list of
+    // expressions, each of which may itself be arithmetic.
+    let lower = s.to_ascii_lowercase();
+    if let Some(inner) = strip_function(&lower, "calc") {
+        return eval_calc(inner, ctx);
+    }
+    for (name, pick) in [
+        ("min", MathFn::Min),
+        ("max", MathFn::Max),
+        ("clamp", MathFn::Clamp),
+    ] {
+        if let Some(inner) = strip_function(&lower, name) {
+            return eval_math_fn(inner, pick, ctx);
+        }
+    }
+
     // Percentages are resolved by the layout engine against a containing block,
     // so they are not a plain length here.
     if s.ends_with('%') {
@@ -1843,7 +2080,7 @@ fn parse_margin_box_four(
     fallback_auto: [bool; 4],
     ctx: LengthContext,
 ) -> ([f32; 4], [bool; 4]) {
-    let tokens: Vec<&str> = s.split_whitespace().collect();
+    let tokens: Vec<&str> = split_components(s);
     let mut parsed = Vec::new();
     for t in tokens {
         if t.eq_ignore_ascii_case("auto") {
@@ -1879,8 +2116,8 @@ fn parse_margin_box_four(
 /// - 3 values: top, horizontal, bottom
 /// - 4 values: top, right, bottom, left
 fn parse_box_four(s: &str, fallback: [f32; 4], ctx: LengthContext) -> [f32; 4] {
-    let parts: Vec<f32> = s
-        .split_whitespace()
+    let parts: Vec<f32> = split_components(s)
+        .into_iter()
         .filter_map(|p| parse_length_ctx(p, ctx))
         .collect();
 
@@ -1913,7 +2150,7 @@ fn parse_flex_basis(s: &str, ctx: LengthContext) -> FlexBasis {
 
 /// Parse the flex shorthand property: "flex: <grow> <shrink>? <basis>?"
 fn parse_flex_shorthand(self_vals: &mut ComputedValues, val: &str, ctx: LengthContext) {
-    let parts: Vec<&str> = val.trim().split_whitespace().collect();
+    let parts: Vec<&str> = split_components(val.trim());
 
     if parts.is_empty() {
         return;
@@ -3575,6 +3812,123 @@ mod tests {
         );
         // Japanese has no case, so it must pass through untouched.
         assert_eq!(TextTransform::Uppercase.apply("日本語"), "日本語");
+    }
+
+    // ------ calc() and math functions ------
+
+    #[test]
+    fn calc_does_basic_arithmetic() {
+        let ctx = LengthContext::default();
+        assert_eq!(parse_length_ctx("calc(100px + 20px)", ctx), Some(120.0));
+        assert_eq!(parse_length_ctx("calc(100px - 20px)", ctx), Some(80.0));
+        assert_eq!(parse_length_ctx("calc(100px * 2)", ctx), Some(200.0));
+        assert_eq!(parse_length_ctx("calc(100px / 4)", ctx), Some(25.0));
+    }
+
+    #[test]
+    fn calc_respects_precedence_and_parentheses() {
+        let ctx = LengthContext::default();
+        assert_eq!(parse_length_ctx("calc(10px + 2 * 20px)", ctx), Some(50.0));
+        assert_eq!(parse_length_ctx("calc((10px + 20px) * 2)", ctx), Some(60.0));
+        assert_eq!(
+            parse_length_ctx("calc(100px - (20px + 30px))", ctx),
+            Some(50.0)
+        );
+    }
+
+    #[test]
+    fn calc_mixes_units_through_the_context() {
+        let ctx = LengthContext {
+            font_size: 10.0,
+            root_font_size: 20.0,
+            viewport_width: 1000.0,
+            viewport_height: 500.0,
+        };
+        assert_eq!(parse_length_ctx("calc(2em + 1rem)", ctx), Some(40.0));
+        assert_eq!(parse_length_ctx("calc(10vw - 50px)", ctx), Some(50.0));
+        assert_eq!(parse_length_ctx("CALC(1EM * 3)", ctx), Some(30.0));
+    }
+
+    #[test]
+    fn calc_handles_unary_signs() {
+        let ctx = LengthContext::default();
+        assert_eq!(parse_length_ctx("calc(-10px + 30px)", ctx), Some(20.0));
+        assert_eq!(parse_length_ctx("calc(10px * -2)", ctx), Some(-20.0));
+    }
+
+    #[test]
+    fn calc_rejects_percentages_and_malformed_input() {
+        let ctx = LengthContext::default();
+        // Percentages need a containing block, which style computation lacks.
+        assert_eq!(parse_length_ctx("calc(100% - 20px)", ctx), None);
+        assert_eq!(parse_length_ctx("calc(10px +)", ctx), None);
+        assert_eq!(parse_length_ctx("calc((10px)", ctx), None);
+        assert_eq!(parse_length_ctx("calc(10px / 0)", ctx), None);
+        assert_eq!(parse_length_ctx("calc()", ctx), None);
+        assert_eq!(parse_length_ctx("calc(red)", ctx), None);
+    }
+
+    #[test]
+    fn min_max_clamp_pick_the_right_value() {
+        let ctx = LengthContext::default();
+        assert_eq!(parse_length_ctx("min(10px, 40px, 20px)", ctx), Some(10.0));
+        assert_eq!(parse_length_ctx("max(10px, 40px, 20px)", ctx), Some(40.0));
+        assert_eq!(parse_length_ctx("clamp(10px, 5px, 40px)", ctx), Some(10.0));
+        assert_eq!(parse_length_ctx("clamp(10px, 25px, 40px)", ctx), Some(25.0));
+        assert_eq!(parse_length_ctx("clamp(10px, 90px, 40px)", ctx), Some(40.0));
+    }
+
+    #[test]
+    fn math_functions_accept_nested_arithmetic() {
+        let ctx = LengthContext {
+            font_size: 10.0,
+            ..LengthContext::default()
+        };
+        assert_eq!(
+            parse_length_ctx("max(calc(2em + 5px), 20px)", ctx),
+            Some(25.0)
+        );
+        assert_eq!(parse_length_ctx("min(3em, 40px)", ctx), Some(30.0));
+    }
+
+    #[test]
+    fn calc_works_end_to_end_in_the_cascade() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div>x</div></body></html>",
+            "div { font-size: 10px; width: calc(100px + 2em); padding: calc(4px * 2); }",
+        );
+
+        let div = styles_for_tag(&arena, &styles, "div");
+        assert_eq!(div.width, Some(120.0));
+        assert_eq!(div.padding, [8.0; 4]);
+    }
+
+    #[test]
+    fn shorthand_splitting_keeps_functions_whole() {
+        assert_eq!(split_components("10px 20px"), vec!["10px", "20px"]);
+        assert_eq!(
+            split_components("calc(4px * 2) 10px"),
+            vec!["calc(4px * 2)", "10px"]
+        );
+        assert_eq!(
+            split_components("  min(1em, 4px)   auto "),
+            vec!["min(1em, 4px)", "auto"]
+        );
+        assert!(split_components("   ").is_empty());
+    }
+
+    #[test]
+    fn calc_in_a_multi_value_shorthand() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div>x</div></body></html>",
+            "div { font-size: 10px; margin: calc(1em + 2px) 5px; }",
+        );
+
+        // top/bottom from the calc, left/right from the literal.
+        assert_eq!(
+            styles_for_tag(&arena, &styles, "div").margin,
+            [12.0, 5.0, 12.0, 5.0]
+        );
     }
 
     #[test]

@@ -755,9 +755,10 @@ impl MistilteinnApp {
         }
 
         // Composite cached images from page cache
+        let page_base = page.base_url();
         for img_info in &image_nodes {
-            let resolved_src = if !page.page_url.is_empty() {
-                crate::network::resolve_url(&page.page_url, &img_info.src)
+            let resolved_src = if !page_base.is_empty() {
+                crate::network::resolve_url(&page_base, &img_info.src)
             } else {
                 img_info.src.clone()
             };
@@ -1154,11 +1155,14 @@ impl MistilteinnApp {
         }
 
         let image_nodes = crate::layout::collect_image_nodes(&new_page.layout_root);
+        // Resolve against <base href> when the document declares one; it is
+        // only knowable now that the HTML has been parsed.
+        let effective_base = new_page.base_url();
         let resolved_images: Vec<(String, f32, f32)> = image_nodes
             .iter()
             .map(|img| {
-                let resolved = if let Some(base) = base_url {
-                    crate::network::resolve_url(base, &img.src)
+                let resolved = if !effective_base.is_empty() {
+                    crate::network::resolve_url(&effective_base, &img.src)
                 } else {
                     img.src.clone()
                 };
@@ -1440,7 +1444,7 @@ fn get_form_submit_url(page: &crate::page::Page, input_dom_id: u32, query_val: &
             format!("https://www.google.com/search?q={}", query_val)
         }
     } else {
-        let base_resolved = crate::network::resolve_url(&page.page_url, &form_action);
+        let base_resolved = crate::network::resolve_url(&page.base_url(), &form_action);
         let delimiter = if base_resolved.contains('?') {
             '&'
         } else {

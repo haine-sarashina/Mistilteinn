@@ -282,6 +282,63 @@ impl DomArena {
         None
     }
 
+    /// Read the document's `<base href>`, if it declares one.
+    ///
+    /// Per the HTML spec only the first `<base>` with an `href` counts, and it
+    /// becomes the base for resolving every relative URL in the document.
+    pub fn base_href(&self) -> Option<String> {
+        let base = LocalName::from("base");
+        let nodes = self.nodes.borrow();
+        nodes
+            .iter()
+            .filter(|n| n.tag_name() == Some(&base))
+            .find_map(|n| n.get_attr("href"))
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+    }
+
+    /// Read the document's declared character encoding.
+    ///
+    /// Handles both `<meta charset>` and the legacy
+    /// `<meta http-equiv="content-type" content="…; charset=…">` form.
+    pub fn meta_charset(&self) -> Option<String> {
+        let meta = LocalName::from("meta");
+        let nodes = self.nodes.borrow();
+        nodes
+            .iter()
+            .filter(|n| n.tag_name() == Some(&meta))
+            .find_map(|n| {
+                if let Some(cs) = n.get_attr("charset") {
+                    return Some(cs.trim().to_ascii_lowercase());
+                }
+                let http_equiv = n.get_attr("http-equiv")?;
+                if !http_equiv.eq_ignore_ascii_case("content-type") {
+                    return None;
+                }
+                let content = n.get_attr("content")?;
+                let lowered = content.to_ascii_lowercase();
+                let (_, charset) = lowered.split_once("charset=")?;
+                Some(charset.trim().trim_matches('"').to_string())
+            })
+            .filter(|c| !c.is_empty())
+    }
+
+    /// Read the `content` of `<meta name="viewport">`, if present.
+    pub fn meta_viewport(&self) -> Option<String> {
+        let meta = LocalName::from("meta");
+        let nodes = self.nodes.borrow();
+        nodes
+            .iter()
+            .filter(|n| n.tag_name() == Some(&meta))
+            .find(|n| {
+                n.get_attr("name")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("viewport"))
+            })
+            .and_then(|n| n.get_attr("content"))
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+    }
+
     /// Find the first element node matching a tag name.
     pub fn find_by_tag(&self, tag: &str) -> Option<u32> {
         let tag_name = LocalName::from(tag);
@@ -823,5 +880,58 @@ mod tests {
         let mut node = DomNode::element("a");
         node.set_attribute("href", "https://example.com");
         assert_eq!(node.get_attr("href"), Some("https://example.com"));
+    }
+
+    #[test]
+    fn base_href_is_read_from_the_document() {
+        let arena = parse_html(
+            "<html><head><base href=\"https://cdn.example.com/assets/\"></head><body>x</body></html>",
+        );
+        assert_eq!(
+            arena.base_href().as_deref(),
+            Some("https://cdn.example.com/assets/")
+        );
+    }
+
+    #[test]
+    fn base_href_absent_or_empty_is_none() {
+        let arena = parse_html("<html><head></head><body>x</body></html>");
+        assert_eq!(arena.base_href(), None);
+
+        let arena = parse_html("<html><head><base href=\"\"></head><body>x</body></html>");
+        assert_eq!(arena.base_href(), None, "an empty href does not set a base");
+    }
+
+    #[test]
+    fn first_base_href_wins() {
+        let arena = parse_html(
+            "<html><head><base href=\"https://a.example/\"><base href=\"https://b.example/\"></head><body>x</body></html>",
+        );
+        assert_eq!(arena.base_href().as_deref(), Some("https://a.example/"));
+    }
+
+    #[test]
+    fn meta_charset_is_read_in_both_forms() {
+        let arena = parse_html("<html><head><meta charset=\"UTF-8\"></head><body>x</body></html>");
+        assert_eq!(arena.meta_charset().as_deref(), Some("utf-8"));
+
+        let arena = parse_html(
+            "<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=Shift_JIS\"></head><body>x</body></html>",
+        );
+        assert_eq!(arena.meta_charset().as_deref(), Some("shift_jis"));
+    }
+
+    #[test]
+    fn meta_viewport_is_read() {
+        let arena = parse_html(
+            "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head><body>x</body></html>",
+        );
+        assert_eq!(
+            arena.meta_viewport().as_deref(),
+            Some("width=device-width, initial-scale=1")
+        );
+
+        let arena = parse_html("<html><head></head><body>x</body></html>");
+        assert_eq!(arena.meta_viewport(), None);
     }
 }

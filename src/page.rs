@@ -32,6 +32,22 @@ pub struct Page {
 }
 
 impl Page {
+    /// The URL that relative references in this document resolve against.
+    ///
+    /// A `<base href>` overrides the document's own URL, and is itself resolved
+    /// against that URL so a relative `<base href="/assets/">` works.
+    pub fn base_url(&self) -> String {
+        match self.arena.base_href() {
+            Some(href) if !self.page_url.is_empty() => {
+                crate::network::resolve_url(&self.page_url, &href)
+            }
+            Some(href) => href,
+            None => self.page_url.clone(),
+        }
+    }
+}
+
+impl Page {
     /// Run the full pipeline: parse HTML + CSS, compute styles, build and measure layout tree.
     pub fn new(html_source: &str, css_source: &str, view_width: f32, view_height: f32) -> Self {
         // Stage 1: Parse HTML into DOM arena

@@ -76,6 +76,10 @@ impl DomNode {
         self.attrs.get(&key).map(|v| v.as_str())
     }
 
+    pub fn get_attribute(&self, name: &str) -> Option<&str> {
+        self.get_attr(name)
+    }
+
     pub fn attr_iter(&self) -> impl Iterator<Item = (&LocalName, &str)> {
         self.attrs.iter().map(|(k, v)| (k, v.as_str()))
     }
@@ -150,6 +154,13 @@ impl crate::layout::LayoutDomNode for DomNode {
             _ => None,
         }
     }
+
+    fn attributes(&self) -> Vec<(String, String)> {
+        self.attrs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
 }
 
 // ------ Handle / Id ------
@@ -197,6 +208,7 @@ impl html5ever::tree_builder::ElemName for OwnedElemName {
 // ------ Arena ------
 
 /// Arena-backed DOM storage with interior mutability.
+#[derive(Clone)]
 pub struct DomArena {
     #[doc(hidden)]
     #[cfg_attr(test, allow(dead_code))]
@@ -247,9 +259,223 @@ impl DomArena {
         self.with_node(h.0, |n| n.clone())
     }
 
+    /// Number of nodes in the arena.
+    pub fn len(&self) -> usize {
+        self.nodes.borrow().len()
+    }
+
     /// Root document handle.
     pub fn document_handle(&self) -> DomHandle {
         DomHandle(NodeId::DOCUMENT)
+    }
+
+    /// Find a node by `id` attribute.
+    pub fn find_by_id(&self, id_val: &str) -> Option<u32> {
+        let nodes = self.nodes.borrow();
+        for (i, node) in nodes.iter().enumerate() {
+            if let Some(val) = node.get_attr("id") {
+                if val == id_val {
+                    return Some(i as u32);
+                }
+            }
+        }
+        None
+    }
+
+    /// Find the first element node matching a tag name.
+    pub fn find_by_tag(&self, tag: &str) -> Option<u32> {
+        let tag_name = LocalName::from(tag);
+        let nodes = self.nodes.borrow();
+        for (i, node) in nodes.iter().enumerate() {
+            if let Some(t) = node.tag_name() {
+                if t == &tag_name {
+                    return Some(i as u32);
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract text content of a node and its children.
+    pub fn get_text_content(&self, node_id: u32) -> String {
+        let mut text = String::new();
+        self.collect_text_recursive(node_id, &mut text);
+        text
+    }
+
+    fn collect_text_recursive(&self, node_id: u32, out: &mut String) {
+        let nodes = self.nodes.borrow();
+        if let Some(node) = nodes.get(node_id as usize) {
+            match &node.node_type {
+                DomNodeType::Text(s) => {
+                    out.push_str(s);
+                }
+                _ => {
+                    let children = node.children.clone();
+                    drop(nodes);
+                    for child in children {
+                        self.collect_text_recursive(child.0, out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set the text content of a node by replacing its children with a single text node.
+    pub fn set_text_content(&self, node_id: u32, new_text: &str) {
+        let text_node = DomNode {
+            node_type: DomNodeType::Text(new_text.to_string()),
+            attrs: FxHashMap::default(),
+            children: Vec::new(),
+            parent: Some(NodeId(node_id)),
+            template_content: None,
+        };
+        let new_text_id = self.alloc(text_node);
+        let mut nodes = self.nodes.borrow_mut();
+        if let Some(node) = nodes.get_mut(node_id as usize) {
+            node.children.clear();
+            node.children.push(new_text_id);
+        }
+    }
+
+    /// Set an attribute on a node.
+    pub fn set_attribute(&self, node_id: u32, name: &str, val: &str) {
+        let mut nodes = self.nodes.borrow_mut();
+        if let Some(node) = nodes.get_mut(node_id as usize) {
+            node.set_attribute(name, val);
+        }
+    }
+
+    /// Get an attribute on a node.
+    pub fn get_attribute(&self, node_id: u32, name: &str) -> Option<String> {
+        let nodes = self.nodes.borrow();
+        nodes
+            .get(node_id as usize)
+            .and_then(|n| n.get_attr(name).map(|s| s.to_string()))
+    }
+
+    /// Extract all inline `<script>` contents from the DOM.
+    /// Only extracts executable JavaScript scripts (skips application/ld+json, text/template, etc.).
+    pub fn extract_scripts(&self) -> Vec<String> {
+        let mut scripts = Vec::new();
+        let script_tag = LocalName::from("script");
+        let count = self.len();
+        for i in 0..count {
+            let is_js_script = {
+                let nodes = self.nodes.borrow();
+                if let Some(node) = nodes.get(i) {
+                    if node.tag_name().map_or(false, |t| t == &script_tag) {
+                        if let Some(type_attr) = node.get_attr("type") {
+                            let t = type_attr.trim().to_lowercase();
+                            t.is_empty()
+                                || t == "text/javascript"
+                                || t == "application/javascript"
+                                || t == "text/ecmascript"
+                                || t == "application/ecmascript"
+                                || t == "module"
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if is_js_script {
+                let text = self.get_text_content(i as u32);
+                if !text.trim().is_empty() {
+                    scripts.push(text);
+                }
+            }
+        }
+        scripts
+    }
+
+    /// Extract the `<title>` text content from the DOM if present.
+    pub fn extract_title(&self) -> Option<String> {
+        let title_tag = LocalName::from("title");
+        let count = self.len();
+        for i in 0..count {
+            let is_title = {
+                let nodes = self.nodes.borrow();
+                nodes
+                    .get(i)
+                    .and_then(|n| n.tag_name())
+                    .map_or(false, |t| t == &title_tag)
+            };
+            if is_title {
+                let text = self.get_text_content(i as u32);
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Serialize a DOM node and its descendants into valid XML/HTML markup (e.g. for SVG).
+    pub fn serialize_node_xml(&self, node_id: u32) -> String {
+        let mut out = String::new();
+        self.serialize_node_xml_inner(node_id, &mut out);
+        out
+    }
+
+    fn serialize_node_xml_inner(&self, node_id: u32, out: &mut String) {
+        let nodes = self.nodes.borrow();
+        let Some(node) = nodes.get(node_id as usize) else {
+            return;
+        };
+
+        match &node.node_type {
+            DomNodeType::Element { name, .. } => {
+                let tag = name.to_string();
+                out.push('<');
+                out.push_str(&tag);
+                for (k, v) in &node.attrs {
+                    out.push(' ');
+                    out.push_str(k.as_ref());
+                    out.push_str("=\"");
+                    // Escape basic XML chars
+                    for ch in v.chars() {
+                        match ch {
+                            '&' => out.push_str("&amp;"),
+                            '<' => out.push_str("&lt;"),
+                            '>' => out.push_str("&gt;"),
+                            '"' => out.push_str("&quot;"),
+                            _ => out.push(ch),
+                        }
+                    }
+                    out.push('"');
+                }
+                if node.children.is_empty() {
+                    out.push_str(" />");
+                } else {
+                    out.push('>');
+                    let child_ids = node.children.clone();
+                    drop(nodes); // Drop borrow before recursion
+                    for cid in child_ids {
+                        self.serialize_node_xml_inner(cid.index() as u32, out);
+                    }
+                    out.push_str("</");
+                    out.push_str(&tag);
+                    out.push('>');
+                }
+            }
+            DomNodeType::Text(text) => {
+                for ch in text.chars() {
+                    match ch {
+                        '&' => out.push_str("&amp;"),
+                        '<' => out.push_str("&lt;"),
+                        '>' => out.push_str("&gt;"),
+                        _ => out.push(ch),
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

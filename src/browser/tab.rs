@@ -89,6 +89,7 @@ impl Tab {
 pub struct TabManager {
     next_id: u32,
     tabs: FxHashMap<TabId, Tab>,
+    tab_order: Vec<TabId>,
     active_tab: Option<TabId>,
 }
 
@@ -97,11 +98,13 @@ impl TabManager {
         Self {
             next_id: 1,
             tabs: FxHashMap::default(),
+            tab_order: Vec::new(),
             active_tab: None,
         }
     }
 
-    /// Creates a new tab and returns its ID.
+    /// Creates a new tab and returns its ID. Inserts the new tab immediately
+    /// below (after) the currently active tab.
     pub fn create_tab(&mut self) -> TabId {
         let id = TabId::new(self.next_id);
         self.next_id += 1;
@@ -119,6 +122,17 @@ impl TabManager {
                 group_id: None,
             },
         );
+
+        if let Some(active_id) = self.active_tab {
+            if let Some(pos) = self.tab_order.iter().position(|&tid| tid == active_id) {
+                self.tab_order.insert(pos + 1, id);
+            } else {
+                self.tab_order.push(id);
+            }
+        } else {
+            self.tab_order.push(id);
+        }
+
         self.active_tab = Some(id);
         id
     }
@@ -143,9 +157,22 @@ impl TabManager {
 
     /// Closes a tab by ID.
     pub fn close_tab(&mut self, id: TabId) {
+        let old_pos = self.tab_order.iter().position(|&tid| tid == id);
+        self.tab_order.retain(|&tid| tid != id);
         self.tabs.remove(&id);
+
         if self.active_tab == Some(id) {
-            self.active_tab = self.tabs.keys().next().copied();
+            if let Some(pos) = old_pos {
+                if pos < self.tab_order.len() {
+                    self.active_tab = Some(self.tab_order[pos]);
+                } else if pos > 0 && !self.tab_order.is_empty() {
+                    self.active_tab = Some(self.tab_order[pos - 1]);
+                } else {
+                    self.active_tab = self.tab_order.first().copied();
+                }
+            } else {
+                self.active_tab = self.tab_order.first().copied();
+            }
         }
     }
 
@@ -161,9 +188,9 @@ impl TabManager {
         self.active_tab.and_then(|id| self.tabs.get(&id))
     }
 
-    /// Returns all tabs.
+    /// Returns all tabs in visual order.
     pub fn all_tabs(&self) -> impl Iterator<Item = &Tab> {
-        self.tabs.values()
+        self.tab_order.iter().filter_map(|id| self.tabs.get(id))
     }
 
     /// Gets a specific tab by ID.

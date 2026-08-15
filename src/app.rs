@@ -12,16 +12,21 @@ use crate::render::{ColorF, MAX_RECTS, RectClip, Renderer, layout_to_clip};
 /// Chrome layout constants.
 const TAB_BAR_WIDTH: u32 = 200;
 const ADDRESS_BAR_HEIGHT: u32 = 40;
-const TAB_BUTTON_HEIGHT: f32 = 45.0;
+const TAB_BUTTON_HEIGHT: f32 = 40.0;
 const TAB_BUTTON_SPACING: f32 = 4.0;
-const GROUP_HEADER_HEIGHT: f32 = 30.0;
-const TAB_BUTTON_X: f32 = 10.0;
-const TAB_BUTTON_RIGHT_MARGIN: f32 = 20.0;
+const NEW_TAB_BUTTON_HEIGHT: f32 = 28.0;
+const CLOSE_BUTTON_SIZE: f32 = 18.0;
+const NAV_BUTTON_WIDTH: f32 = 36.0;
+const GROUP_HEADER_HEIGHT: f32 = 28.0;
+const TAB_BUTTON_X: f32 = 8.0;
+const TAB_BUTTON_RIGHT_MARGIN: f32 = 16.0;
 const TAB_GROUP_COLOR_STRIP_WIDTH: f32 = 4.0;
 const LOADING_BAR_HEIGHT: f32 = 3.0;
 const LOADING_BAR_COLOR_R: f32 = 80.0 / 255.0;
 const LOADING_BAR_COLOR_G: f32 = 140.0 / 255.0;
 const LOADING_BAR_COLOR_B: f32 = 230.0 / 255.0;
+const SCROLLBAR_WIDTH: f32 = 10.0;
+const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 30.0;
 
 /// Main application struct implementing winit's ApplicationHandler trait.
 pub struct MistilteinnApp {
@@ -47,6 +52,16 @@ pub struct MistilteinnApp {
     is_address_focused: bool,
     /// The cursor position in the address input.
     address_cursor: usize,
+    /// The DOM node ID of the focused page <input> / <textarea>, if any.
+    focused_page_input: Option<u32>,
+    /// Whether the user is actively dragging the scrollbar thumb.
+    is_dragging_scrollbar: bool,
+    /// The cursor Y position when scrollbar dragging started.
+    scrollbar_drag_start_y: f32,
+    /// The scroll Y offset when scrollbar dragging started.
+    scrollbar_drag_start_scroll_y: f32,
+    /// Whether the scrollbar is currently hovered by cursor.
+    hovered_scrollbar: bool,
 }
 
 /// Hit-test result for tab bar clicks.
@@ -56,6 +71,10 @@ enum HitTestResult {
     GroupHeader(crate::browser::tab_group::GroupId),
     /// Clicked on a tab button
     TabButton(crate::browser::tab::TabId),
+    /// Clicked on close button ('×') of a tab
+    CloseTabButton(crate::browser::tab::TabId),
+    /// Clicked on '+ New Tab' button
+    NewTabButton,
     /// Clicked on empty space in tab bar
     Empty,
     /// Clicked on Address Bar
@@ -64,6 +83,12 @@ enum HitTestResult {
     BackButton,
     /// Clicked on Forward Button
     ForwardButton,
+    /// Clicked on Reload Button
+    ReloadButton,
+    /// Clicked on Scrollbar Thumb
+    ScrollbarThumb,
+    /// Clicked on Scrollbar Track
+    ScrollbarTrack,
 }
 
 impl HitTestResult {
@@ -111,6 +136,23 @@ impl MistilteinnApp {
             r: 42.0 / 255.0,
             g: 42.0 / 255.0,
             b: 47.0 / 255.0,
+            a: 1.0,
+        });
+
+        // + New Tab button at top of Tab Bar
+        let new_tab_btn_y = 6.0;
+        rects.push(layout_to_clip(
+            TAB_BUTTON_X,
+            new_tab_btn_y,
+            TAB_BAR_WIDTH as f32 - TAB_BUTTON_X - TAB_BUTTON_RIGHT_MARGIN,
+            NEW_TAB_BUTTON_HEIGHT,
+            window_width as f32,
+            window_height as f32,
+        ));
+        colors.push(ColorF {
+            r: 55.0 / 255.0,
+            g: 55.0 / 255.0,
+            b: 65.0 / 255.0,
             a: 1.0,
         });
 
@@ -215,13 +257,14 @@ impl MistilteinnApp {
             a: 1.0,
         });
 
-        // Back button
-        let nav_btn_width = 40.0;
+        // Navigation buttons (Back, Forward, Reload)
         let mut curr_x = TAB_BAR_WIDTH as f32;
+
+        // Back button
         rects.push(layout_to_clip(
             curr_x,
             0.0,
-            nav_btn_width,
+            NAV_BUTTON_WIDTH,
             ADDRESS_BAR_HEIGHT as f32,
             window_width as f32,
             window_height as f32,
@@ -232,13 +275,13 @@ impl MistilteinnApp {
             b: 60.0 / 255.0,
             a: 1.0,
         });
-        curr_x += nav_btn_width;
+        curr_x += NAV_BUTTON_WIDTH;
 
         // Forward button
         rects.push(layout_to_clip(
             curr_x,
             0.0,
-            nav_btn_width,
+            NAV_BUTTON_WIDTH,
             ADDRESS_BAR_HEIGHT as f32,
             window_width as f32,
             window_height as f32,
@@ -249,7 +292,24 @@ impl MistilteinnApp {
             b: 60.0 / 255.0,
             a: 1.0,
         });
-        curr_x += nav_btn_width;
+        curr_x += NAV_BUTTON_WIDTH;
+
+        // Reload button
+        rects.push(layout_to_clip(
+            curr_x,
+            0.0,
+            NAV_BUTTON_WIDTH,
+            ADDRESS_BAR_HEIGHT as f32,
+            window_width as f32,
+            window_height as f32,
+        ));
+        colors.push(ColorF {
+            r: 55.0 / 255.0,
+            g: 55.0 / 255.0,
+            b: 60.0 / 255.0,
+            a: 1.0,
+        });
+        curr_x += NAV_BUTTON_WIDTH;
 
         // Inner URL Input box
         let addr_box_margin = 6.0;
@@ -307,22 +367,53 @@ impl MistilteinnApp {
     ) {
         let text_color = [0.9, 0.9, 0.9, 1.0]; // Light gray/white
 
-        // Draw tab titles
+        // Draw + New Tab button text
+        text_renderer.rasterize_to_bitmap(
+            "+ New Tab",
+            13.0,
+            "sans-serif",
+            [0.85, 0.85, 0.9, 1.0],
+            TAB_BUTTON_X + 45.0,
+            12.0,
+            TAB_BAR_WIDTH as f32 - 60.0,
+            buffer,
+            win_w,
+            win_h,
+        );
+
+        // Draw tab titles and close '×' buttons
         let mut y = ADDRESS_BAR_HEIGHT as f32 + TAB_BUTTON_SPACING;
         for group in self.group_manager.all_groups() {
             y += GROUP_HEADER_HEIGHT + TAB_BUTTON_SPACING;
             if !group.collapsed {
                 for tab_id in &group.tab_ids {
                     if let Some(tab) = self.tab_manager.get_tab(*tab_id) {
-                        let title = if tab.title.is_empty() { "New Tab" } else { &tab.title };
+                        let title = if tab.title.is_empty() {
+                            "New Tab"
+                        } else {
+                            &tab.title
+                        };
                         text_renderer.rasterize_to_bitmap(
                             title,
-                            14.0,
+                            13.0,
                             "sans-serif",
                             text_color,
-                            TAB_BUTTON_X + 15.0,
-                            y + 12.0,
-                            TAB_BAR_WIDTH as f32 - 30.0,
+                            TAB_BUTTON_X + 12.0,
+                            y + 11.0,
+                            TAB_BAR_WIDTH as f32 - TAB_BUTTON_X - TAB_BUTTON_RIGHT_MARGIN - 30.0,
+                            buffer,
+                            win_w,
+                            win_h,
+                        );
+                        // Close '×' button
+                        text_renderer.rasterize_to_bitmap(
+                            "×",
+                            15.0,
+                            "sans-serif",
+                            [0.7, 0.7, 0.75, 1.0],
+                            TAB_BAR_WIDTH as f32 - TAB_BUTTON_RIGHT_MARGIN - 16.0,
+                            y + 9.0,
+                            20.0,
                             buffer,
                             win_w,
                             win_h,
@@ -335,15 +426,32 @@ impl MistilteinnApp {
         }
         for tab in self.tab_manager.all_tabs() {
             if tab.group_id.is_none() {
-                let title = if tab.title.is_empty() { "New Tab" } else { &tab.title };
+                let title = if tab.title.is_empty() {
+                    "New Tab"
+                } else {
+                    &tab.title
+                };
                 text_renderer.rasterize_to_bitmap(
                     title,
-                    14.0,
+                    13.0,
                     "sans-serif",
                     text_color,
-                    TAB_BUTTON_X + 15.0,
-                    y + 12.0,
-                    TAB_BAR_WIDTH as f32 - 30.0,
+                    TAB_BUTTON_X + 12.0,
+                    y + 11.0,
+                    TAB_BAR_WIDTH as f32 - TAB_BUTTON_X - TAB_BUTTON_RIGHT_MARGIN - 30.0,
+                    buffer,
+                    win_w,
+                    win_h,
+                );
+                // Close '×' button
+                text_renderer.rasterize_to_bitmap(
+                    "×",
+                    15.0,
+                    "sans-serif",
+                    [0.7, 0.7, 0.75, 1.0],
+                    TAB_BAR_WIDTH as f32 - TAB_BUTTON_RIGHT_MARGIN - 16.0,
+                    y + 9.0,
+                    20.0,
                     buffer,
                     win_w,
                     win_h,
@@ -352,42 +460,58 @@ impl MistilteinnApp {
             }
         }
 
-        // Draw Back button
-        let nav_btn_width = 40.0;
+        // Draw Navigation buttons (Back, Forward, Reload)
         let mut curr_x = TAB_BAR_WIDTH as f32;
+
+        // Back button
         text_renderer.rasterize_to_bitmap(
             "◀",
-            20.0,
+            18.0,
             "sans-serif",
             text_color,
-            curr_x + 10.0,
-            8.0,
+            curr_x + 9.0,
+            9.0,
             30.0,
             buffer,
             win_w,
             win_h,
         );
-        curr_x += nav_btn_width;
+        curr_x += NAV_BUTTON_WIDTH;
 
-        // Draw Forward button
+        // Forward button
         text_renderer.rasterize_to_bitmap(
             "▶",
-            20.0,
+            18.0,
             "sans-serif",
             text_color,
-            curr_x + 10.0,
+            curr_x + 9.0,
+            9.0,
+            30.0,
+            buffer,
+            win_w,
+            win_h,
+        );
+        curr_x += NAV_BUTTON_WIDTH;
+
+        // Reload button
+        text_renderer.rasterize_to_bitmap(
+            "↻",
+            18.0,
+            "sans-serif",
+            text_color,
+            curr_x + 9.0,
             8.0,
             30.0,
             buffer,
             win_w,
             win_h,
         );
-        curr_x += nav_btn_width;
+        curr_x += NAV_BUTTON_WIDTH;
 
         // Draw Address input
         let addr_box_margin = 6.0;
         let addr_box_x = curr_x + addr_box_margin;
-        
+
         // Show cursor if focused
         let display_text = if self.is_address_focused {
             let mut t = self.address_input.clone();
@@ -399,7 +523,10 @@ impl MistilteinnApp {
             t
         } else {
             if self.address_input.is_empty() {
-                self.tab_manager.get_active_tab_page().map(|p| p.page_url.clone()).unwrap_or_default()
+                self.tab_manager
+                    .get_active_tab_page()
+                    .map(|p| p.page_url.clone())
+                    .unwrap_or_default()
             } else {
                 self.address_input.clone()
             }
@@ -451,15 +578,38 @@ impl MistilteinnApp {
             .unwrap_or((0.0, 0.0));
 
         let Some(ref page) = self.tab_manager.get_active_tab_page() else {
-            // Upload chrome only if no page content
+            // No active page: render blank white canvas with chrome overlay
+            let mut all_rects: Vec<RectClip> = chrome_rects;
+            let mut all_colors: Vec<ColorF> = chrome_colors;
+
+            // Add white background for content area
+            all_rects.push(layout_to_clip(
+                TAB_BAR_WIDTH as f32,
+                ADDRESS_BAR_HEIGHT as f32,
+                win_w as f32 - TAB_BAR_WIDTH as f32,
+                win_h as f32 - ADDRESS_BAR_HEIGHT as f32,
+                win_w as f32,
+                win_h as f32,
+            ));
+            all_colors.push(ColorF {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            });
+
             if let Some(ref mut renderer) = self.renderer {
-                renderer.set_rects(&chrome_rects, &chrome_colors);
+                renderer.set_rects(&all_rects, &all_colors);
+            }
+
+            let mut composite_buffer = vec![0u8; (win_w * win_h * 4) as usize];
+            let mut text_renderer = TextRenderer::new();
+            self.draw_chrome_text(&mut text_renderer, &mut composite_buffer, win_w, win_h);
+            if let Some(ref mut renderer) = self.renderer {
+                renderer.set_text_bitmap(win_w, win_h, &composite_buffer);
             }
             return;
         };
-
-        // Use effective view dimensions (subtract chrome area offsets for layout purposes)
-
 
         // Collect render rectangles from layout tree and convert to clip space
         let rects = page.collect_rects();
@@ -521,8 +671,59 @@ impl MistilteinnApp {
         // Collect image nodes from layout tree (sync recompose does NOT fetch images)
         let image_nodes = crate::layout::collect_image_nodes(&page.layout_root);
 
+        // Collect visual decorations (background colors, borders, border-radius)
+        let decorations = crate::layout::collect_decorations(&page.layout_root);
+
         // Allocate full-window RGBA buffer (transparent background)
         let mut composite_buffer = vec![0u8; (win_w * win_h * 4) as usize];
+
+        // Render background colors and borders first (beneath text and images)
+        for deco in &decorations {
+            let dx = deco.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
+            let dy = deco.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
+
+            if let Some(bg) = deco.background_color {
+                if deco.border_radius > 0.0 {
+                    crate::render::draw_rounded_rect_fill(
+                        &mut composite_buffer,
+                        win_w,
+                        win_h,
+                        dx,
+                        dy,
+                        deco.width,
+                        deco.height,
+                        deco.border_radius,
+                        bg,
+                    );
+                } else {
+                    crate::render::draw_solid_rect(
+                        &mut composite_buffer,
+                        win_w,
+                        win_h,
+                        dx,
+                        dy,
+                        deco.width,
+                        deco.height,
+                        bg,
+                    );
+                }
+            }
+
+            if let Some(b_color) = deco.border_color {
+                crate::render::draw_rect_borders(
+                    &mut composite_buffer,
+                    win_w,
+                    win_h,
+                    dx,
+                    dy,
+                    deco.width,
+                    deco.height,
+                    deco.border_width,
+                    b_color,
+                );
+            }
+        }
+
         let mut text_renderer = TextRenderer::new();
 
         // Rasterize text nodes into the composite buffer
@@ -538,7 +739,7 @@ impl MistilteinnApp {
             let text_x = text_info.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
             let text_y = text_info.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
 
-            text_renderer.rasterize_to_bitmap(
+            text_renderer.rasterize_to_bitmap_styled(
                 &text_info.text,
                 text_info.font_size,
                 "sans-serif",
@@ -546,6 +747,8 @@ impl MistilteinnApp {
                 text_x,
                 text_y,
                 text_info.width,
+                text_info.is_bold,
+                text_info.is_underline,
                 &mut composite_buffer,
                 win_w,
                 win_h,
@@ -560,23 +763,123 @@ impl MistilteinnApp {
                 img_info.src.clone()
             };
 
-            if let Some(cached) = page.image_cache.get(&resolved_src) {
+            let cached = page
+                .image_cache
+                .get(&resolved_src)
+                .or_else(|| page.image_cache.get(&img_info.src));
+
+            if let Some(cached) = cached {
+                // Skip unpositioned or collapsed small icons at (0, 0)
+                if img_info.x <= 0.0
+                    && img_info.y <= 0.0
+                    && img_info.width < 32.0
+                    && img_info.height < 32.0
+                {
+                    continue;
+                }
                 let img_x = img_info.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
                 let img_y = img_info.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
-                crate::render::composite_image(
-                    &cached.rgba,
-                    cached.width,
-                    cached.height,
+                let target_w = if img_info.width >= 4.0 {
+                    img_info.width
+                } else {
+                    cached.width as f32
+                };
+                let target_h = if img_info.height >= 4.0 {
+                    img_info.height
+                } else {
+                    cached.height as f32
+                };
+                if target_w >= 4.0 && target_h >= 4.0 {
+                    crate::render::composite_image_scaled(
+                        &cached.rgba,
+                        cached.width,
+                        cached.height,
+                        &mut composite_buffer,
+                        win_w,
+                        win_h,
+                        img_x,
+                        img_y,
+                        target_w,
+                        target_h,
+                    );
+                }
+            }
+        }
+
+        // Highlight focused page input with blue outline
+        if let Some(focused_dom_id) = self.focused_page_input {
+            if let Some(rect) = find_layout_rect_by_dom_id(&page.layout_root, focused_dom_id) {
+                let fx = rect.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
+                let fy = rect.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
+                crate::render::draw_rect_borders(
                     &mut composite_buffer,
                     win_w,
                     win_h,
-                    img_x,
-                    img_y,
+                    fx - 1.0,
+                    fy - 1.0,
+                    rect.width + 2.0,
+                    rect.height + 2.0,
+                    [2.0, 2.0, 2.0, 2.0],
+                    [66, 133, 244, 255],
                 );
             }
         }
 
+        // CRITICAL CLIPPING: Clear any page content (text/images) that overflowed into
+        // the left tab bar (x < TAB_BAR_WIDTH) or top address bar (y < ADDRESS_BAR_HEIGHT)
+        for py in 0..win_h {
+            for px in 0..win_w {
+                if px < TAB_BAR_WIDTH || py < ADDRESS_BAR_HEIGHT {
+                    let idx = ((py * win_w + px) * 4) as usize;
+                    if idx + 3 < composite_buffer.len() {
+                        composite_buffer[idx] = 0;
+                        composite_buffer[idx + 1] = 0;
+                        composite_buffer[idx + 2] = 0;
+                        composite_buffer[idx + 3] = 0;
+                    }
+                }
+            }
+        }
+
         self.draw_chrome_text(&mut text_renderer, &mut composite_buffer, win_w, win_h);
+
+        // Draw Scrollbar (track and thumb)
+        if let Some((track_x, track_y, track_w, track_h, thumb_x, thumb_y, thumb_w, thumb_h, _)) =
+            self.get_scrollbar_metrics(win_w, win_h)
+        {
+            // Track background (subtle light gray)
+            crate::render::draw_solid_rect(
+                &mut composite_buffer,
+                win_w,
+                win_h,
+                track_x,
+                track_y,
+                track_w,
+                track_h,
+                [230, 230, 230, 80],
+            );
+
+            // Thumb (rounded pill, styled with hover / drag states)
+            let thumb_color = if self.is_dragging_scrollbar {
+                [70, 70, 70, 230]
+            } else if self.hovered_scrollbar {
+                [100, 100, 100, 200]
+            } else {
+                [140, 140, 140, 160]
+            };
+
+            crate::render::draw_rounded_rect_fill(
+                &mut composite_buffer,
+                win_w,
+                win_h,
+                thumb_x,
+                thumb_y,
+                thumb_w,
+                thumb_h,
+                3.0,
+                thumb_color,
+            );
+        }
 
         // Upload the composite bitmap to GPU
         if let Some(ref mut renderer) = self.renderer {
@@ -590,6 +893,9 @@ impl MistilteinnApp {
         let h = self.window_height() as f32 - ADDRESS_BAR_HEIGHT as f32;
 
         let new_page = crate::page::Page::new(html_source, css_source, w, h);
+        if let Some(tab) = self.tab_manager.active_tab_mut() {
+            tab.title = new_page.title.clone();
+        }
         self.tab_manager.set_active_tab_page(new_page);
         self.recompose();
 
@@ -614,18 +920,40 @@ impl MistilteinnApp {
         }
     }
 
-    /// Load a page from a URL by fetching it over the network.
+    /// Load a page from a URL by fetching it over the network (adds to history).
     pub fn load_url(&mut self, url: &str) {
+        self.load_url_internal(url, true);
+    }
+
+    /// Load a page without adding a new history entry (used for back/forward navigation).
+    pub fn load_url_no_history(&mut self, url: &str) {
+        self.load_url_internal(url, false);
+    }
+
+    /// Internal URL loading logic.
+    fn load_url_internal(&mut self, url: &str, push_history: bool) {
+        let trimmed = url.trim();
+        let full_url = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            trimmed.to_string()
+        } else if trimmed.contains(' ') || !trimmed.contains('.') {
+            format!(
+                "https://www.google.com/search?q={}",
+                trimmed.replace(' ', "+")
+            )
+        } else {
+            format!("https://{}", trimmed)
+        };
+
         let handle = self.tokio_rt.as_ref().map(|rt| rt.handle().clone());
         if let Some(handle) = handle {
-            handle.block_on(self.load_url_async(url));
+            handle.block_on(self.load_url_async(&full_url, push_history));
         } else {
             log::error!("No tokio runtime available for loading URL");
         }
     }
 
     /// Load a page from a URL asynchronously with external CSS fetching.
-    pub async fn load_url_async(&mut self, url: &str) {
+    pub async fn load_url_async(&mut self, url: &str, push_history: bool) {
         // Set loading state and repaint so the indicator appears before the async fetch
         self.tab_manager.set_active_tab_loading(true);
         self.recompose();
@@ -638,6 +966,138 @@ impl MistilteinnApp {
             Ok(r) => r,
             Err(e) => {
                 log::error!("Failed to fetch {}: {:?}", url, e);
+                let err_str = format!("{:?}", e);
+                let (err_code, reason) =
+                    if err_str.contains("TimedOut") || err_str.contains("Timeout") {
+                        ("ERR_CONNECTION_TIMED_OUT", "からの応答時間が長すぎます。")
+                    } else if err_str.contains("Connect") || err_str.contains("dns") {
+                        (
+                            "ERR_NAME_NOT_RESOLVED",
+                            "のサーバーの IP アドレスが見つかりませんでした。",
+                        )
+                    } else {
+                        ("ERR_CONNECTION_FAILED", "への接続中に問題が発生しました。")
+                    };
+
+                let host = url
+                    .strip_prefix("https://")
+                    .or_else(|| url.strip_prefix("http://"))
+                    .unwrap_or(url)
+                    .split('/')
+                    .next()
+                    .unwrap_or(url);
+
+                let search_query = host.replace('.', " ");
+                let search_url = format!("https://www.google.com/search?q={}", search_query);
+
+                let error_html = format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>このサイトにアクセスできません</title>
+<style>
+  body {{
+    background-color: #202124;
+    color: #e8eaed;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    margin: 0;
+    padding: 80px 48px;
+    line-height: 1.6;
+  }}
+  .container {{
+    max-width: 600px;
+    margin: 0 auto;
+  }}
+  .icon {{
+    font-size: 56px;
+    margin-bottom: 24px;
+    color: #9aa0a6;
+  }}
+  h1 {{
+    font-size: 24px;
+    font-weight: 500;
+    margin: 0 0 16px 0;
+    color: #e8eaed;
+  }}
+  p {{
+    font-size: 15px;
+    color: #9aa0a6;
+    margin: 0 0 16px 0;
+  }}
+  .host {{
+    color: #e8eaed;
+    font-weight: 600;
+  }}
+  ul {{
+    margin: 8px 0 24px 20px;
+    padding: 0;
+    color: #9aa0a6;
+    font-size: 14px;
+  }}
+  li {{
+    margin-bottom: 6px;
+  }}
+  .error-code {{
+    font-family: monospace;
+    font-size: 12px;
+    color: #5f6368;
+    margin-top: 24px;
+    margin-bottom: 32px;
+  }}
+  .btn-wrap {{
+    margin-top: 32px;
+  }}
+  .btn {{
+    display: inline-block;
+    padding: 8px 24px;
+    font-size: 14px;
+    font-weight: 500;
+    text-decoration: none;
+    border-radius: 100px;
+    background-color: #8ab4f8;
+    color: #202124;
+    text-align: center;
+    margin-right: 12px;
+  }}
+  .btn-search {{
+    display: inline-block;
+    padding: 7px 23px;
+    font-size: 14px;
+    font-weight: 500;
+    text-decoration: none;
+    border-radius: 100px;
+    background-color: transparent;
+    color: #8ab4f8;
+    border: 1px solid #5f6368;
+    text-align: center;
+  }}
+</style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">📄</div>
+    <h1>このサイトにアクセスできません</h1>
+    <p><span class="host">{}</span> {}</p>
+    <p>次をお試しください</p>
+    <ul>
+      <li>接続を確認する</li>
+      <li>URL の綴りを確認する</li>
+      <li>検索エンジンで正しいアドレスを調べる</li>
+    </ul>
+    <div class="error-code">{}</div>
+    <div class="btn-wrap">
+      <a href="{}" class="btn">再読み込み</a>
+      <a href="{}" class="btn-search">Google で検索</a>
+    </div>
+  </div>
+</body>
+</html>"#,
+                    host, reason, err_code, url, search_url
+                );
+                let error_css = "body { margin: 0; padding: 60px 48px; background-color: #202124; color: #e8eaed; }";
+                self.load_page_async(&error_html, error_css, Some(url))
+                    .await;
                 self.tab_manager.set_active_tab_loading(false);
                 return;
             }
@@ -651,9 +1111,11 @@ impl MistilteinnApp {
             log::info!("Redirected: {} -> {}", url, final_url);
         }
 
-        // Push resolved URL to history
+        // Update tab URL and history
         if let Some(tab) = self.tab_manager.active_tab_mut() {
-            tab.push_history(&final_url);
+            if push_history {
+                tab.push_history(&final_url);
+            }
             tab.url = final_url.clone();
         }
 
@@ -691,40 +1153,53 @@ impl MistilteinnApp {
         if let Some(url) = &base_url {
             new_page.page_url = url.to_string();
         }
-        
+
         let image_nodes = crate::layout::collect_image_nodes(&new_page.layout_root);
-        let resolved_srcs: Vec<String> = image_nodes
+        let resolved_images: Vec<(String, f32, f32)> = image_nodes
             .iter()
             .map(|img| {
-                if let Some(base) = base_url {
+                let resolved = if let Some(base) = base_url {
                     crate::network::resolve_url(base, &img.src)
                 } else {
                     img.src.clone()
-                }
+                };
+                (resolved, img.width, img.height)
             })
             .collect();
 
-        // Fetch all images concurrently
-        let fetch_futures = resolved_srcs.iter().map(|src| {
-            let src_clone = src.clone();
-            async move {
-                match crate::network::fetch_image(&src_clone).await {
+        // Fetch all images concurrently with throttling
+        use futures::StreamExt;
+        let results = futures::stream::iter(resolved_images.into_iter().map(
+            |(src, req_w, req_h)| async move {
+                match crate::network::fetch_image(&src).await {
                     Ok(bytes) => {
                         if let Ok(img) = image::load_from_memory(&bytes) {
                             let rgba = img.to_rgba8();
                             let (iw, ih) = rgba.dimensions();
-                            log::info!("Decoded image: {} ({}x{})", src_clone, iw, ih);
-                            Some((src_clone, rgba.into_raw(), iw, ih))
+                            log::info!("Decoded image: {} ({}x{})", src, iw, ih);
+                            Some((src, rgba.into_raw(), iw, ih))
+                        } else if let Ok(svg_str) = std::str::from_utf8(&bytes) {
+                            if let Some((rgba, iw, ih)) =
+                                crate::render::render_svg_to_rgba(svg_str, req_w, req_h)
+                            {
+                                log::info!("Rendered SVG: {} ({}x{})", src, iw, ih);
+                                Some((src, rgba, iw, ih))
+                            } else {
+                                log::warn!("Failed to render SVG: {}", src);
+                                None
+                            }
                         } else {
                             None
                         }
                     }
                     Err(_) => None,
                 }
-            }
-        });
-        
-        let results = futures::future::join_all(fetch_futures).await;
+            },
+        ))
+        .buffer_unordered(6)
+        .collect::<Vec<_>>()
+        .await;
+
         for result in results.into_iter().flatten() {
             let (src, rgba, width, height) = result;
             new_page.image_cache.insert(
@@ -737,9 +1212,12 @@ impl MistilteinnApp {
             );
         }
 
+        if let Some(tab) = self.tab_manager.active_tab_mut() {
+            tab.title = new_page.title.clone();
+        }
         self.tab_manager.set_active_tab_page(new_page);
         self.recompose();
-        
+
         if let Some(ref mut renderer) = self.renderer {
             if let Err(e) = renderer.render() {
                 log::error!("Render after load_page_async failed: {:?}", e);
@@ -747,7 +1225,7 @@ impl MistilteinnApp {
                 log::info!("Page loaded (async) and rendered");
             }
         }
-        
+
         // Memory profiling (only when memprof feature is enabled)
         #[cfg(feature = "memprof")]
         {
@@ -776,7 +1254,204 @@ impl MistilteinnApp {
             .map(|r| r.window().inner_size().height)
             .unwrap_or(800)
     }
+}
 
+/// Recursively searches for an element with the given `id` or `name` in the layout tree and returns its Y position.
+fn find_element_y_by_id(
+    node: &crate::layout::LayoutNode,
+    arena: &crate::html::DomArena,
+    target_id: &str,
+) -> Option<f32> {
+    if let Some(dom_id) = node.dom_node_id {
+        if let Some(dom_node) = arena.get(crate::html::DomHandle(crate::html::NodeId::from_raw(
+            dom_id,
+        ))) {
+            if dom_node.get_attribute("id") == Some(target_id)
+                || dom_node.get_attribute("name") == Some(target_id)
+            {
+                return Some(node.rect.y);
+            }
+        }
+    }
+    for child in &node.children {
+        if let Some(y) = find_element_y_by_id(child, arena, target_id) {
+            return Some(y);
+        }
+    }
+    None
+}
+
+/// Searches from a starting DOM node up through its ancestors or down through its descendants
+/// to find the closest `<input>` / `<textarea>` or `<a href="...">`.
+fn find_link_or_input_at_dom_id(
+    arena: &crate::html::DomArena,
+    dom_id: u32,
+) -> (Option<u32>, Option<String>) {
+    let mut curr = Some(crate::html::NodeId::from_raw(dom_id));
+    let mut clicked_input = None;
+    let mut clicked_href = None;
+
+    while let Some(nid) = curr {
+        if let Some(node) = arena.get(crate::html::DomHandle(nid)) {
+            let tag = node
+                .tag_name()
+                .map(|t| t.to_string())
+                .unwrap_or_default()
+                .to_lowercase();
+            if tag == "input" || tag == "textarea" {
+                if clicked_input.is_none() {
+                    clicked_input = Some(nid.index() as u32);
+                }
+            }
+            if tag == "a" {
+                if clicked_href.is_none() {
+                    if let Some(href) = node.get_attribute("href") {
+                        if !href.trim().is_empty() {
+                            clicked_href = Some(href.to_string());
+                        }
+                    }
+                }
+            }
+            if clicked_input.is_some() || clicked_href.is_some() {
+                break;
+            }
+            // If we are at a form or container, check its descendants for an input/textarea
+            if (tag == "form" || tag == "div" || tag == "center") && clicked_input.is_none() {
+                if let Some(desc_inp) = find_first_input_in_subtree(arena, nid) {
+                    clicked_input = Some(desc_inp);
+                }
+            }
+            curr = node.parent;
+        } else {
+            break;
+        }
+    }
+    (clicked_input, clicked_href)
+}
+
+/// Recursively finds the first `<input>` or `<textarea>` in a DOM subtree.
+fn find_first_input_in_subtree(
+    arena: &crate::html::DomArena,
+    root: crate::html::NodeId,
+) -> Option<u32> {
+    if let Some(node) = arena.get(crate::html::DomHandle(root)) {
+        let tag = node
+            .tag_name()
+            .map(|t| t.to_string())
+            .unwrap_or_default()
+            .to_lowercase();
+        if tag == "input" || tag == "textarea" {
+            let input_type = node
+                .get_attribute("type")
+                .unwrap_or_default()
+                .to_lowercase();
+            if input_type != "hidden" && input_type != "submit" && input_type != "button" {
+                return Some(root.index() as u32);
+            }
+        }
+        for &child in &node.children {
+            if let Some(found) = find_first_input_in_subtree(arena, child) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Searches the layout tree for the topmost interactive input/textarea containing or nearest to (x, y).
+fn find_input_layout_at_pos(node: &crate::layout::LayoutNode, x: f32, y: f32) -> Option<u32> {
+    if node.rect.contains(x, y) {
+        if node.interaction_type == crate::layout::InteractionType::Input {
+            if let Some(id) = node.dom_node_id {
+                return Some(id);
+            }
+        }
+        for child in node.children.iter().rev() {
+            if let Some(id) = find_input_layout_at_pos(child, x, y) {
+                return Some(id);
+            }
+        }
+        for abs_child in node.absolute_children.iter().rev() {
+            if let Some(id) = find_input_layout_at_pos(abs_child, x, y) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Recursively searches for the layout rect of a given DOM node ID.
+fn find_layout_rect_by_dom_id(
+    node: &crate::layout::LayoutNode,
+    dom_id: u32,
+) -> Option<crate::layout::Rect> {
+    if node.dom_node_id == Some(dom_id) {
+        return Some(node.rect);
+    }
+    for child in &node.children {
+        if let Some(r) = find_layout_rect_by_dom_id(child, dom_id) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// Constructs the appropriate search/form submit URL given a form input and query string.
+fn get_form_submit_url(page: &crate::page::Page, input_dom_id: u32, query_val: &str) -> String {
+    let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(input_dom_id));
+    let mut param_name = "search".to_string();
+    let mut form_action = String::new();
+
+    if let Some(input_node) = page.arena.get(handle) {
+        if let Some(name) = input_node.get_attribute("name") {
+            if !name.is_empty() {
+                param_name = name.to_string();
+            }
+        }
+
+        // Traverse ancestors to find <form>
+        let mut curr_id = input_node.parent;
+        while let Some(pid) = curr_id {
+            if let Some(pnode) = page.arena.get(crate::html::DomHandle(pid)) {
+                let tag = pnode
+                    .tag_name()
+                    .map(|t| t.to_string())
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if tag == "form" {
+                    if let Some(action) = pnode.get_attribute("action") {
+                        form_action = action.to_string();
+                    }
+                    break;
+                }
+                curr_id = pnode.parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    if form_action.is_empty() {
+        if page.page_url.contains("wikipedia.org") {
+            format!(
+                "https://ja.wikipedia.org/wiki/Special:Search?search={}",
+                query_val
+            )
+        } else {
+            format!("https://www.google.com/search?q={}", query_val)
+        }
+    } else {
+        let base_resolved = crate::network::resolve_url(&page.page_url, &form_action);
+        let delimiter = if base_resolved.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
+        format!("{}{}{}={}", base_resolved, delimiter, param_name, query_val)
+    }
+}
+
+impl MistilteinnApp {
     /// Pushes rectangle(s) for a single tab button into the rects/colors vectors.
     fn push_tab_button_rects(
         rects: &mut Vec<RectClip>,
@@ -829,23 +1504,108 @@ impl MistilteinnApp {
         }
     }
 
-    /// Hit-test the chrome area (tab bar and address bar).
+    /// Get current inner window size or fallback.
+    fn window_size(&self) -> (u32, u32) {
+        self.renderer
+            .as_ref()
+            .map(|r| {
+                (
+                    r.window().inner_size().width,
+                    r.window().inner_size().height,
+                )
+            })
+            .unwrap_or((1280, 800))
+    }
+
+    /// Calculate scrollbar layout metrics:
+    /// Returns `(track_x, track_y, track_w, track_h, thumb_x, thumb_y, thumb_w, thumb_h, max_scroll)` if scrollable.
+    fn get_scrollbar_metrics(
+        &self,
+        win_w: u32,
+        win_h: u32,
+    ) -> Option<(f32, f32, f32, f32, f32, f32, f32, f32, f32)> {
+        let page = self.tab_manager.get_active_tab_page()?;
+        let content_h = page.layout_root.rect.height;
+        let viewport_h = (win_h as f32 - ADDRESS_BAR_HEIGHT as f32).max(1.0);
+
+        if content_h <= viewport_h {
+            return None;
+        }
+
+        let scroll_y = self
+            .tab_manager
+            .get_active_tab_scroll()
+            .map(|s| s.1)
+            .unwrap_or(0.0);
+        let max_scroll = (content_h - viewport_h).max(0.0);
+        let thumb_h = (viewport_h / content_h * viewport_h)
+            .max(SCROLLBAR_MIN_THUMB_HEIGHT)
+            .min(viewport_h);
+        let track_w = SCROLLBAR_WIDTH;
+        let track_x = win_w as f32 - track_w;
+        let track_y = ADDRESS_BAR_HEIGHT as f32;
+        let track_h = viewport_h;
+
+        let thumb_travel = (track_h - thumb_h).max(1.0);
+        let thumb_y = track_y
+            + if max_scroll > 0.0 {
+                (scroll_y / max_scroll * thumb_travel).clamp(0.0, thumb_travel)
+            } else {
+                0.0
+            };
+
+        let thumb_w = track_w - 4.0;
+        let thumb_x = track_x + 2.0;
+
+        Some((
+            track_x, track_y, track_w, track_h, thumb_x, thumb_y, thumb_w, thumb_h, max_scroll,
+        ))
+    }
+
+    /// Hit-test the chrome area (tab bar, address bar, scrollbar).
     fn hit_test_chrome(&self, x: f32, y: f32) -> HitTestResult {
+        // Check Scrollbar area (right edge)
+        let (win_w, win_h) = self.window_size();
+        if let Some((
+            track_x,
+            track_y,
+            track_w,
+            track_h,
+            _thumb_x,
+            thumb_y,
+            _thumb_w,
+            thumb_h,
+            _max_scroll,
+        )) = self.get_scrollbar_metrics(win_w, win_h)
+        {
+            if x >= track_x && x <= track_x + track_w && y >= track_y && y <= track_y + track_h {
+                if y >= thumb_y && y <= thumb_y + thumb_h {
+                    return HitTestResult::ScrollbarThumb;
+                } else {
+                    return HitTestResult::ScrollbarTrack;
+                }
+            }
+        }
+
         // Check Address bar area (top)
         if y < ADDRESS_BAR_HEIGHT as f32 {
             if x >= TAB_BAR_WIDTH as f32 {
-                let nav_w = 40.0;
                 let mut curr_x = TAB_BAR_WIDTH as f32;
                 // Back button
-                if x >= curr_x && x < curr_x + nav_w {
+                if x >= curr_x && x < curr_x + NAV_BUTTON_WIDTH {
                     return HitTestResult::BackButton;
                 }
-                curr_x += nav_w;
+                curr_x += NAV_BUTTON_WIDTH;
                 // Forward button
-                if x >= curr_x && x < curr_x + nav_w {
+                if x >= curr_x && x < curr_x + NAV_BUTTON_WIDTH {
                     return HitTestResult::ForwardButton;
                 }
-                curr_x += nav_w;
+                curr_x += NAV_BUTTON_WIDTH;
+                // Reload button
+                if x >= curr_x && x < curr_x + NAV_BUTTON_WIDTH {
+                    return HitTestResult::ReloadButton;
+                }
+                curr_x += NAV_BUTTON_WIDTH;
                 // Address bar input box
                 if x >= curr_x {
                     return HitTestResult::AddressBar;
@@ -856,6 +1616,15 @@ impl MistilteinnApp {
         // Check Tab bar area (left)
         if x > TAB_BAR_WIDTH as f32 {
             return HitTestResult::Empty;
+        }
+
+        // Check + New Tab button at top
+        if x >= TAB_BUTTON_X
+            && x <= (TAB_BAR_WIDTH as f32 - TAB_BUTTON_RIGHT_MARGIN)
+            && y >= 6.0
+            && y <= 6.0 + NEW_TAB_BUTTON_HEIGHT
+        {
+            return HitTestResult::NewTabButton;
         }
 
         let mut button_y = ADDRESS_BAR_HEIGHT as f32 + TAB_BUTTON_SPACING;
@@ -881,6 +1650,14 @@ impl MistilteinnApp {
                             && y >= button_y
                             && y <= button_y + TAB_BUTTON_HEIGHT
                         {
+                            // Check if click is on the '×' close button
+                            if x >= TAB_BAR_WIDTH as f32
+                                - TAB_BUTTON_RIGHT_MARGIN
+                                - CLOSE_BUTTON_SIZE
+                                - 4.0
+                            {
+                                return HitTestResult::CloseTabButton(tab.id);
+                            }
                             return HitTestResult::TabButton(tab.id);
                         }
                         button_y += TAB_BUTTON_HEIGHT + TAB_BUTTON_SPACING;
@@ -899,6 +1676,11 @@ impl MistilteinnApp {
                     && y >= button_y
                     && y <= button_y + TAB_BUTTON_HEIGHT
                 {
+                    // Check if click is on the '×' close button
+                    if x >= TAB_BAR_WIDTH as f32 - TAB_BUTTON_RIGHT_MARGIN - CLOSE_BUTTON_SIZE - 4.0
+                    {
+                        return HitTestResult::CloseTabButton(tab.id);
+                    }
                     return HitTestResult::TabButton(tab.id);
                 }
                 button_y += TAB_BUTTON_HEIGHT + TAB_BUTTON_SPACING;
@@ -935,6 +1717,50 @@ impl MistilteinnApp {
                 color
             );
             self.recompose();
+        }
+    }
+
+    /// Creates a new blank tab, activates it, and focuses the address bar.
+    pub fn create_new_tab(&mut self) -> crate::browser::tab::TabId {
+        let id = self.tab_manager.create_tab();
+        self.tab_manager.activate_tab(id);
+        self.address_input.clear();
+        self.address_cursor = 0;
+        self.is_address_focused = true;
+        self.focused_page_input = None;
+        self.recompose();
+        log::info!("Created and activated new tab {:?}", id);
+        id
+    }
+
+    /// Closes a specified tab and updates active tab state.
+    pub fn close_tab(&mut self, tab_id: crate::browser::tab::TabId) {
+        self.group_manager.remove_tab_from_any_group(tab_id);
+        self.tab_manager.close_tab(tab_id);
+        if self.tab_manager.active_tab_id().is_none() {
+            let new_id = self.tab_manager.create_tab();
+            self.tab_manager.activate_tab(new_id);
+        }
+        if let Some(tab) = self.tab_manager.active_tab() {
+            self.address_input = tab.url.clone();
+        } else {
+            self.address_input.clear();
+        }
+        self.address_cursor = self.address_input.len();
+        self.is_address_focused = false;
+        self.focused_page_input = None;
+        self.recompose();
+        log::info!("Closed tab {:?}", tab_id);
+    }
+
+    /// Reloads the currently active tab if it has a valid URL.
+    pub fn reload_active_tab(&mut self) {
+        if let Some(tab) = self.tab_manager.active_tab() {
+            let url = tab.url.clone();
+            if !url.is_empty() {
+                log::info!("Reloading tab {:?}", tab.id);
+                self.load_url_no_history(&url);
+            }
         }
     }
 
@@ -977,7 +1803,7 @@ impl ApplicationHandler for MistilteinnApp {
             let mut window_attributes = WindowAttributes::default()
                 .with_title(format!("Mistilteinn v{}", env!("CARGO_PKG_VERSION")))
                 .with_inner_size(winit::dpi::PhysicalSize::new(1280, 800));
-            
+
             if let Some(icon) = icon {
                 window_attributes = window_attributes.with_window_icon(Some(icon));
             }
@@ -1069,13 +1895,19 @@ impl ApplicationHandler for MistilteinnApp {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let (win_w, win_h) = self.window_size();
+                let max_scroll = self
+                    .get_scrollbar_metrics(win_w, win_h)
+                    .map(|m| m.8)
+                    .unwrap_or(0.0);
+
                 if let Some(scroll) = self.tab_manager.get_active_tab_scroll_mut() {
                     match delta {
                         winit::event::MouseScrollDelta::LineDelta(_dx, dy) => {
-                            *scroll = (scroll.0, (scroll.1 + (dy * 30.0)).max(0.0));
+                            *scroll = (scroll.0, (scroll.1 - (dy * 40.0)).clamp(0.0, max_scroll));
                         }
                         winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                            *scroll = (scroll.0, (scroll.1 + pos.y as f32).max(0.0));
+                            *scroll = (scroll.0, (scroll.1 - pos.y as f32).clamp(0.0, max_scroll));
                         }
                     }
                 }
@@ -1091,6 +1923,47 @@ impl ApplicationHandler for MistilteinnApp {
                     MouseButton::Left => {
                         if state == ElementState::Pressed {
                             match self.hit_test_chrome(cx, cy) {
+                                HitTestResult::ScrollbarThumb => {
+                                    self.is_address_focused = false;
+                                    self.is_dragging_scrollbar = true;
+                                    self.scrollbar_drag_start_y = cy;
+                                    self.scrollbar_drag_start_scroll_y = self
+                                        .tab_manager
+                                        .get_active_tab_scroll()
+                                        .map(|s| s.1)
+                                        .unwrap_or(0.0);
+                                    self.recompose();
+                                }
+                                HitTestResult::ScrollbarTrack => {
+                                    self.is_address_focused = false;
+                                    let (win_w, win_h) = self.window_size();
+                                    if let Some((
+                                        _tx,
+                                        track_y,
+                                        _tw,
+                                        track_h,
+                                        _thumb_x,
+                                        _thumb_y,
+                                        _thumb_w,
+                                        thumb_h,
+                                        max_scroll,
+                                    )) = self.get_scrollbar_metrics(win_w, win_h)
+                                    {
+                                        let thumb_travel = (track_h - thumb_h).max(1.0);
+                                        let click_offset =
+                                            (cy - track_y - thumb_h * 0.5).clamp(0.0, thumb_travel);
+                                        let new_scroll = (click_offset / thumb_travel) * max_scroll;
+                                        if let Some(scroll) =
+                                            self.tab_manager.get_active_tab_scroll_mut()
+                                        {
+                                            scroll.1 = new_scroll.clamp(0.0, max_scroll);
+                                        }
+                                        self.is_dragging_scrollbar = true;
+                                        self.scrollbar_drag_start_y = cy;
+                                        self.scrollbar_drag_start_scroll_y = new_scroll;
+                                        self.recompose();
+                                    }
+                                }
                                 HitTestResult::GroupHeader(group_id) => {
                                     if let Some(is_now_collapsed) =
                                         self.group_manager.toggle_collapse(group_id)
@@ -1107,8 +1980,23 @@ impl ApplicationHandler for MistilteinnApp {
                                         return;
                                     }
                                 }
+                                HitTestResult::NewTabButton => {
+                                    self.create_new_tab();
+                                }
+                                HitTestResult::CloseTabButton(tab_id) => {
+                                    self.close_tab(tab_id);
+                                }
+                                HitTestResult::ReloadButton => {
+                                    self.is_address_focused = false;
+                                    self.reload_active_tab();
+                                }
                                 HitTestResult::TabButton(tab_id) => {
                                     self.tab_manager.activate_tab(tab_id);
+                                    if let Some(tab) = self.tab_manager.active_tab() {
+                                        self.address_input = tab.url.clone();
+                                    }
+                                    self.address_cursor = self.address_input.len();
+                                    self.is_address_focused = false;
                                     self.recompose();
                                     log::info!("Activated tab {:?}", tab_id);
                                 }
@@ -1122,7 +2010,8 @@ impl ApplicationHandler for MistilteinnApp {
                                     if let Some(tab) = self.tab_manager.active_tab_mut() {
                                         if let Some(url) = tab.go_back() {
                                             let url_clone = url.clone();
-                                            self.load_url(&url_clone);
+                                            self.address_input = url_clone.clone();
+                                            self.load_url_no_history(&url_clone);
                                         }
                                     }
                                     self.recompose();
@@ -1132,7 +2021,8 @@ impl ApplicationHandler for MistilteinnApp {
                                     if let Some(tab) = self.tab_manager.active_tab_mut() {
                                         if let Some(url) = tab.go_forward() {
                                             let url_clone = url.clone();
-                                            self.load_url(&url_clone);
+                                            self.address_input = url_clone.clone();
+                                            self.load_url_no_history(&url_clone);
                                         }
                                     }
                                     self.recompose();
@@ -1140,9 +2030,126 @@ impl ApplicationHandler for MistilteinnApp {
                                 HitTestResult::Empty => {
                                     if self.is_address_focused {
                                         self.is_address_focused = false;
-                                        self.recompose();
                                     }
+
+                                    // Check page content area for input focus or link click
+                                    if self.is_in_content_area(cx, cy) {
+                                        let mut link_to_navigate: Option<String> = None;
+                                        let mut anchor_jump_target: Option<String> = None;
+
+                                        if let Some(tab) = self.tab_manager.active_tab_mut() {
+                                            if let Some(ref mut page) = tab.page {
+                                                let scroll_offset = tab.scroll_offset;
+                                                let content_x =
+                                                    cx - TAB_BAR_WIDTH as f32 + scroll_offset.0;
+                                                let content_y = cy - ADDRESS_BAR_HEIGHT as f32
+                                                    + scroll_offset.1;
+
+                                                let dom_path = crate::layout::hit_test_dom_path(
+                                                    &page.layout_root,
+                                                    content_x,
+                                                    content_y,
+                                                );
+
+                                                let mut clicked_input = None;
+                                                let mut clicked_href: Option<String> = None;
+
+                                                for &node_id in dom_path.iter().rev() {
+                                                    let (inp, href) = find_link_or_input_at_dom_id(
+                                                        &page.arena,
+                                                        node_id,
+                                                    );
+                                                    if clicked_input.is_none() && inp.is_some() {
+                                                        clicked_input = inp;
+                                                    }
+                                                    if clicked_href.is_none() && href.is_some() {
+                                                        clicked_href = href;
+                                                    }
+                                                    if clicked_input.is_some()
+                                                        || clicked_href.is_some()
+                                                    {
+                                                        break;
+                                                    }
+                                                }
+                                                if clicked_input.is_none() {
+                                                    clicked_input = find_input_layout_at_pos(
+                                                        &page.layout_root,
+                                                        content_x,
+                                                        content_y,
+                                                    );
+                                                }
+                                                self.focused_page_input = clicked_input;
+
+                                                if let Some(href) = clicked_href {
+                                                    let href_trimmed = href.trim();
+                                                    if href_trimmed.starts_with('#') {
+                                                        let target_id =
+                                                            href_trimmed.trim_start_matches('#');
+                                                        if !target_id.is_empty() {
+                                                            anchor_jump_target =
+                                                                Some(target_id.to_string());
+                                                        }
+                                                    } else if !href_trimmed.is_empty() {
+                                                        let current_url = &page.page_url;
+                                                        let resolved = crate::network::resolve_url(
+                                                            current_url,
+                                                            href_trimmed,
+                                                        );
+                                                        link_to_navigate = Some(resolved);
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Execute in-page anchor jump or URL navigation
+                                        if let Some(target_id) = anchor_jump_target {
+                                            let target_y = self
+                                                .tab_manager
+                                                .get_active_tab_page()
+                                                .and_then(|page| {
+                                                    find_element_y_by_id(
+                                                        &page.layout_root,
+                                                        &page.arena,
+                                                        &target_id,
+                                                    )
+                                                });
+
+                                            if let Some(target_y) = target_y {
+                                                let (win_w, win_h) = self.window_size();
+                                                let max_scroll = self
+                                                    .get_scrollbar_metrics(win_w, win_h)
+                                                    .map(|m| m.8)
+                                                    .unwrap_or(0.0);
+                                                if let Some(tab) = self.tab_manager.active_tab_mut()
+                                                {
+                                                    tab.scroll_offset.1 =
+                                                        target_y.clamp(0.0, max_scroll);
+                                                    log::info!(
+                                                        "Jumped to anchor #{}: y={}",
+                                                        target_id,
+                                                        tab.scroll_offset.1
+                                                    );
+                                                }
+                                            }
+                                        } else if let Some(target_url) = link_to_navigate {
+                                            log::info!(
+                                                "Clicked link, navigating to: {}",
+                                                target_url
+                                            );
+                                            self.address_input = target_url.clone();
+                                            self.load_url(&target_url);
+                                            return;
+                                        }
+                                    } else {
+                                        self.focused_page_input = None;
+                                    }
+                                    self.recompose();
                                 }
+                            }
+                        } else if state == ElementState::Released {
+                            if self.is_dragging_scrollbar {
+                                self.is_dragging_scrollbar = false;
+                                self.recompose();
                             }
                         }
                     }
@@ -1177,6 +2184,35 @@ impl ApplicationHandler for MistilteinnApp {
                 let cy = position.y as f32;
                 self.cursor_pos = (cx, cy);
 
+                // Handle scrollbar dragging
+                if self.is_dragging_scrollbar {
+                    let (win_w, win_h) = self.window_size();
+                    if let Some((
+                        _tx,
+                        _ty,
+                        _tw,
+                        track_h,
+                        _thumb_x,
+                        _thumb_y,
+                        _thumb_w,
+                        thumb_h,
+                        max_scroll,
+                    )) = self.get_scrollbar_metrics(win_w, win_h)
+                    {
+                        let delta_y = cy - self.scrollbar_drag_start_y;
+                        let thumb_travel = (track_h - thumb_h).max(1.0);
+                        let new_scroll = self.scrollbar_drag_start_scroll_y
+                            + (delta_y / thumb_travel) * max_scroll;
+                        if let Some(scroll) = self.tab_manager.get_active_tab_scroll_mut() {
+                            scroll.1 = new_scroll.clamp(0.0, max_scroll);
+                        }
+                        self.recompose();
+                        if let Some(ref renderer) = self.renderer {
+                            renderer.window().request_redraw();
+                        }
+                    }
+                }
+
                 // Hit-test tab bar for hover highlight
                 let new_hovered_tab = if cx < TAB_BAR_WIDTH as f32 && cy > 0.0 {
                     match self.hit_test_chrome(cx, cy) {
@@ -1195,7 +2231,23 @@ impl ApplicationHandler for MistilteinnApp {
                 let addr_changed = self.hovered_address_bar != new_hovered_addr;
                 self.hovered_address_bar = new_hovered_addr;
 
-                if tab_changed || addr_changed {
+                // Hit-test scrollbar for hover highlight
+                let (win_w, win_h) = self.window_size();
+                let is_over_scrollbar =
+                    if let Some((track_x, track_y, track_w, track_h, _, _, _, _, _)) =
+                        self.get_scrollbar_metrics(win_w, win_h)
+                    {
+                        cx >= track_x
+                            && cx <= track_x + track_w
+                            && cy >= track_y
+                            && cy <= track_y + track_h
+                    } else {
+                        false
+                    };
+                let scrollbar_hover_changed = self.hovered_scrollbar != is_over_scrollbar;
+                self.hovered_scrollbar = is_over_scrollbar;
+
+                if tab_changed || addr_changed || scrollbar_hover_changed {
                     self.recompose();
                     if let Some(ref renderer) = self.renderer {
                         renderer.window().request_redraw();
@@ -1214,7 +2266,7 @@ impl ApplicationHandler for MistilteinnApp {
                         let content_x = cx - TAB_BAR_WIDTH as f32 + scroll_offset.0;
                         let content_y = cy - ADDRESS_BAR_HEIGHT as f32 + scroll_offset.1;
 
-                        let cursor_kind = crate::layout::hit_test_interactive(
+                        let mut cursor_kind = crate::layout::hit_test_interactive(
                             &page.layout_root,
                             content_x,
                             content_y,
@@ -1232,6 +2284,21 @@ impl ApplicationHandler for MistilteinnApp {
                             content_x,
                             content_y,
                         );
+
+                        if cursor_kind == CursorKind::Default {
+                            for &node_id in dom_path.iter().rev() {
+                                let (inp, href) =
+                                    find_link_or_input_at_dom_id(&page.arena, node_id);
+                                if inp.is_some() {
+                                    cursor_kind = CursorKind::IBeam;
+                                    break;
+                                }
+                                if href.is_some() {
+                                    cursor_kind = CursorKind::Pointer;
+                                    break;
+                                }
+                            }
+                        }
 
                         (Some(cursor_kind), Some(dom_path))
                     } else {
@@ -1302,17 +2369,44 @@ impl ApplicationHandler for MistilteinnApp {
                     self.ctrl_pressed = event.state == ElementState::Pressed;
                     return;
                 }
-                
+
                 if event.state == ElementState::Pressed {
                     if self.ctrl_pressed {
                         match event.physical_key {
+                            PhysicalKey::Code(KeyCode::KeyT) => {
+                                // Ctrl+T: New Tab
+                                self.create_new_tab();
+                            }
+                            PhysicalKey::Code(KeyCode::KeyW) => {
+                                // Ctrl+W: Close active Tab
+                                if let Some(active_id) = self.tab_manager.active_tab_id() {
+                                    self.close_tab(active_id);
+                                }
+                            }
+                            PhysicalKey::Code(KeyCode::KeyR) => {
+                                // Ctrl+R: Reload active Tab
+                                self.reload_active_tab();
+                            }
+                            PhysicalKey::Code(KeyCode::KeyL) => {
+                                // Ctrl+L: Focus address bar
+                                self.is_address_focused = true;
+                                self.address_cursor = self.address_input.len();
+                                self.focused_page_input = None;
+                                self.recompose();
+                            }
                             PhysicalKey::Code(KeyCode::Tab) => {
                                 // Ctrl+Tab: switch to next tab
-                                let tabs: Vec<_> = self.tab_manager.all_tabs().map(|t| t.id).collect();
+                                let tabs: Vec<_> =
+                                    self.tab_manager.all_tabs().map(|t| t.id).collect();
                                 if let Some(current) = self.tab_manager.active_tab_id() {
-                                    let idx = tabs.iter().position(|&id| id == current).unwrap_or(0);
+                                    let idx =
+                                        tabs.iter().position(|&id| id == current).unwrap_or(0);
                                     let next_idx = (idx + 1) % tabs.len();
                                     self.tab_manager.activate_tab(tabs[next_idx]);
+                                    if let Some(tab) = self.tab_manager.active_tab() {
+                                        self.address_input = tab.url.clone();
+                                    }
+                                    self.address_cursor = self.address_input.len();
                                     self.recompose();
                                     log::info!("Switched to tab {:?}", tabs[next_idx]);
                                 }
@@ -1321,8 +2415,28 @@ impl ApplicationHandler for MistilteinnApp {
                                 // Ctrl+G: create group for active tab
                                 self.create_group_for_active_tab();
                             }
+                            PhysicalKey::Code(KeyCode::KeyV) => {
+                                // Ctrl+V: paste into address bar
+                                if self.is_address_focused {
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        if let Ok(text) = clipboard.get_text() {
+                                            let cleaned_text = text.trim();
+                                            self.address_input
+                                                .insert_str(self.address_cursor, cleaned_text);
+                                            self.address_cursor += cleaned_text.len();
+                                            self.recompose();
+                                            if let Some(ref renderer) = self.renderer {
+                                                renderer.window().request_redraw();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
                         }
+                    } else if event.physical_key == PhysicalKey::Code(KeyCode::F5) {
+                        // F5: Reload active tab
+                        self.reload_active_tab();
                     } else if self.is_address_focused {
                         use winit::keyboard::{Key, NamedKey};
                         let mut changed = false;
@@ -1353,7 +2467,7 @@ impl ApplicationHandler for MistilteinnApp {
                                 }
                             }
                             Key::Named(NamedKey::Enter) => {
-                                let url = self.address_input.clone();
+                                let url = self.address_input.trim().to_string();
                                 self.load_url(&url);
                                 self.is_address_focused = false;
                                 changed = true;
@@ -1370,8 +2484,95 @@ impl ApplicationHandler for MistilteinnApp {
                             }
                             _ => {}
                         }
-                        
+
                         if changed {
+                            self.recompose();
+                            if let Some(ref renderer) = self.renderer {
+                                renderer.window().request_redraw();
+                            }
+                        }
+                    } else if let Some(input_node_id) = self.focused_page_input {
+                        use winit::keyboard::{Key, NamedKey};
+                        let mut changed = false;
+                        let mut submit_url = None;
+
+                        if let Some(tab) = self.tab_manager.active_tab_mut() {
+                            if let Some(ref mut page) = tab.page {
+                                let mut cur_val = page
+                                    .arena
+                                    .get_attribute(input_node_id, "value")
+                                    .unwrap_or_default();
+                                match &event.logical_key {
+                                    Key::Named(NamedKey::Backspace) => {
+                                        if !cur_val.is_empty() {
+                                            cur_val.pop();
+                                            page.set_input_value_and_recompute(
+                                                input_node_id,
+                                                &cur_val,
+                                            );
+                                            changed = true;
+                                        }
+                                    }
+                                    Key::Named(NamedKey::Enter) => {
+                                        if !cur_val.trim().is_empty() {
+                                            submit_url = Some(get_form_submit_url(
+                                                page,
+                                                input_node_id,
+                                                cur_val.trim(),
+                                            ));
+                                        }
+                                    }
+                                    Key::Character(c) => {
+                                        for ch in c.chars() {
+                                            if !ch.is_control() {
+                                                cur_val.push(ch);
+                                                changed = true;
+                                            }
+                                        }
+                                        if changed {
+                                            page.set_input_value_and_recompute(
+                                                input_node_id,
+                                                &cur_val,
+                                            );
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        if let Some(url) = submit_url {
+                            log::info!("Submitting page form to: {}", url);
+                            self.address_input = url.clone();
+                            self.load_url(&url);
+                        } else if changed {
+                            self.recompose();
+                            if let Some(ref renderer) = self.renderer {
+                                renderer.window().request_redraw();
+                            }
+                        }
+                    }
+                }
+            }
+            WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
+                if self.is_address_focused {
+                    for ch in text.chars() {
+                        self.address_input.insert(self.address_cursor, ch);
+                        self.address_cursor += ch.len_utf8();
+                    }
+                    self.recompose();
+                    if let Some(ref renderer) = self.renderer {
+                        renderer.window().request_redraw();
+                    }
+                } else if let Some(input_node_id) = self.focused_page_input {
+                    if let Some(tab) = self.tab_manager.active_tab_mut() {
+                        if let Some(ref mut page) = tab.page {
+                            let mut cur_val = page
+                                .arena
+                                .get_attribute(input_node_id, "value")
+                                .unwrap_or_default();
+                            cur_val.push_str(&text);
+                            page.set_input_value_and_recompute(input_node_id, &cur_val);
                             self.recompose();
                             if let Some(ref renderer) = self.renderer {
                                 renderer.window().request_redraw();
@@ -1402,6 +2603,162 @@ pub fn run(start_url: Option<String>) {
         address_input: String::new(),
         is_address_focused: false,
         address_cursor: 0,
+        focused_page_input: None,
+        is_dragging_scrollbar: false,
+        scrollbar_drag_start_y: 0.0,
+        scrollbar_drag_start_scroll_y: 0.0,
+        hovered_scrollbar: false,
     };
     event_loop.run_app(&mut app).expect("Event loop failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scrollbar_metrics_no_page() {
+        let app = MistilteinnApp {
+            renderer: None,
+            start_url: None,
+            tab_manager: crate::browser::tab::TabManager::new(),
+            group_manager: crate::browser::tab_group::GroupManager::new(),
+            tokio_rt: None,
+            cursor_pos: (0.0, 0.0),
+            ctrl_pressed: false,
+            hovered_tab_id: None,
+            hovered_address_bar: false,
+            prev_hovered_dom_id: None,
+            address_input: String::new(),
+            is_address_focused: false,
+            address_cursor: 0,
+            focused_page_input: None,
+            is_dragging_scrollbar: false,
+            scrollbar_drag_start_y: 0.0,
+            scrollbar_drag_start_scroll_y: 0.0,
+            hovered_scrollbar: false,
+        };
+
+        assert!(app.get_scrollbar_metrics(1280, 800).is_none());
+    }
+
+    #[test]
+    fn test_scrollbar_metrics_with_long_page() {
+        let mut app = MistilteinnApp {
+            renderer: None,
+            start_url: None,
+            tab_manager: crate::browser::tab::TabManager::new(),
+            group_manager: crate::browser::tab_group::GroupManager::new(),
+            tokio_rt: None,
+            cursor_pos: (0.0, 0.0),
+            ctrl_pressed: false,
+            hovered_tab_id: None,
+            hovered_address_bar: false,
+            prev_hovered_dom_id: None,
+            address_input: String::new(),
+            is_address_focused: false,
+            address_cursor: 0,
+            focused_page_input: None,
+            is_dragging_scrollbar: false,
+            scrollbar_drag_start_y: 0.0,
+            scrollbar_drag_start_scroll_y: 0.0,
+            hovered_scrollbar: false,
+        };
+
+        let tab_id = app.tab_manager.create_tab();
+        app.tab_manager.activate_tab(tab_id);
+
+        let mut page = crate::page::Page::new(
+            "<html><body><div style='height: 2000px;'>Long Content</div></body></html>",
+            "",
+            1080.0,
+            760.0,
+        );
+        page.layout_root.rect.height = 2000.0;
+        app.tab_manager.set_active_tab_page(page);
+
+        let metrics = app.get_scrollbar_metrics(1280, 800);
+        assert!(
+            metrics.is_some(),
+            "Long page should produce scrollbar metrics"
+        );
+
+        let (track_x, track_y, track_w, track_h, thumb_x, thumb_y, thumb_w, thumb_h, max_scroll) =
+            metrics.unwrap();
+        assert_eq!(track_x, 1280.0 - SCROLLBAR_WIDTH);
+        assert_eq!(track_y, ADDRESS_BAR_HEIGHT as f32);
+        assert_eq!(track_w, SCROLLBAR_WIDTH);
+        assert_eq!(track_h, 800.0 - ADDRESS_BAR_HEIGHT as f32);
+        assert!(thumb_w < track_w);
+        assert_eq!(thumb_x, track_x + 2.0);
+        assert_eq!(thumb_y, track_y);
+        assert!(thumb_h >= SCROLLBAR_MIN_THUMB_HEIGHT);
+        assert_eq!(max_scroll, 2000.0 - (800.0 - ADDRESS_BAR_HEIGHT as f32));
+    }
+
+    #[test]
+    fn test_find_element_y_by_id() {
+        let page = crate::page::Page::new(
+            r#"<html><body>
+                <div id="top" style="height: 100px;">Top</div>
+                <div id="target" style="height: 200px;">Target Section</div>
+              </body></html>"#,
+            "",
+            800.0,
+            600.0,
+        );
+
+        let y = find_element_y_by_id(&page.layout_root, &page.arena, "target");
+        assert!(y.is_some(), "Element with id='target' should be found");
+        assert_eq!(
+            find_element_y_by_id(&page.layout_root, &page.arena, "nonexistent"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_get_form_submit_url() {
+        let mut page = crate::page::Page::new(
+            r#"<html><body>
+                <form action="/search" method="get">
+                    <input name="q" value="rust" />
+                </form>
+              </body></html>"#,
+            "",
+            800.0,
+            600.0,
+        );
+        page.page_url = "https://example.com/index.html".to_string();
+
+        fn find_input(
+            node: &crate::layout::LayoutNode,
+            arena: &crate::html::DomArena,
+        ) -> Option<u32> {
+            if let Some(dom_id) = node.dom_node_id {
+                if let Some(dom_node) = arena.get(crate::html::DomHandle(
+                    crate::html::NodeId::from_raw(dom_id),
+                )) {
+                    if dom_node
+                        .tag_name()
+                        .map(|t| t.to_string())
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        == "input"
+                    {
+                        return Some(dom_id);
+                    }
+                }
+            }
+            for child in &node.children {
+                if let Some(id) = find_input(child, arena) {
+                    return Some(id);
+                }
+            }
+            None
+        }
+
+        let input_id = find_input(&page.layout_root, &page.arena).expect("input node should exist");
+        let submit_url = get_form_submit_url(&page, input_id, "rust browser");
+        assert_eq!(submit_url, "https://example.com/search?q=rust browser");
+    }
 }

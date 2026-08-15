@@ -28,17 +28,39 @@ pub struct FetchResult {
 }
 
 /// Fetches the content of a URL with a proper User-Agent and timeout.
+/// If an HTTPS request times out or fails to connect, automatically falls back to HTTP
+/// to resolve domains that redirect via port 80 (e.g. apple.co.jp -> https://www.apple.com/jp/).
 pub async fn fetch(url: &str) -> Result<FetchResult, NetworkError> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 Mistilteinn/0.1")
+        .timeout(std::time::Duration::from_secs(12))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .map_err(NetworkError::Http)?;
 
-    let response = client.get(url).send().await?;
-    let final_url = response.url().to_string();
-    let content = response.text().await?;
-    Ok(FetchResult { content, final_url })
+    match client.get(url).send().await {
+        Ok(response) => {
+            let final_url = response.url().to_string();
+            let content = response.text().await?;
+            Ok(FetchResult { content, final_url })
+        }
+        Err(e) => {
+            if url.starts_with("https://") {
+                let http_url = format!("http://{}", &url[8..]);
+                log::info!(
+                    "HTTPS fetch failed ({:?}), attempting HTTP fallback: {}",
+                    e,
+                    http_url
+                );
+                if let Ok(response) = client.get(&http_url).send().await {
+                    let final_url = response.url().to_string();
+                    let content = response.text().await?;
+                    return Ok(FetchResult { content, final_url });
+                }
+            }
+            Err(NetworkError::Http(e))
+        }
+    }
 }
 
 /// Resolve a potentially relative URL against a base URL.
@@ -47,7 +69,7 @@ pub async fn fetch(url: &str) -> Result<FetchResult, NetworkError> {
 /// - If it starts with "/", prepend the scheme + host from the base URL.
 /// - Otherwise, append to the base URL's directory.
 pub fn resolve_url(base_url: &str, href: &str) -> String {
-    if href.starts_with("http://") || href.starts_with("https://") {
+    if href.starts_with("data:") || href.starts_with("http://") || href.starts_with("https://") {
         return href.to_string();
     }
 
@@ -170,22 +192,94 @@ pub fn extract_css(html_content: &str) -> String {
     css_parts.join("\n")
 }
 
-/// Fetch image bytes from a URL with a 15-second timeout and the standard User-Agent.
-pub async fn fetch_image(url: &str) -> Result<Vec<u8>, NetworkError> {
-    let client = reqwest::Client::builder()
+use std::sync::LazyLock;
+
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
-        .user_agent("Mozilla/5.0 Mistilteinn/0.1")
+        .user_agent("Mistilteinn/0.2.10 (https://github.com/haine-sarashina/Mistilteinn; dev@mistilteinn.local) reqwest/0.12")
         .build()
-        .map_err(NetworkError::Http)?;
-    let bytes = client.get(url).send().await?.bytes().await?;
-    Ok(bytes.to_vec())
+        .expect("Failed to build global HTTP client")
+});
+
+/// Simple base64 decoder for data: URIs without external dependency.
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0;
+
+    for &b in input.as_bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b'\r' | b'\n' | b' ' => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Fetch image bytes from a URL (or decode data: URI) with Keep-Alive connection pooling and retries.
+pub async fn fetch_image(url: &str) -> Result<Vec<u8>, NetworkError> {
+    if url.starts_with("data:") {
+        if let Some(comma_pos) = url.find(',') {
+            let meta = &url[..comma_pos];
+            let data_str = &url[comma_pos + 1..];
+            if meta.contains(";base64") {
+                if let Some(decoded) = decode_base64(data_str.trim()) {
+                    return Ok(decoded);
+                }
+            } else {
+                // Raw / utf8 data: URI (e.g. data:image/svg+xml;utf8,<svg>...)
+                let unescaped = data_str
+                    .replace("%20", " ")
+                    .replace("%3C", "<")
+                    .replace("%3E", ">")
+                    .replace("%23", "#")
+                    .replace("%22", "\"");
+                return Ok(unescaped.into_bytes());
+            }
+        }
+    }
+
+    for attempt in 0..3 {
+        let resp = HTTP_CLIENT.get(url).send().await;
+        match resp {
+            Ok(res) if res.status().is_success() => {
+                let bytes = res.bytes().await.map_err(NetworkError::Http)?;
+                return Ok(bytes.to_vec());
+            }
+            Ok(res) if res.status().as_u16() == 429 => {
+                tokio::time::sleep(std::time::Duration::from_millis(150 * (attempt + 1))).await;
+            }
+            Ok(_) => {
+                break;
+            }
+            Err(e) => {
+                if attempt == 2 {
+                    return Err(NetworkError::Http(e));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    Err(NetworkError::Timeout)
 }
 
 /// Fetch a single CSS file with a shorter timeout (10s) and the standard User-Agent.
 async fn fetch_css_file(url: &str) -> Result<String, NetworkError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent("Mozilla/5.0 Mistilteinn/0.1")
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .build()
         .map_err(NetworkError::Http)?;
 

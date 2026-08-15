@@ -19,6 +19,7 @@ pub struct CachedImage {
 /// A fully parsed and laid-out page ready for rendering.
 pub struct Page {
     pub arena: DomArena,
+    pub title: String,
     #[allow(dead_code)]
     pub styles: FxHashMap<u32, css::ComputedValues>,
     pub layout_root: crate::layout::LayoutNode,
@@ -35,6 +36,22 @@ impl Page {
     pub fn new(html_source: &str, css_source: &str, view_width: f32, view_height: f32) -> Self {
         // Stage 1: Parse HTML into DOM arena
         let arena = html::parse_html(html_source);
+        let title = arena
+            .extract_title()
+            .unwrap_or_else(|| "New Tab".to_string());
+        let shared_arena = std::rc::Rc::new(std::cell::RefCell::new(arena));
+
+        // Stage 1.5: Execute inline JS scripts with DOM bindings connected to arena
+        let mut js_context = crate::js::init_js_engine_with_arena(shared_arena.clone());
+        let scripts = shared_arena.borrow().extract_scripts();
+        for script in scripts {
+            crate::js::execute_script(&mut js_context, &script);
+        }
+
+        let arena = match std::rc::Rc::try_unwrap(shared_arena) {
+            Ok(cell) => cell.into_inner(),
+            Err(rc) => rc.borrow().clone(),
+        };
 
         // Stage 2: Parse CSS into author stylesheet
         let author_stylesheet = crate::css::parser::parse_stylesheet(css_source);
@@ -44,7 +61,7 @@ impl Page {
         let stylesheet = css::merge_stylesheets_with_author(&ua_stylesheet, &author_stylesheet);
 
         // Stage 3: Compute styles for every element node
-        let styles = css::compute_styles_for_tree(&arena, &stylesheet);
+        let styles = css::compute_styles_for_tree(&arena, &stylesheet, (view_width, view_height));
 
         // Stage 4: Build layout tree starting from document root (node 0)
         let mut layout_root = crate::layout::build_layout_tree(
@@ -97,6 +114,7 @@ impl Page {
 
         Self {
             arena,
+            title,
             styles,
             layout_root,
             view_width,
@@ -115,12 +133,14 @@ impl Page {
         self.styles = css::compute_styles_for_tree_with_hover(
             &self.arena,
             &self.stylesheet,
+            (self.view_width, self.view_height),
             hovered_ids,
         );
 
         // Rebuild layout tree from new computed styles
         let get_node = |id: u32| self.arena.get(DomHandle(NodeId::from_raw(id)));
-        self.layout_root = crate::layout::build_layout_tree(0, &self.styles, get_node, self.view_width);
+        self.layout_root =
+            crate::layout::build_layout_tree(0, &self.styles, get_node, self.view_width);
 
         // Re-extract absolute children and recompute layout
         crate::layout::extract_absolute_children(&mut self.layout_root);
@@ -155,6 +175,12 @@ impl Page {
     /// Collect renderable rectangles with colors from the layout tree.
     pub fn collect_rects(&self) -> Vec<(Rect, Option<[u8; 4]>)> {
         crate::layout::collect_render_rects(&self.layout_root)
+    }
+
+    /// Update the `value` attribute of an input element and recompute layout.
+    pub fn set_input_value_and_recompute(&mut self, node_id: u32, value: &str) {
+        self.arena.set_attribute(node_id, "value", value);
+        self.recompute_with_hover(&[]);
     }
 
     /// Estimate the memory footprint of this page's data structures.

@@ -68,6 +68,16 @@ pub fn parse_color_value(color_str: &str) -> Option<CSSColor> {
         return Some(result);
     }
 
+    // Transparent keyword
+    if lower == "transparent" {
+        return Some(CSSColor::Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0.0,
+        });
+    }
+
     // Named colors
     let named = parse_named_color(&lower);
     if let Some(_rgb) = named {
@@ -157,7 +167,6 @@ fn parse_named_color(color: &str) -> Option<(u8, u8, u8)> {
         ("teal", (0, 128, 128)),
         ("navy", (0, 0, 128)),
         ("fuchsia", (255, 0, 255)),
-        ("transparent", (0, 0, 0)),
     ]
     .into_iter()
     .collect();
@@ -272,6 +281,16 @@ fn inherit_properties(parent: &ComputedValues, mut child: ComputedValues) -> Com
     if child.line_height == 1.2 && parent.line_height != 1.2 {
         child.line_height = parent.line_height;
     }
+    // `text-align` inherits
+    if child.text_align == TextAlign::Left && parent.text_align != TextAlign::Left {
+        child.text_align = parent.text_align;
+    }
+    // CSS custom properties (variables) always inherit
+    for (k, v) in &parent.custom_properties {
+        if !child.custom_properties.contains_key(k) {
+            child.custom_properties.insert(k.clone(), v.clone());
+        }
+    }
     // `background_color` does NOT inherit (CSS initial = transparent)
     child
 }
@@ -288,6 +307,97 @@ fn node_has_class(node: &crate::html::DomNode, class: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve the font size of the root `<html>` element, which `rem` units
+/// resolve against.
+///
+/// Only selectors that target the root itself (`html`, `:root`, `*`) can apply,
+/// so this is a cheap scan rather than a full cascade pass. Declarations are
+/// applied in ascending specificity, each `em` resolving against the value so
+/// far — matching how `font-size: 1.2em` on the root behaves in a real engine.
+fn resolve_root_font_size(
+    arena: &crate::html::DomArena,
+    active_rules: &[&parser::CSSRule],
+    ctx: LengthContext,
+) -> f32 {
+    // Inline `style` on <html> wins over any stylesheet rule, so find the node.
+    let root_style_attr = {
+        let nodes = arena.nodes.borrow();
+        nodes
+            .iter()
+            .find(|n| {
+                n.tag_name()
+                    .is_some_and(|t| t.as_ref().eq_ignore_ascii_case("html"))
+            })
+            .and_then(|n| n.get_attr("style").map(|s| s.to_string()))
+    };
+
+    let mut candidates: Vec<(&Declaration, (u32, u32, u32))> = Vec::new();
+    for rule in active_rules {
+        let targets_root = rule.selectors.iter().any(|sel| {
+            sel.complex.len() == 1
+                && match &sel.complex[0].1 {
+                    parser::SimpleSelector::Type(t) => t.eq_ignore_ascii_case("html"),
+                    parser::SimpleSelector::PseudoClass { name, .. } => {
+                        name.eq_ignore_ascii_case("root")
+                    }
+                    parser::SimpleSelector::Universal => true,
+                    _ => false,
+                }
+        });
+        if !targets_root {
+            continue;
+        }
+        let spec = rule
+            .selectors
+            .iter()
+            .map(|s| s.specificity())
+            .max()
+            .unwrap_or((0, 0, 0));
+        for decl in &rule.declarations {
+            if decl.property.eq_ignore_ascii_case("font-size") {
+                candidates.push((decl, spec));
+            }
+        }
+    }
+
+    // Normal declarations first, then !important, each in ascending specificity.
+    candidates.sort_by_key(|(decl, spec)| (decl.important, *spec));
+
+    let mut size = DEFAULT_FONT_SIZE;
+    let mut apply = |value: &str, size: &mut f32| {
+        let local = LengthContext {
+            font_size: *size,
+            root_font_size: *size,
+            ..ctx
+        };
+        // A percentage on the root resolves against the initial font size.
+        if let Some(pct) = value.trim().strip_suffix('%') {
+            if let Ok(n) = pct.trim().parse::<f32>() {
+                *size = DEFAULT_FONT_SIZE * n / 100.0;
+                return;
+            }
+        }
+        if let Some(px) = parse_length_ctx(value, local) {
+            if px > 0.0 {
+                *size = px;
+            }
+        }
+    };
+
+    for (decl, _) in candidates {
+        apply(&decl.value, &mut size);
+    }
+    if let Some(style) = root_style_attr {
+        for decl in parse_declarations(&style) {
+            if decl.property.eq_ignore_ascii_case("font-size") {
+                apply(&decl.value, &mut size);
+            }
+        }
+    }
+
+    size
+}
+
 /// Compute the resolved styles for every element node in the DOM tree.
 ///
 /// Takes the parsed DOM arena and a `Stylesheet` (from `parse_css`),
@@ -298,8 +408,9 @@ fn node_has_class(node: &crate::html::DomNode, class: &str) -> bool {
 pub fn compute_styles_for_tree(
     arena: &crate::html::DomArena,
     stylesheet: &parser::Stylesheet,
+    viewport: (f32, f32),
 ) -> FxHashMap<u32, ComputedValues> {
-    compute_styles_for_tree_internal(arena, stylesheet, |_| false)
+    compute_styles_for_tree_internal(arena, stylesheet, viewport, |_| false)
 }
 
 /// Compute styles with runtime hover context.
@@ -309,10 +420,11 @@ pub fn compute_styles_for_tree(
 pub fn compute_styles_for_tree_with_hover(
     arena: &crate::html::DomArena,
     stylesheet: &parser::Stylesheet,
+    viewport: (f32, f32),
     hovered_ids: &[u32],
 ) -> FxHashMap<u32, ComputedValues> {
     let hover_set: std::collections::HashSet<u32> = hovered_ids.iter().copied().collect();
-    compute_styles_for_tree_internal(arena, stylesheet, |id| hover_set.contains(&id))
+    compute_styles_for_tree_internal(arena, stylesheet, viewport, |id| hover_set.contains(&id))
 }
 
 /// Internal implementation of style computation with a configurable hover predicate.
@@ -322,6 +434,7 @@ pub fn compute_styles_for_tree_with_hover(
 fn compute_styles_for_tree_internal<F>(
     arena: &crate::html::DomArena,
     stylesheet: &parser::Stylesheet,
+    viewport: (f32, f32),
     is_hovered: F,
 ) -> FxHashMap<u32, ComputedValues>
 where
@@ -344,52 +457,153 @@ where
         })
         .collect();
 
-    // Pre-compute which nodes are first children of their parents.
-    // Used for :first-child pseudo-class evaluation.
+    // Pre-compute child relationships for pseudo-classes (:first-child, :last-child, :only-child, :nth-child)
     let mut first_children: std::collections::HashSet<u32> =
         std::collections::HashSet::with_capacity(element_ids.len());
+    let mut last_children: std::collections::HashSet<u32> =
+        std::collections::HashSet::with_capacity(element_ids.len());
+    let mut only_children: std::collections::HashSet<u32> =
+        std::collections::HashSet::with_capacity(element_ids.len());
+    let mut child_indices: rustc_hash::FxHashMap<u32, usize> = rustc_hash::FxHashMap::default();
+
+    let mut node_classes: rustc_hash::FxHashMap<u32, Vec<String>> =
+        rustc_hash::FxHashMap::default();
+    let mut node_ids: rustc_hash::FxHashMap<u32, String> = rustc_hash::FxHashMap::default();
+
     for node in &*nodes_ref {
-        if let Some(&first_child) = node.children.first() {
-            first_children.insert(first_child.index() as u32);
+        let elem_children: Vec<u32> = node
+            .children
+            .iter()
+            .map(|h| h.index() as u32)
+            .filter(|&id| element_ids.contains(&id))
+            .collect();
+
+        if let Some(&first_child) = elem_children.first() {
+            first_children.insert(first_child);
+        }
+        if let Some(&last_child) = elem_children.last() {
+            last_children.insert(last_child);
+        }
+        if elem_children.len() == 1 {
+            only_children.insert(elem_children[0]);
+        }
+        for (idx, &cid) in elem_children.iter().enumerate() {
+            child_indices.insert(cid, idx + 1); // 1-based index
         }
     }
+
+    for &node_id in &element_ids {
+        let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(node_id));
+        if let Some(node) = arena.get(handle) {
+            if let Some(attr) = node.get_attr("class") {
+                node_classes.insert(node_id, attr.split_whitespace().map(String::from).collect());
+            }
+            if let Some(id) = node.get_attr("id") {
+                node_ids.insert(node_id, id.to_string());
+            }
+        }
+    }
+
     drop(nodes_ref);
 
     // Phase 1: Cascade — for each element, find matching rules and apply
-    for &node_id in &element_ids {
+    let start = std::time::Instant::now();
+    let total_elements = element_ids.len();
+
+    // Collect active rules from the stylesheet based on viewport width
+    let mut active_rules: Vec<&parser::CSSRule> = stylesheet.rules.iter().collect();
+    for media_rule in &stylesheet.media_rules {
+        if parser::evaluate_media_condition(&media_rule.condition, viewport.0) {
+            active_rules.extend(media_rule.rules.iter());
+        }
+    }
+
+    // Keep applied declarations per element so we can re-evaluate variables after inheriting from parent
+    let mut applied_decls_per_element: rustc_hash::FxHashMap<u32, Vec<Declaration>> =
+        rustc_hash::FxHashMap::default();
+
+    // Base context for resolving relative lengths. `rem` needs the root font
+    // size, which is whatever `<html>` resolves to, so compute that first.
+    let mut length_ctx = LengthContext {
+        font_size: DEFAULT_FONT_SIZE,
+        root_font_size: DEFAULT_FONT_SIZE,
+        viewport_width: viewport.0,
+        viewport_height: viewport.1,
+    };
+    length_ctx.root_font_size = resolve_root_font_size(arena, &active_rules, length_ctx);
+
+    for (i, &node_id) in element_ids.iter().enumerate() {
+        if i % 1000 == 0 && i > 0 {
+            log::info!("Computed styles for {}/{} elements...", i, total_elements);
+        }
         let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(node_id));
         let node = match arena.get(handle) {
             Some(n) => n,
             None => continue,
         };
 
-        let tag: String = match node.tag_name() {
-            Some(t) => (*t).to_string(),
-            None => continue,
+        let get_parent = |id: u32| -> Option<u32> {
+            let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(id));
+            if let Some(node) = arena.get(handle) {
+                node.parent_id()
+            } else {
+                None
+            }
+        };
+
+        let simple_match = |id: u32, sel: &parser::SimpleSelector| -> bool {
+            let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(id));
+            let node = match arena.get(handle) {
+                Some(n) => n,
+                None => return false,
+            };
+            let tag = match node.tag_name() {
+                Some(t) => t,
+                None => return false,
+            };
+            let has_class = |c: &str| -> bool {
+                node_classes
+                    .get(&id)
+                    .map_or(false, |classes| classes.iter().any(|cls| cls == c))
+            };
+            let has_id_val =
+                |i: &str| -> bool { node_ids.get(&id).map_or(false, |id_str| id_str == i) };
+            let matches_attr = |name: &str, op: &parser::AttrOperator, val: Option<&str>| -> bool {
+                if let Some(attr_val) = node.get_attr(name) {
+                    parser::evaluate_attr_operator(attr_val, op, val)
+                } else {
+                    false
+                }
+            };
+            let is_first = || first_children.contains(&id);
+            let is_last = || last_children.contains(&id);
+            let is_only = || only_children.contains(&id);
+            let child_idx = || *child_indices.get(&id).unwrap_or(&1);
+            let hover = || is_hovered(id);
+            parser::Selector::simple_matches_with_context(
+                sel,
+                tag,
+                has_class,
+                has_id_val,
+                matches_attr,
+                is_first,
+                is_last,
+                is_only,
+                child_idx,
+                hover,
+            )
         };
 
         // Collect all matching rules with their specificity
         let mut matched: Vec<(&parser::CSSRule, (u32, u32, u32))> = Vec::new();
 
-        for rule in &stylesheet.rules {
+        for rule in &active_rules {
             for selector in &rule.selectors {
-                if selector.matches_element_with_hover(
-                    &tag,
-                    |c| node_has_class(&node, c),
-                    |i| node_get_id(&node) == Some(i),
-                    || first_children.contains(&node_id),
-                    || is_hovered(node_id),
-                ) {
+                if selector.full_matches(node_id, &get_parent, &simple_match) {
                     matched.push((rule, selector.specificity()));
                 }
             }
         }
-
-        // CSS Cascade order (author origin only):
-        // 1. Normal declarations (applied first — can be overridden)
-        // 2. !important declarations (applied last — override normal)
-        // Within each group: sort by specificity ascending (lower first, higher overwrites).
-        // Stable sort preserves source order within same specificity (later rule wins).
 
         let mut computed = ComputedValues::default();
 
@@ -406,31 +620,38 @@ where
             }
         }
 
+        let mut all_applied = Vec::new();
+
         // Pass 1: Normal declarations (ascending specificity — higher wins by overwriting)
         normal_decls.sort_by(|a, b| a.1.cmp(&b.1));
         for (decl, _) in normal_decls {
-            computed = computed.from_declaration(decl);
+            computed = computed.from_declaration_with_ctx(decl, length_ctx);
+            all_applied.push((*decl).clone());
         }
 
         // Pass 2: !important declarations (override normal, ascending specificity)
         important_decls.sort_by(|a, b| a.1.cmp(&b.1));
         for (decl, _) in important_decls {
-            computed = computed.from_declaration(decl);
+            computed = computed.from_declaration_with_ctx(decl, length_ctx);
+            all_applied.push((*decl).clone());
         }
 
         // Pass 3: Inline `style` attribute — highest specificity per CSS spec.
-        // Applied after stylesheet cascade but before inheritance propagation.
         if let Some(style_attr) = node.get_attr("style") {
             let inline_decls = parse_declarations(style_attr);
             for decl in &inline_decls {
-                computed = computed.from_declaration(decl);
+                computed = computed.from_declaration_with_ctx(decl, length_ctx);
+                all_applied.push(decl.clone());
             }
         }
 
+        applied_decls_per_element.insert(node_id, all_applied);
         result.insert(node_id, computed);
     }
 
-    // Phase 2: Inheritance — BFS from root to propagate inheritable properties
+    log::info!("Phase 1 Cascade complete in {:?}", start.elapsed());
+
+    // Phase 2: Inheritance & Defaults — top-down pass
     // Build parent map using the public parent_id() accessor
     let mut parent_map = FxHashMap::default();
     for &nid in &element_ids {
@@ -442,14 +663,23 @@ where
         }
     }
 
-    // Topological sort: process nodes in document order (BFS-ish)
-    // Since arena assigns IDs in document order, processing in ascending ID order
-    // ensures parents are processed before children.
+    // Topological sort: process nodes in document order
     for &node_id in &element_ids {
         if let Some(&parent_id) = parent_map.get(&node_id) {
-            if let Some(parent_styles) = result.get(&parent_id) {
-                let child_styles = result.get(&node_id).cloned().unwrap_or_default();
-                let inherited = inherit_properties(parent_styles, child_styles);
+            if let Some(parent_styles) = result.get(&parent_id).cloned() {
+                // Rebuild from a freshly inherited base rather than layering onto
+                // the Phase 1 result. Every declaration is re-applied below, so
+                // reusing the Phase 1 values would apply them twice — harmless for
+                // absolute values, but `em` would compound (2em → 4x the parent).
+                let mut inherited = inherit_properties(&parent_styles, ComputedValues::default());
+
+                // Re-evaluate applied declarations with inherited CSS custom properties
+                if let Some(decls) = applied_decls_per_element.get(&node_id) {
+                    for decl in decls {
+                        inherited = inherited.from_declaration_with_ctx(decl, length_ctx);
+                    }
+                }
+
                 result.insert(node_id, inherited);
             }
         }
@@ -470,6 +700,16 @@ pub enum DisplayType {
     InlineFlex,
     None,
     Grid,
+    Table,
+    InlineTable,
+    TableRowGroup,
+    TableHeaderGroup,
+    TableFooterGroup,
+    TableRow,
+    TableCell,
+    TableCaption,
+    TableColumn,
+    TableColumnGroup,
 }
 
 // ------ Flexbox Enums ------
@@ -563,6 +803,25 @@ pub enum GridTrack {
     Fr(f32),
     /// Automatic sizing, i.e. "auto"
     Auto,
+    /// Minimum content sizing, i.e. "min-content"
+    MinContent,
+    /// Maximum content sizing, i.e. "max-content"
+    MaxContent,
+    /// Fit content with a maximum limit, i.e. "fit-content(200px)"
+    FitContent(f32),
+}
+
+// ------ Alignment on Item (align-self) ------
+
+/// The computed `align-self` CSS property for flex/grid items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignSelf {
+    Auto,
+    FlexStart,
+    FlexEnd,
+    Center,
+    Baseline,
+    Stretch,
 }
 
 // ------ Positioning ------
@@ -575,6 +834,25 @@ pub enum PositionType {
     Absolute,
 }
 
+// ------ Float & Clear ------
+
+/// The computed `float` CSS property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatType {
+    None,
+    Left,
+    Right,
+}
+
+/// The computed `clear` CSS property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearType {
+    None,
+    Left,
+    Right,
+    Both,
+}
+
 // ------ Computed Values ------
 
 /// Fully resolved CSS property values for a single element.
@@ -585,6 +863,8 @@ pub struct ComputedValues {
     pub height: Option<f32>,
     /// Margin: [top, right, bottom, left]
     pub margin: [f32; 4],
+    /// Margin auto flags: [top, right, bottom, left]
+    pub margin_auto: [bool; 4],
     /// Padding: [top, right, bottom, left]
     pub padding: [f32; 4],
     /// Background color as RGBA (None = transparent)
@@ -633,6 +913,31 @@ pub struct ComputedValues {
     pub grid_row_gap: f32,
     // Grid item / flex item property
     pub order: i32,
+    pub align_self: AlignSelf,
+    // Float & Clear
+    pub float: FloatType,
+    pub clear: ClearType,
+    // Border & Radius
+    pub border_width: [f32; 4],
+    pub border_color: Option<[u8; 4]>,
+    pub border_radius: f32,
+    // Typography
+    pub is_bold: bool,
+    pub is_italic: bool,
+    pub is_underline: bool,
+    pub text_align: TextAlign,
+    // CSS Custom Properties (CSS variables --*)
+    pub custom_properties: rustc_hash::FxHashMap<String, String>,
+}
+
+/// CSS text-align property
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+    Justify,
 }
 
 impl Default for ComputedValues {
@@ -643,6 +948,7 @@ impl Default for ComputedValues {
             width: None,
             height: None,
             margin: [0.0; 4],
+            margin_auto: [false; 4],
             padding: [0.0; 4],
             background_color: None,
             color: None,
@@ -653,6 +959,7 @@ impl Default for ComputedValues {
             justify_content: JustifyContent::FlexStart,
             align_items: AlignItems::Stretch,
             align_content: AlignContent::Normal,
+            align_self: AlignSelf::Auto,
             row_gap: 0.0,
             column_gap: 0.0,
             flex_grow: 0.0,
@@ -663,7 +970,7 @@ impl Default for ComputedValues {
             explicit_height: None,
             min_width: None,
             max_width: None,
-            line_height: 1.2, // CSS default for "normal"
+            line_height: 1.2,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
             position: PositionType::Static,
@@ -676,8 +983,109 @@ impl Default for ComputedValues {
             grid_column_gap: 0.0,
             grid_row_gap: 0.0,
             order: 0,
+            float: FloatType::None,
+            clear: ClearType::None,
+            border_width: [0.0; 4],
+            border_color: None,
+            border_radius: 0.0,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            text_align: TextAlign::Left,
+            custom_properties: rustc_hash::FxHashMap::default(),
         }
     }
+}
+
+/// Resolve `var(--name, fallback)` occurrences within a CSS property value.
+pub fn resolve_var_functions(val: &str, vars: &rustc_hash::FxHashMap<String, String>) -> String {
+    let mut seen = Vec::new();
+    resolve_var_functions_internal(val, vars, &mut seen, 0)
+}
+
+fn resolve_var_functions_internal(
+    val: &str,
+    vars: &rustc_hash::FxHashMap<String, String>,
+    seen: &mut Vec<String>,
+    depth: usize,
+) -> String {
+    if depth > 10 || !val.contains("var(") {
+        return val.to_string();
+    }
+
+    let mut result = String::new();
+    let mut i = 0;
+    let bytes = val.as_bytes();
+
+    while i < val.len() {
+        if val[i..].starts_with("var(") {
+            let start = i + 4;
+            let mut paren_depth = 1usize;
+            let mut end = start;
+            while end < bytes.len() && paren_depth > 0 {
+                if bytes[end] == b'(' {
+                    paren_depth += 1;
+                } else if bytes[end] == b')' {
+                    paren_depth -= 1;
+                }
+                end += 1;
+            }
+            if paren_depth == 0 {
+                let inside = val[start..end - 1].trim();
+                let (var_name, fallback) = if let Some(comma_pos) = find_top_level_comma(inside) {
+                    (
+                        inside[..comma_pos].trim(),
+                        Some(inside[comma_pos + 1..].trim()),
+                    )
+                } else {
+                    (inside, None)
+                };
+
+                let resolved_value = if !seen.iter().any(|s| s == var_name) {
+                    if let Some(found) = vars.get(var_name) {
+                        seen.push(var_name.to_string());
+                        let res = resolve_var_functions_internal(found, vars, seen, depth + 1);
+                        seen.pop();
+                        res
+                    } else if let Some(fb) = fallback {
+                        resolve_var_functions_internal(fb, vars, seen, depth + 1)
+                    } else {
+                        String::new()
+                    }
+                } else if let Some(fb) = fallback {
+                    resolve_var_functions_internal(fb, vars, seen, depth + 1)
+                } else {
+                    String::new()
+                };
+
+                result.push_str(&resolved_value);
+                i = end;
+                continue;
+            }
+        }
+
+        let c = val[i..].chars().next().unwrap();
+        result.push(c);
+        i += c.len_utf8();
+    }
+
+    result
+}
+
+fn find_top_level_comma(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, b) in s.bytes().enumerate() {
+        if b == b'(' {
+            depth += 1;
+        } else if b == b')' {
+            if depth > 0 {
+                depth -= 1;
+            }
+        } else if b == b',' && depth == 0 {
+            return Some(i);
+        }
+    }
+    None
 }
 
 impl ComputedValues {
@@ -685,9 +1093,44 @@ impl ComputedValues {
     ///
     /// Returns a new `ComputedValues` with the declaration applied on top
     /// of the current values (or defaults if called on `Default::default()`).
-    pub fn from_declaration(mut self, decl: &Declaration) -> Self {
+    pub fn from_declaration(self, decl: &Declaration) -> Self {
+        self.from_declaration_with_ctx(decl, LengthContext::default())
+    }
+
+    /// Parse a single [`Declaration`] and apply it, resolving relative length
+    /// units (`em`, `rem`, `vw`, `vh`, …) against `base_ctx`.
+    ///
+    /// `base_ctx.font_size` is ignored: `em` always resolves against the font
+    /// size this element has accumulated so far, which — because inheritance
+    /// runs before declarations are re-applied — is the parent's font size for
+    /// a `font-size` declaration, and the element's own font size afterwards.
+    pub fn from_declaration_with_ctx(
+        mut self,
+        decl: &Declaration,
+        base_ctx: LengthContext,
+    ) -> Self {
         let prop = decl.property.to_lowercase();
-        let val = decl.value.trim();
+        if prop.starts_with("--") {
+            self.custom_properties
+                .insert(decl.property.clone(), decl.value.clone());
+            return self;
+        }
+
+        let resolved_val = resolve_var_functions(&decl.value, &self.custom_properties);
+        let val = resolved_val.trim();
+
+        let ctx = LengthContext {
+            font_size: self.font_size,
+            ..base_ctx
+        };
+        // Shadow the module-level helpers so every length in this function
+        // resolves through the active context.
+        let parse_length = |s: &str| parse_length_ctx(s, ctx);
+        let parse_box_four = |s: &str, fallback: [f32; 4]| parse_box_four(s, fallback, ctx);
+        let parse_margin_box_four =
+            |s: &str, fm: [f32; 4], fa: [bool; 4]| parse_margin_box_four(s, fm, fa, ctx);
+        let parse_flex_basis = |s: &str| parse_flex_basis(s, ctx);
+        let parse_grid_track_list = |s: &str| parse_grid_track_list(s, ctx);
 
         match prop.as_str() {
             "display" => {
@@ -699,6 +1142,16 @@ impl ComputedValues {
                     "inline-flex" => DisplayType::InlineFlex,
                     "none" => DisplayType::None,
                     "grid" => DisplayType::Grid,
+                    "table" => DisplayType::Table,
+                    "inline-table" => DisplayType::InlineTable,
+                    "table-row-group" => DisplayType::TableRowGroup,
+                    "table-header-group" => DisplayType::TableHeaderGroup,
+                    "table-footer-group" => DisplayType::TableFooterGroup,
+                    "table-row" => DisplayType::TableRow,
+                    "table-cell" => DisplayType::TableCell,
+                    "table-caption" => DisplayType::TableCaption,
+                    "table-column" => DisplayType::TableColumn,
+                    "table-column-group" => DisplayType::TableColumnGroup,
                     _ => self.display,
                 };
             }
@@ -711,26 +1164,44 @@ impl ComputedValues {
                 self.explicit_height = self.height;
             }
             "margin" => {
-                self.margin = parse_box_four(val, self.margin);
+                let (m, a) = parse_margin_box_four(val, self.margin, self.margin_auto);
+                self.margin = m;
+                self.margin_auto = a;
             }
             "margin-top" => {
-                if let Some(v) = parse_length(val) {
+                if val.trim().eq_ignore_ascii_case("auto") {
+                    self.margin[0] = 0.0;
+                    self.margin_auto[0] = true;
+                } else if let Some(v) = parse_length(val) {
                     self.margin[0] = v;
+                    self.margin_auto[0] = false;
                 }
             }
             "margin-right" => {
-                if let Some(v) = parse_length(val) {
+                if val.trim().eq_ignore_ascii_case("auto") {
+                    self.margin[1] = 0.0;
+                    self.margin_auto[1] = true;
+                } else if let Some(v) = parse_length(val) {
                     self.margin[1] = v;
+                    self.margin_auto[1] = false;
                 }
             }
             "margin-bottom" => {
-                if let Some(v) = parse_length(val) {
+                if val.trim().eq_ignore_ascii_case("auto") {
+                    self.margin[2] = 0.0;
+                    self.margin_auto[2] = true;
+                } else if let Some(v) = parse_length(val) {
                     self.margin[2] = v;
+                    self.margin_auto[2] = false;
                 }
             }
             "margin-left" => {
-                if let Some(v) = parse_length(val) {
+                if val.trim().eq_ignore_ascii_case("auto") {
+                    self.margin[3] = 0.0;
+                    self.margin_auto[3] = true;
+                } else if let Some(v) = parse_length(val) {
                     self.margin[3] = v;
+                    self.margin_auto[3] = false;
                 }
             }
             "padding" => {
@@ -804,6 +1275,11 @@ impl ComputedValues {
                     _ => self.justify_content,
                 };
             }
+            "justify-items" => {
+                if val.trim().eq_ignore_ascii_case("center") {
+                    self.text_align = TextAlign::Center;
+                }
+            }
             "align-items" => {
                 self.align_items = match val {
                     "stretch" => AlignItems::Stretch,
@@ -827,7 +1303,7 @@ impl ComputedValues {
                 self.flex_basis = parse_flex_basis(val);
             }
             "flex" => {
-                parse_flex_shorthand(&mut self, val);
+                parse_flex_shorthand(&mut self, val, ctx);
             }
             "align-content" => {
                 self.align_content = parse_align_content(val);
@@ -896,6 +1372,21 @@ impl ComputedValues {
                     _ => Overflow::Visible,
                 };
             }
+            "float" => {
+                self.float = match val {
+                    "left" => FloatType::Left,
+                    "right" => FloatType::Right,
+                    _ => FloatType::None,
+                };
+            }
+            "clear" => {
+                self.clear = match val {
+                    "left" => ClearType::Left,
+                    "right" => ClearType::Right,
+                    "both" => ClearType::Both,
+                    _ => ClearType::None,
+                };
+            }
             "position" => {
                 self.position = match val {
                     "relative" => PositionType::Relative,
@@ -942,11 +1433,111 @@ impl ComputedValues {
             "order" => {
                 self.order = val.parse().unwrap_or(0);
             }
+            "align-self" => {
+                self.align_self = parse_align_self(val);
+            }
+            "border" => {
+                let (w, c) = parse_border_shorthand(val);
+                if let Some(width) = w {
+                    self.border_width = [width; 4];
+                }
+                if let Some(color) = c {
+                    self.border_color = Some(color);
+                }
+            }
+            "border-top" => {
+                let (w, c) = parse_border_shorthand(val);
+                if let Some(width) = w {
+                    self.border_width[0] = width;
+                }
+                if let Some(color) = c {
+                    self.border_color = Some(color);
+                }
+            }
+            "border-right" => {
+                let (w, c) = parse_border_shorthand(val);
+                if let Some(width) = w {
+                    self.border_width[1] = width;
+                }
+                if let Some(color) = c {
+                    self.border_color = Some(color);
+                }
+            }
+            "border-bottom" => {
+                let (w, c) = parse_border_shorthand(val);
+                if let Some(width) = w {
+                    self.border_width[2] = width;
+                }
+                if let Some(color) = c {
+                    self.border_color = Some(color);
+                }
+            }
+            "border-left" => {
+                let (w, c) = parse_border_shorthand(val);
+                if let Some(width) = w {
+                    self.border_width[3] = width;
+                }
+                if let Some(color) = c {
+                    self.border_color = Some(color);
+                }
+            }
+            "border-width" => {
+                self.border_width = parse_box_four(val, self.border_width);
+            }
+            "border-color" => {
+                if let Some(c) = parse_color_value(val) {
+                    let (r, g, b, a) = c.to_rgba();
+                    self.border_color = Some([r, g, b, a]);
+                }
+            }
+            "border-radius" => {
+                if let Some(r) = parse_length(val) {
+                    self.border_radius = r;
+                }
+            }
+            "font-weight" => {
+                self.is_bold = matches!(val, "bold" | "bolder" | "700" | "800" | "900");
+            }
+            "font-style" => {
+                self.is_italic = matches!(val, "italic" | "oblique");
+            }
+            "text-decoration" | "text-decoration-line" => {
+                self.is_underline = val.contains("underline");
+            }
+            "text-align" => {
+                self.text_align = match val {
+                    "center" => TextAlign::Center,
+                    "right" => TextAlign::Right,
+                    "justify" => TextAlign::Justify,
+                    _ => TextAlign::Left,
+                };
+            }
             _ => {}
         }
 
         self
     }
+}
+
+/// Helper to parse CSS border shorthand like "1px solid #ccc"
+fn parse_border_shorthand(val: &str) -> (Option<f32>, Option<[u8; 4]>) {
+    let mut width = None;
+    let mut color = None;
+    for part in val.split_whitespace() {
+        if width.is_none() {
+            if let Some(w) = parse_length(part) {
+                width = Some(w);
+                continue;
+            }
+        }
+        if color.is_none() {
+            if let Some(c) = parse_color_value(part) {
+                let (r, g, b, a) = c.to_rgba();
+                color = Some([r, g, b, a]);
+            }
+        }
+    }
+    (width, color)
 }
 
 /// Parse a CSS offset value (top/right/bottom/left) allowing negative pixels.
@@ -978,19 +1569,126 @@ fn parse_offset(s: &str) -> Option<f32> {
     num_str.parse::<f32>().ok()
 }
 
-/// Parse a CSS length value (pixels) from a string like `"10px"` or `"10"`.
-/// Returns `None` for `"auto"`, `"inherit"`, or unparseable values.
-fn parse_length(s: &str) -> Option<f32> {
+/// The context needed to resolve relative CSS length units into pixels.
+///
+/// `em` resolves against the *current* element's font size, `rem` against the
+/// root (`<html>`) font size, and the viewport units against the viewport box.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LengthContext {
+    /// Font size of the element the declaration applies to (for `em`, `ex`, `ch`).
+    pub font_size: f32,
+    /// Font size of the root `<html>` element (for `rem`).
+    pub root_font_size: f32,
+    /// Viewport width in CSS pixels (for `vw`, `vmin`, `vmax`).
+    pub viewport_width: f32,
+    /// Viewport height in CSS pixels (for `vh`, `vmin`, `vmax`).
+    pub viewport_height: f32,
+}
+
+/// The CSS initial font size, used whenever no explicit context is available.
+pub const DEFAULT_FONT_SIZE: f32 = 16.0;
+
+impl Default for LengthContext {
+    fn default() -> Self {
+        Self {
+            font_size: DEFAULT_FONT_SIZE,
+            root_font_size: DEFAULT_FONT_SIZE,
+            viewport_width: 800.0,
+            viewport_height: 600.0,
+        }
+    }
+}
+
+/// Parse a CSS length value into pixels, resolving relative units via `ctx`.
+///
+/// Supports absolute units (`px`, `pt`, `pc`, `in`, `cm`, `mm`, `q`), font-relative
+/// units (`em`, `rem`, `ex`, `ch`), and viewport units (`vw`, `vh`, `vmin`, `vmax`).
+/// A bare number is treated as pixels (quirks-friendly, and correct for `0`).
+/// Returns `None` for `"auto"`, `"inherit"`, percentages, or unparseable values.
+fn parse_length_ctx(s: &str, ctx: LengthContext) -> Option<f32> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("inherit") {
         return None;
     }
-    // Strip common unit suffixes and parse as pixels
-    let num = s.trim_end_matches(|c: char| c.is_alphabetic());
-    if num.is_empty() {
+    // Percentages are resolved by the layout engine against a containing block,
+    // so they are not a plain length here.
+    if s.ends_with('%') {
         return None;
     }
-    num.parse::<f32>().ok()
+
+    // Split the numeric part from the trailing unit.
+    let unit_start = s
+        .rfind(|c: char| c.is_ascii_digit() || c == '.')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let (num_str, unit) = s.split_at(unit_start);
+    let num: f32 = num_str.trim().parse().ok()?;
+    if !num.is_finite() {
+        return None;
+    }
+
+    let unit = unit.trim().to_ascii_lowercase();
+    let px = match unit.as_str() {
+        "" | "px" => num,
+        "em" => num * ctx.font_size,
+        "rem" => num * ctx.root_font_size,
+        // Approximations used by every engine when real font metrics are unavailable.
+        "ex" => num * ctx.font_size * 0.5,
+        "ch" => num * ctx.font_size * 0.5,
+        "vw" => num * ctx.viewport_width / 100.0,
+        "vh" => num * ctx.viewport_height / 100.0,
+        "vmin" => num * ctx.viewport_width.min(ctx.viewport_height) / 100.0,
+        "vmax" => num * ctx.viewport_width.max(ctx.viewport_height) / 100.0,
+        // Absolute units, defined by CSS against 96dpi.
+        "pt" => num * 96.0 / 72.0,
+        "pc" => num * 16.0,
+        "in" => num * 96.0,
+        "cm" => num * 96.0 / 2.54,
+        "mm" => num * 96.0 / 25.4,
+        "q" => num * 96.0 / 101.6,
+        _ => return None,
+    };
+    Some(px)
+}
+
+/// Parse a CSS length using the default context (16px font, 800x600 viewport).
+fn parse_length(s: &str) -> Option<f32> {
+    parse_length_ctx(s, LengthContext::default())
+}
+
+/// Parse margin shorthand supporting `auto` values.
+fn parse_margin_box_four(
+    s: &str,
+    fallback_margin: [f32; 4],
+    fallback_auto: [bool; 4],
+    ctx: LengthContext,
+) -> ([f32; 4], [bool; 4]) {
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    let mut parsed = Vec::new();
+    for t in tokens {
+        if t.eq_ignore_ascii_case("auto") {
+            parsed.push((0.0, true));
+        } else if let Some(v) = parse_length_ctx(t, ctx) {
+            parsed.push((v, false));
+        }
+    }
+
+    match parsed.len() {
+        1 => ([parsed[0].0; 4], [parsed[0].1; 4]),
+        2 => (
+            [parsed[0].0, parsed[1].0, parsed[0].0, parsed[1].0],
+            [parsed[0].1, parsed[1].1, parsed[0].1, parsed[1].1],
+        ),
+        3 => (
+            [parsed[0].0, parsed[1].0, parsed[2].0, parsed[1].0],
+            [parsed[0].1, parsed[1].1, parsed[2].1, parsed[1].1],
+        ),
+        4 => (
+            [parsed[0].0, parsed[1].0, parsed[2].0, parsed[3].0],
+            [parsed[0].1, parsed[1].1, parsed[2].1, parsed[3].1],
+        ),
+        _ => (fallback_margin, fallback_auto),
+    }
 }
 
 /// Parse a box model shorthand (margin/padding) into four values.
@@ -1000,10 +1698,10 @@ fn parse_length(s: &str) -> Option<f32> {
 /// - 2 values: vertical, horizontal
 /// - 3 values: top, horizontal, bottom
 /// - 4 values: top, right, bottom, left
-fn parse_box_four(s: &str, fallback: [f32; 4]) -> [f32; 4] {
+fn parse_box_four(s: &str, fallback: [f32; 4], ctx: LengthContext) -> [f32; 4] {
     let parts: Vec<f32> = s
         .split_whitespace()
-        .filter_map(|p| parse_length(p))
+        .filter_map(|p| parse_length_ctx(p, ctx))
         .collect();
 
     match parts.len() {
@@ -1017,7 +1715,7 @@ fn parse_box_four(s: &str, fallback: [f32; 4]) -> [f32; 4] {
 
 /// Parse flex-basis value: "auto" -> FlexBasis::Auto, numeric length -> FlexBasis::Pixels(px),
 /// percentage value (e.g. "50%") -> FlexBasis::Percentage(frac).
-fn parse_flex_basis(s: &str) -> FlexBasis {
+fn parse_flex_basis(s: &str, ctx: LengthContext) -> FlexBasis {
     let s = s.trim();
     if s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("content") {
         return FlexBasis::Auto;
@@ -1027,16 +1725,14 @@ fn parse_flex_basis(s: &str) -> FlexBasis {
             return FlexBasis::Percentage(n / 100.0);
         }
     }
-    if let Some(px_val) = s.strip_suffix("px") {
-        if let Ok(n) = px_val.parse::<f32>() {
-            return FlexBasis::Pixels(n);
-        }
+    if let Some(px) = parse_length_ctx(s, ctx) {
+        return FlexBasis::Pixels(px);
     }
     FlexBasis::Auto
 }
 
 /// Parse the flex shorthand property: "flex: <grow> <shrink>? <basis>?"
-fn parse_flex_shorthand(self_vals: &mut ComputedValues, val: &str) {
+fn parse_flex_shorthand(self_vals: &mut ComputedValues, val: &str, ctx: LengthContext) {
     let parts: Vec<&str> = val.trim().split_whitespace().collect();
 
     if parts.is_empty() {
@@ -1077,7 +1773,7 @@ fn parse_flex_shorthand(self_vals: &mut ComputedValues, val: &str) {
         if let Ok(shrink) = parts[1].parse::<f32>() {
             self_vals.flex_shrink = shrink;
         } else {
-            self_vals.flex_basis = parse_flex_basis(parts[1]);
+            self_vals.flex_basis = parse_flex_basis(parts[1], ctx);
         }
         return;
     }
@@ -1090,7 +1786,7 @@ fn parse_flex_shorthand(self_vals: &mut ComputedValues, val: &str) {
         if let Ok(shrink) = parts[1].parse::<f32>() {
             self_vals.flex_shrink = shrink;
         }
-        self_vals.flex_basis = parse_flex_basis(parts[2]);
+        self_vals.flex_basis = parse_flex_basis(parts[2], ctx);
     }
 }
 
@@ -1108,34 +1804,121 @@ fn parse_align_content(s: &str) -> AlignContent {
     }
 }
 
-/// Parse a grid track list like "1fr 1fr 200px auto" into GridTrack enums.
-fn parse_grid_track_list(value: &str) -> Vec<GridTrack> {
+/// Parse align-self value.
+fn parse_align_self(s: &str) -> AlignSelf {
+    match s.trim() {
+        "auto" => AlignSelf::Auto,
+        "flex-start" | "start" => AlignSelf::FlexStart,
+        "flex-end" | "end" => AlignSelf::FlexEnd,
+        "center" => AlignSelf::Center,
+        "baseline" => AlignSelf::Baseline,
+        "stretch" => AlignSelf::Stretch,
+        _ => AlignSelf::Auto,
+    }
+}
+
+/// Parse a single track token string (e.g. "1fr", "200px", "min-content", "max-content", "auto", "fit-content(100px)")
+fn parse_single_grid_track(token: &str, ctx: LengthContext) -> Option<GridTrack> {
+    let token = token.trim();
+    if token.eq_ignore_ascii_case("auto") {
+        return Some(GridTrack::Auto);
+    }
+    if token.eq_ignore_ascii_case("min-content") {
+        return Some(GridTrack::MinContent);
+    }
+    if token.eq_ignore_ascii_case("max-content") {
+        return Some(GridTrack::MaxContent);
+    }
+    if let Some(fit) = token
+        .strip_prefix("fit-content(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let fit_px = parse_length_ctx(fit.trim(), ctx).unwrap_or(0.0);
+        return Some(GridTrack::FitContent(fit_px));
+    }
+    if let Some(fr_val) = token.strip_suffix("fr") {
+        if let Ok(n) = fr_val.parse::<f32>() {
+            return Some(GridTrack::Fr(n));
+        }
+    }
+    if let Some(px) = parse_length_ctx(token, ctx) {
+        return Some(GridTrack::Fixed(px));
+    }
+    None
+}
+
+/// Parse a grid track list like "1fr 1fr 200px auto min-content repeat(3, 1fr)" into GridTrack enums.
+fn parse_grid_track_list(value: &str, ctx: LengthContext) -> Vec<GridTrack> {
     let mut tracks = Vec::new();
-    for token in value.split_whitespace() {
-        if let Some(fr_val) = token.strip_suffix('r') {
-            // Check if the character before 'r' is 'f' (i.e. "fr" suffix)
-            let bytes = fr_val.as_bytes();
-            if let Some(&last) = bytes.last() {
-                if last == b'f' {
-                    let num_str = &fr_val[..fr_val.len() - 1];
-                    if let Ok(n) = num_str.parse::<f32>() {
-                        tracks.push(GridTrack::Fr(n));
-                        continue;
+    let val_trimmed = value.trim();
+    if val_trimmed.is_empty() {
+        return tracks;
+    }
+
+    // Handle repeat(...) syntax: e.g. repeat(3, 1fr) or repeat(2, min-content 1fr)
+    let mut chars = val_trimmed.chars().peekable();
+    let mut token = String::new();
+    let mut paren_depth = 0usize;
+
+    while let Some(ch) = chars.next() {
+        if ch == '(' {
+            paren_depth += 1;
+            token.push(ch);
+        } else if ch == ')' {
+            if paren_depth > 0 {
+                paren_depth -= 1;
+            }
+            token.push(ch);
+            if paren_depth == 0 {
+                let trimmed_tok = token.trim();
+                if let Some(repeat_content) = trimmed_tok
+                    .strip_prefix("repeat(")
+                    .and_then(|s| s.strip_suffix(')'))
+                {
+                    if let Some((count_str, track_str)) = repeat_content.split_once(',') {
+                        if let Ok(count) = count_str.trim().parse::<usize>() {
+                            let sub_tracks = parse_grid_track_list(track_str, ctx);
+                            for _ in 0..count.min(100) {
+                                tracks.extend(sub_tracks.iter().cloned());
+                            }
+                        }
+                    }
+                } else if let Some(tr) = parse_single_grid_track(trimmed_tok, ctx) {
+                    tracks.push(tr);
+                }
+                token.clear();
+            }
+        } else if ch.is_whitespace() && paren_depth == 0 {
+            if !token.is_empty() {
+                if let Some(tr) = parse_single_grid_track(&token, ctx) {
+                    tracks.push(tr);
+                }
+                token.clear();
+            }
+        } else {
+            token.push(ch);
+        }
+    }
+
+    if !token.is_empty() {
+        let trimmed_tok = token.trim();
+        if let Some(repeat_content) = trimmed_tok
+            .strip_prefix("repeat(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            if let Some((count_str, track_str)) = repeat_content.split_once(',') {
+                if let Ok(count) = count_str.trim().parse::<usize>() {
+                    let sub_tracks = parse_grid_track_list(track_str, ctx);
+                    for _ in 0..count.min(100) {
+                        tracks.extend(sub_tracks.iter().cloned());
                     }
                 }
             }
-        }
-        if token.eq_ignore_ascii_case("auto") {
-            tracks.push(GridTrack::Auto);
-            continue;
-        }
-        if let Some(px_val) = token.strip_suffix('x').and_then(|s| s.strip_suffix('p')) {
-            if let Ok(n) = px_val.parse::<f32>() {
-                tracks.push(GridTrack::Fixed(n));
-                continue;
-            }
+        } else if let Some(tr) = parse_single_grid_track(trimmed_tok, ctx) {
+            tracks.push(tr);
         }
     }
+
     tracks
 }
 
@@ -1168,13 +1951,63 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
         ("ul", "display: block; padding-left: 40px; margin: 1em 0"),
         ("ol", "display: block; padding-left: 40px; margin: 1em 0"),
         ("li", "display: block"),
-        ("table", "display: table"),
+        (
+            "table",
+            "display: table; border-collapse: collapse; margin: 0.5em 0",
+        ),
+        ("thead", "display: table-header-group"),
+        ("tbody", "display: table-row-group"),
+        ("tfoot", "display: table-footer-group"),
+        ("tr", "display: table-row"),
+        (
+            "td",
+            "display: table-cell; padding: 4px 8px; border: 1px solid #a2a9b1",
+        ),
+        (
+            "th",
+            "display: table-cell; font-weight: bold; padding: 4px 8px; border: 1px solid #c8ccd1; background-color: #eaecf0; text-align: center",
+        ),
+        ("caption", "display: table-caption"),
+        ("colgroup", "display: table-column-group"),
+        ("col", "display: table-column"),
         ("img", "display: inline"),
-        ("a", "display: inline"),
+        (
+            "a",
+            "display: inline; color: #0645ad; text-decoration: underline",
+        ),
         ("div", "display: block"),
+        ("center", "display: block; text-align: center"),
+        ("main", "display: block"),
+        ("header", "display: block"),
+        ("footer", "display: block"),
+        ("nav", "display: block"),
+        ("section", "display: block"),
+        ("article", "display: block"),
+        ("aside", "display: block"),
+        ("figure", "display: block; margin: 1em 40px"),
+        ("figcaption", "display: block"),
         ("span", "display: inline"),
+        ("br", "display: inline"),
         ("form", "display: block"),
-        ("input", "display: inline"),
+        (
+            "input",
+            "display: inline-block; padding: 4px 8px; border: 1px solid #767676; border-radius: 2px; background-color: #ffffff; color: #000000",
+        ),
+        (
+            "button",
+            "display: inline-block; padding: 4px 12px; border: 1px solid #767676; border-radius: 2px; background-color: #f0f0f0; color: #000000; font-weight: bold",
+        ),
+        (
+            "textarea",
+            "display: inline-block; padding: 4px 8px; border: 1px solid #767676; border-radius: 2px; background-color: #ffffff",
+        ),
+        ("head", "display: none"),
+        ("script", "display: none"),
+        ("style", "display: none"),
+        ("meta", "display: none"),
+        ("title", "display: none"),
+        ("link", "display: none"),
+        ("noscript", "display: none"),
     ];
 
     let mut rules = Vec::new();
@@ -1191,6 +2024,7 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
     parser::Stylesheet {
         rules,
         imports: Vec::new(),
+        media_rules: Vec::new(),
     }
 }
 
@@ -1207,7 +2041,11 @@ pub fn merge_stylesheets_with_author(
     rules.extend_from_slice(&author.rules);
     // UA stylesheet has no imports; pass through author imports (already resolved at fetch time)
     let imports = author.imports.clone();
-    parser::Stylesheet { rules, imports }
+    parser::Stylesheet {
+        rules,
+        imports,
+        media_rules: author.media_rules.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -1503,7 +2341,7 @@ mod tests {
     fn cascade_basic_match() {
         let arena = crate::html::parse_html("<div>Hello</div>");
         let stylesheet = parser::parse_stylesheet("div { color: red; }");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         // The <div> should have a computed style entry
         assert!(!styles.is_empty());
@@ -1529,7 +2367,7 @@ mod tests {
         // ID selector (#mydiv) has higher specificity than type selector (div)
         let arena = crate::html::parse_html(r#"<div id="mydiv">Test</div>"#);
         let stylesheet = parser::parse_stylesheet("div { color: blue; } #mydiv { color: red; }");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
@@ -1551,7 +2389,7 @@ mod tests {
         let arena = crate::html::parse_html(r#"<div id="x">Test</div>"#);
         let stylesheet =
             parser::parse_stylesheet("div { color: blue !important; } #x { color: red; }");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
@@ -1572,7 +2410,7 @@ mod tests {
         // Same specificity: later rule wins
         let arena = crate::html::parse_html(r#"<div class="a">Test</div>"#);
         let stylesheet = parser::parse_stylesheet(".a { color: red; } .a { color: blue; }");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
@@ -1594,7 +2432,7 @@ mod tests {
         let arena = crate::html::parse_html("<div style='color:red'><span>child</span></div>");
         // Style only on <div>; <span> should inherit
         let stylesheet = parser::parse_stylesheet("div { color: red; }");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let span_id = nodes.iter().position(|n| {
@@ -1620,7 +2458,7 @@ mod tests {
     fn inheritance_font_size_propagates() {
         let arena = crate::html::parse_html("<div><p>text</p></div>");
         let stylesheet = parser::parse_stylesheet("div { font-size: 24px; }");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let p_id = nodes.iter().position(|n| {
@@ -1638,7 +2476,7 @@ mod tests {
     fn defaults_applied() {
         let arena = crate::html::parse_html("<div></div>");
         let stylesheet = parser::parse_stylesheet(""); // empty stylesheet
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         assert!(!styles.is_empty());
         // All element nodes should have default ComputedValues
@@ -1931,7 +2769,7 @@ mod tests {
         // Parent has overflow:hidden; child should have default visible.
         let arena = crate::html::parse_html("<div><p>child</p></div>");
         let stylesheet = parser::parse_stylesheet("div { overflow: hidden; }");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
@@ -1964,7 +2802,7 @@ mod tests {
     fn inline_style_applied() {
         let arena = crate::html::parse_html(r#"<div style="color: blue;">Test</div>"#);
         let stylesheet = parser::parse_stylesheet("");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
@@ -1983,7 +2821,7 @@ mod tests {
     fn inline_style_overrides_stylesheet() {
         let arena = crate::html::parse_html(r#"<div id="mydiv" style="color: green;">Test</div>"#);
         let stylesheet = parser::parse_stylesheet("div { color: red; } #mydiv { color: blue; }");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
@@ -2004,7 +2842,7 @@ mod tests {
             r#"<div style="color: red; font-size: 20px; background-color: yellow;">Test</div>"#,
         );
         let stylesheet = parser::parse_stylesheet("");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
@@ -2025,7 +2863,7 @@ mod tests {
     fn inline_style_combines_with_stylesheet() {
         let arena = crate::html::parse_html(r#"<div style="color: red;">Test</div>"#);
         let stylesheet = parser::parse_stylesheet("div { font-size: 18px; }");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
@@ -2045,7 +2883,7 @@ mod tests {
     fn inline_style_overrides_important() {
         let arena = crate::html::parse_html(r#"<div style="color: red;">Test</div>"#);
         let stylesheet = parser::parse_stylesheet("div { color: blue !important; }");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
@@ -2064,7 +2902,7 @@ mod tests {
     fn inline_style_no_style_attribute() {
         let arena = crate::html::parse_html("<div>No inline style</div>");
         let stylesheet = parser::parse_stylesheet("div { color: green; }");
-        let styles = compute_styles_for_tree(&arena, &stylesheet);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         assert!(!styles.is_empty());
         let nodes = arena.nodes.borrow();
@@ -2094,7 +2932,7 @@ mod tests {
         let ua = user_agent_stylesheet();
         let empty_author = parser::parse_stylesheet("");
         let merged = merge_stylesheets_with_author(&ua, &empty_author);
-        let styles = compute_styles_for_tree(&arena, &merged);
+        let styles = compute_styles_for_tree(&arena, &merged, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let body_id = nodes.iter().position(|n| {
@@ -2126,7 +2964,7 @@ mod tests {
         let ua = user_agent_stylesheet();
         let empty_author = parser::parse_stylesheet("");
         let merged = merge_stylesheets_with_author(&ua, &empty_author);
-        let styles = compute_styles_for_tree(&arena, &merged);
+        let styles = compute_styles_for_tree(&arena, &merged, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let ul_id = nodes.iter().position(|n| {
@@ -2150,7 +2988,7 @@ mod tests {
         let ua = user_agent_stylesheet();
         let empty_author = parser::parse_stylesheet("");
         let merged = merge_stylesheets_with_author(&ua, &empty_author);
-        let styles = compute_styles_for_tree(&arena, &merged);
+        let styles = compute_styles_for_tree(&arena, &merged, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let p_id = nodes.iter().position(|n| {
@@ -2159,11 +2997,130 @@ mod tests {
         if let Some(id) = p_id {
             let p_styles = styles.get(&(id as u32)).expect("p has styles");
             assert_eq!(p_styles.display, DisplayType::Block, "p should be block");
-            assert_eq!(p_styles.margin[0], 1.0, "p top margin from UA");
-            assert_eq!(p_styles.margin[2], 1.0, "p bottom margin from UA");
+            // UA rule is `margin: 1em 0`, and <p> inherits the 16px default font size.
+            assert_eq!(p_styles.margin[0], 16.0, "p top margin from UA (1em)");
+            assert_eq!(p_styles.margin[2], 16.0, "p bottom margin from UA (1em)");
         } else {
             assert!(false, "Expected to find a <p> node");
         }
+    }
+
+    // ------ Length units ------
+
+    /// Find the computed styles of the first element with the given tag name.
+    fn styles_for_tag<'a>(
+        arena: &crate::html::DomArena,
+        styles: &'a FxHashMap<u32, ComputedValues>,
+        tag: &str,
+    ) -> &'a ComputedValues {
+        let nodes = arena.nodes.borrow();
+        let id = nodes
+            .iter()
+            .position(|n| n.is_element() && n.tag_name().is_some_and(|t| t.as_ref() == tag))
+            .unwrap_or_else(|| panic!("expected a <{tag}> element"));
+        styles.get(&(id as u32)).expect("element has styles")
+    }
+
+    #[test]
+    fn absolute_length_units_convert_to_px() {
+        let ctx = LengthContext::default();
+        assert_eq!(parse_length_ctx("10px", ctx), Some(10.0));
+        assert_eq!(parse_length_ctx("0", ctx), Some(0.0));
+        assert_eq!(parse_length_ctx("12pt", ctx), Some(16.0));
+        assert_eq!(parse_length_ctx("1in", ctx), Some(96.0));
+        assert_eq!(parse_length_ctx("1pc", ctx), Some(16.0));
+        assert_eq!(parse_length_ctx("2.54cm", ctx).unwrap().round(), 96.0);
+        assert_eq!(parse_length_ctx("25.4mm", ctx).unwrap().round(), 96.0);
+    }
+
+    #[test]
+    fn font_relative_units_use_context() {
+        let ctx = LengthContext {
+            font_size: 20.0,
+            root_font_size: 10.0,
+            ..LengthContext::default()
+        };
+        assert_eq!(parse_length_ctx("2em", ctx), Some(40.0));
+        assert_eq!(parse_length_ctx("2rem", ctx), Some(20.0));
+        assert_eq!(parse_length_ctx("1ex", ctx), Some(10.0));
+    }
+
+    #[test]
+    fn viewport_units_use_context() {
+        let ctx = LengthContext {
+            viewport_width: 1000.0,
+            viewport_height: 500.0,
+            ..LengthContext::default()
+        };
+        assert_eq!(parse_length_ctx("50vw", ctx), Some(500.0));
+        assert_eq!(parse_length_ctx("10vh", ctx), Some(50.0));
+        assert_eq!(parse_length_ctx("10vmin", ctx), Some(50.0));
+        assert_eq!(parse_length_ctx("10vmax", ctx), Some(100.0));
+    }
+
+    #[test]
+    fn unknown_units_and_percentages_are_rejected() {
+        let ctx = LengthContext::default();
+        assert_eq!(parse_length_ctx("50%", ctx), None);
+        assert_eq!(parse_length_ctx("10foo", ctx), None);
+        assert_eq!(parse_length_ctx("auto", ctx), None);
+        assert_eq!(parse_length_ctx("", ctx), None);
+    }
+
+    #[test]
+    fn em_font_size_resolves_against_parent() {
+        // h1's UA rule is `font-size: 2em`, so it must be twice the inherited 16px.
+        let arena = crate::html::parse_html("<html><body><h1>Title</h1></body></html>");
+        let ua = user_agent_stylesheet();
+        let merged = merge_stylesheets_with_author(&ua, &parser::parse_stylesheet(""));
+        let styles = compute_styles_for_tree(&arena, &merged, (1024.0, 768.0));
+
+        assert_eq!(styles_for_tag(&arena, &styles, "h1").font_size, 32.0);
+    }
+
+    #[test]
+    fn em_length_resolves_against_own_font_size() {
+        let arena = crate::html::parse_html("<html><body><div>x</div></body></html>");
+        let author = parser::parse_stylesheet("div { font-size: 20px; padding: 2em; }");
+        let styles = compute_styles_for_tree(&arena, &author, (1024.0, 768.0));
+
+        let div = styles_for_tag(&arena, &styles, "div");
+        assert_eq!(div.font_size, 20.0);
+        assert_eq!(div.padding, [40.0; 4], "2em against the element's own 20px");
+    }
+
+    #[test]
+    fn rem_resolves_against_root_font_size() {
+        let arena = crate::html::parse_html("<html><body><div>x</div></body></html>");
+        let author = parser::parse_stylesheet(
+            "html { font-size: 10px; } div { width: 5rem; padding: 1rem; }",
+        );
+        let styles = compute_styles_for_tree(&arena, &author, (1024.0, 768.0));
+
+        let div = styles_for_tag(&arena, &styles, "div");
+        assert_eq!(div.width, Some(50.0));
+        assert_eq!(div.padding, [10.0; 4]);
+    }
+
+    #[test]
+    fn viewport_units_resolve_against_actual_viewport() {
+        let arena = crate::html::parse_html("<html><body><div>x</div></body></html>");
+        let author = parser::parse_stylesheet("div { width: 50vw; height: 25vh; }");
+        let styles = compute_styles_for_tree(&arena, &author, (1000.0, 800.0));
+
+        let div = styles_for_tag(&arena, &styles, "div");
+        assert_eq!(div.width, Some(500.0));
+        assert_eq!(div.height, Some(200.0));
+    }
+
+    #[test]
+    fn em_compounds_through_nested_elements() {
+        let arena = crate::html::parse_html("<html><body><div><span>x</span></div></body></html>");
+        let author =
+            parser::parse_stylesheet("div { font-size: 20px; } span { font-size: 1.5em; }");
+        let styles = compute_styles_for_tree(&arena, &author, (1024.0, 768.0));
+
+        assert_eq!(styles_for_tag(&arena, &styles, "span").font_size, 30.0);
     }
 
     #[test]
@@ -2172,7 +3129,7 @@ mod tests {
         let ua = user_agent_stylesheet();
         let author = parser::parse_stylesheet("div { display: inline; }");
         let merged = merge_stylesheets_with_author(&ua, &author);
-        let styles = compute_styles_for_tree(&arena, &merged);
+        let styles = compute_styles_for_tree(&arena, &merged, (1024.0, 768.0));
 
         let nodes = arena.nodes.borrow();
         let div_id = nodes.iter().position(|n| {
@@ -2320,7 +3277,7 @@ mod tests {
         let stylesheet = merge_stylesheets_with_author(&ua_stylesheet, &author_stylesheet);
 
         // Without hover — the <a> should NOT have red color from :hover rule
-        let styles_no_hover = compute_styles_for_tree(&arena, &stylesheet);
+        let styles_no_hover = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
 
         // With hover — mark node_id 3 (the <a>) as hovered
         // Node IDs: 0=document, 1=html, 2=body, 3=a
@@ -2329,24 +3286,34 @@ mod tests {
         let link_node_id = nodes_ref
             .iter()
             .enumerate()
-            .find(|(_, n)| n.is_element())
+            .find(|(_, n)| n.is_element() && n.tag_name().map(|t| t.as_ref()) == Some("a"))
             .map(|(i, _)| i as u32);
         drop(nodes_ref);
 
-        // Compute with the <a> marked as hovered (try node 3 which should be the <a>)
-        let styles_with_hover = compute_styles_for_tree_with_hover(&arena, &stylesheet, &[3]);
+        // Compute with the <a> marked as hovered
+        let link_id = link_node_id.expect("Should have found <a> tag");
+        let styles_with_hover =
+            compute_styles_for_tree_with_hover(&arena, &stylesheet, (1024.0, 768.0), &[link_id]);
 
         // The hovered node should have styles computed from the :hover rule
         // Check that it has a non-default color
-        if let Some(computed) = styles_with_hover.get(&3) {
-            assert_eq!(computed.color, Some([255, 0, 0, 255]), "Hovered <a> should have red color");
+        if let Some(computed) = styles_with_hover.get(&link_id) {
+            assert_eq!(
+                computed.color,
+                Some([255, 0, 0, 255]),
+                "Hovered <a> should have red color"
+            );
         } else {
-            panic!("Node 3 (<a>) should have computed styles");
+            panic!("Node {} (<a>) should have computed styles", link_id);
         }
 
         // Without hover, the color should NOT be red (no other rule sets it)
-        if let Some(computed) = styles_no_hover.get(&3) {
-            assert_ne!(computed.color, Some([255, 0, 0, 255]), "Non-hovered <a> should NOT have red color");
+        if let Some(computed) = styles_no_hover.get(&link_id) {
+            assert_ne!(
+                computed.color,
+                Some([255, 0, 0, 255]),
+                "Non-hovered <a> should NOT have red color"
+            );
         }
     }
 
@@ -2362,8 +3329,9 @@ mod tests {
         let stylesheet = merge_stylesheets_with_author(&ua_stylesheet, &author_stylesheet);
 
         // Static computation should produce same result as hover with empty set
-        let static_styles = compute_styles_for_tree(&arena, &stylesheet);
-        let no_hover_styles = compute_styles_for_tree_with_hover(&arena, &stylesheet, &[]);
+        let static_styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
+        let no_hover_styles =
+            compute_styles_for_tree_with_hover(&arena, &stylesheet, (1024.0, 768.0), &[]);
 
         // Both should have the same number of entries and same background_color for each node
         assert_eq!(static_styles.len(), no_hover_styles.len());
@@ -2371,10 +3339,246 @@ mod tests {
             if let Some(other) = no_hover_styles.get(&id) {
                 assert_eq!(
                     computed.background_color, other.background_color,
-                    "Node {} background_color mismatch", id
+                    "Node {} background_color mismatch",
+                    id
                 );
                 assert_eq!(computed.color, other.color, "Node {} color mismatch", id);
             }
         }
+    }
+
+    #[test]
+    fn test_table_display_types() {
+        let decls = [
+            ("display: table", DisplayType::Table),
+            ("display: inline-table", DisplayType::InlineTable),
+            ("display: table-row-group", DisplayType::TableRowGroup),
+            ("display: table-header-group", DisplayType::TableHeaderGroup),
+            ("display: table-footer-group", DisplayType::TableFooterGroup),
+            ("display: table-row", DisplayType::TableRow),
+            ("display: table-cell", DisplayType::TableCell),
+            ("display: table-caption", DisplayType::TableCaption),
+            ("display: table-column", DisplayType::TableColumn),
+            ("display: table-column-group", DisplayType::TableColumnGroup),
+        ];
+
+        for (css_str, expected) in decls {
+            let parsed = parse_declarations(css_str);
+            let mut computed = ComputedValues::default();
+            for decl in parsed {
+                computed = computed.from_declaration(&decl);
+            }
+            assert_eq!(computed.display, expected, "Failed for {}", css_str);
+        }
+    }
+
+    #[test]
+    fn test_grid_track_advanced_parsing() {
+        let tracks = parse_grid_track_list(
+            "min-content 1fr max-content 200px fit-content(300px) auto",
+            LengthContext::default(),
+        );
+        assert_eq!(tracks.len(), 6);
+        assert_eq!(tracks[0], GridTrack::MinContent);
+        assert_eq!(tracks[1], GridTrack::Fr(1.0));
+        assert_eq!(tracks[2], GridTrack::MaxContent);
+        assert_eq!(tracks[3], GridTrack::Fixed(200.0));
+        assert_eq!(tracks[4], GridTrack::FitContent(300.0));
+        assert_eq!(tracks[5], GridTrack::Auto);
+    }
+
+    #[test]
+    fn test_grid_repeat_syntax() {
+        let tracks = parse_grid_track_list(
+            "repeat(3, 1fr) 200px repeat(2, min-content 100px)",
+            LengthContext::default(),
+        );
+        assert_eq!(tracks.len(), 8);
+        assert_eq!(tracks[0], GridTrack::Fr(1.0));
+        assert_eq!(tracks[1], GridTrack::Fr(1.0));
+        assert_eq!(tracks[2], GridTrack::Fr(1.0));
+        assert_eq!(tracks[3], GridTrack::Fixed(200.0));
+        assert_eq!(tracks[4], GridTrack::MinContent);
+        assert_eq!(tracks[5], GridTrack::Fixed(100.0));
+        assert_eq!(tracks[6], GridTrack::MinContent);
+        assert_eq!(tracks[7], GridTrack::Fixed(100.0));
+    }
+
+    #[test]
+    fn test_align_self_parsing() {
+        let decls = [
+            ("align-self: auto", AlignSelf::Auto),
+            ("align-self: flex-start", AlignSelf::FlexStart),
+            ("align-self: flex-end", AlignSelf::FlexEnd),
+            ("align-self: center", AlignSelf::Center),
+            ("align-self: stretch", AlignSelf::Stretch),
+        ];
+
+        for (css_str, expected) in decls {
+            let parsed = parse_declarations(css_str);
+            let mut computed = ComputedValues::default();
+            for decl in parsed {
+                computed = computed.from_declaration(&decl);
+            }
+            assert_eq!(computed.align_self, expected, "Failed for {}", css_str);
+        }
+    }
+
+    #[test]
+    fn test_css_variable_resolution_basic() {
+        let mut vars = rustc_hash::FxHashMap::default();
+        vars.insert("--main-color".to_string(), "#ff0000".to_string());
+        vars.insert("--base-size".to_string(), "20px".to_string());
+
+        let res1 = resolve_var_functions("var(--main-color)", &vars);
+        assert_eq!(res1, "#ff0000");
+
+        let res2 = resolve_var_functions("var(--base-size)", &vars);
+        assert_eq!(res2, "20px");
+
+        let res3 = resolve_var_functions("var(--missing, #00ff00)", &vars);
+        assert_eq!(res3, "#00ff00");
+
+        let res4 = resolve_var_functions("var(--missing, var(--main-color))", &vars);
+        assert_eq!(res4, "#ff0000");
+    }
+
+    #[test]
+    fn test_css_variable_inheritance_in_tree() {
+        let html = r#"
+            <html>
+                <body>
+                    <div id="parent">
+                        <span id="child">Text</span>
+                    </div>
+                </body>
+            </html>
+        "#;
+        let css = r#"
+            #parent {
+                --theme-color: rgb(255, 128, 0);
+                color: var(--theme-color);
+            }
+            #child {
+                background-color: var(--theme-color);
+            }
+        "#;
+        let arena = crate::html::parse_html(html);
+        let stylesheet = parser::parse_stylesheet(css);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
+
+        let nodes = arena.nodes.borrow();
+        let child_id = nodes
+            .iter()
+            .position(|n| n.is_element() && n.get_attr("id") == Some("child"))
+            .unwrap() as u32;
+
+        let child_styles = styles.get(&child_id).expect("child styles");
+        assert_eq!(child_styles.background_color, Some([255, 128, 0, 255]));
+        assert_eq!(child_styles.color, Some([255, 128, 0, 255]));
+    }
+
+    #[test]
+    fn test_attribute_selectors_comprehensive() {
+        let html = r#"
+            <html>
+                <body>
+                    <a id="a1" href="https://example.com/page.html" class="btn primary" target="_blank">Link 1</a>
+                    <a id="a2" href="/relative/path" class="btn secondary">Link 2</a>
+                    <div id="d1" data-role="custom-widget-v1">Widget</div>
+                </body>
+            </html>
+        "#;
+        let css = r#"
+            a[target] { color: rgb(1, 1, 1); }
+            a[href^="https://"] { font-size: 24px; }
+            a[href$=".html"] { line-height: 2.0; }
+            a[class~="primary"] { margin-top: 15px; }
+            div[data-role*="widget"] { padding-left: 30px; }
+        "#;
+        let arena = crate::html::parse_html(html);
+        let stylesheet = parser::parse_stylesheet(css);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
+
+        let nodes = arena.nodes.borrow();
+        let a1_id = nodes
+            .iter()
+            .position(|n| n.is_element() && n.get_attr("id") == Some("a1"))
+            .unwrap() as u32;
+        let a2_id = nodes
+            .iter()
+            .position(|n| n.is_element() && n.get_attr("id") == Some("a2"))
+            .unwrap() as u32;
+        let d1_id = nodes
+            .iter()
+            .position(|n| n.is_element() && n.get_attr("id") == Some("d1"))
+            .unwrap() as u32;
+
+        let a1_styles = styles.get(&a1_id).unwrap();
+        assert_eq!(a1_styles.color, Some([1, 1, 1, 255]), "a1 matches [target]");
+        assert_eq!(a1_styles.font_size, 24.0, "a1 matches [href^='https://']");
+        assert_eq!(a1_styles.line_height, 2.0, "a1 matches [href$='.html']");
+        assert_eq!(a1_styles.margin[0], 15.0, "a1 matches [class~='primary']");
+
+        let a2_styles = styles.get(&a2_id).unwrap();
+        assert_ne!(
+            a2_styles.color,
+            Some([1, 1, 1, 255]),
+            "a2 should NOT match [target]"
+        );
+
+        let d1_styles = styles.get(&d1_id).unwrap();
+        assert_eq!(
+            d1_styles.padding[3], 30.0,
+            "d1 matches [data-role*='widget']"
+        );
+    }
+
+    #[test]
+    fn test_pseudo_classes_nth_child_last_child() {
+        let html = r#"
+            <html>
+                <body>
+                    <ul id="list">
+                        <li id="li1">Item 1</li>
+                        <li id="li2">Item 2</li>
+                        <li id="li3">Item 3</li>
+                        <li id="li4">Item 4</li>
+                    </ul>
+                </body>
+            </html>
+        "#;
+        let css = r#"
+            li:first-child { margin-top: 10px; }
+            li:last-child { margin-bottom: 20px; }
+            li:nth-child(even) { font-size: 22px; }
+        "#;
+        let arena = crate::html::parse_html(html);
+        let stylesheet = parser::parse_stylesheet(css);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
+
+        let nodes = arena.nodes.borrow();
+        let li1_id = nodes
+            .iter()
+            .position(|n| n.is_element() && n.get_attr("id") == Some("li1"))
+            .unwrap() as u32;
+        let li2_id = nodes
+            .iter()
+            .position(|n| n.is_element() && n.get_attr("id") == Some("li2"))
+            .unwrap() as u32;
+        let li4_id = nodes
+            .iter()
+            .position(|n| n.is_element() && n.get_attr("id") == Some("li4"))
+            .unwrap() as u32;
+
+        let li1 = styles.get(&li1_id).unwrap();
+        assert_eq!(li1.margin[0], 10.0, "li1 is :first-child");
+
+        let li2 = styles.get(&li2_id).unwrap();
+        assert_eq!(li2.font_size, 22.0, "li2 is 2nd child (:nth-child(even))");
+
+        let li4 = styles.get(&li4_id).unwrap();
+        assert_eq!(li4.margin[2], 20.0, "li4 is :last-child");
+        assert_eq!(li4.font_size, 22.0, "li4 is 4th child (:nth-child(even))");
     }
 }

@@ -38,7 +38,6 @@ pub struct Renderer {
     text_pipeline: wgpu::RenderPipeline,
     /// Bind group layout for the text pipeline (texture + sampler).
     text_bind_group_layout: wgpu::BindGroupLayout,
-
 }
 
 impl Renderer {
@@ -180,8 +179,6 @@ impl Renderer {
         // Create text render pipeline (textured quad overlay)
         let text_pipeline = Self::create_text_pipeline(&device, surface_format);
         let text_bind_group_layout = text_pipeline.get_bind_group_layout(0);
-
-
 
         log::info!(
             "Renderer initialized — surface format: {:?}, size: {}x{}",
@@ -732,6 +729,16 @@ pub fn color_u8_to_f32(color: [u8; 4]) -> ColorF {
 /// * `src_height` - Height of the source image in pixels.
 /// * `dest` - Destination RGBA buffer (mutable, 4 bytes per pixel).
 /// * `dest_width` - Width of the destination buffer in pixels.
+/// Composite an image buffer into a destination RGBA buffer at the specified position.
+///
+/// Blends `src_rgba` into `dest` using standard alpha compositing (over operator).
+/// Handles out-of-bounds clipping automatically.
+///
+/// * `src_rgba` - Raw RGBA8 pixel data for the source image.
+/// * `src_width` - Width of the source image in pixels.
+/// * `src_height` - Height of the source image in pixels.
+/// * `dest` - Target RGBA8 buffer to blend into.
+/// * `dest_width` - Width of the destination buffer in pixels.
 /// * `dest_height` - Height of the destination buffer in pixels.
 /// * `dest_x` - X position (in layout space) to place the top-left of the image.
 /// * `dest_y` - Y position (in layout space) to place the top-left of the image.
@@ -745,22 +752,61 @@ pub fn composite_image(
     dest_x: f32,
     dest_y: f32,
 ) {
+    composite_image_scaled(
+        src_rgba,
+        src_width,
+        src_height,
+        dest,
+        dest_width,
+        dest_height,
+        dest_x,
+        dest_y,
+        src_width as f32,
+        src_height as f32,
+    );
+}
+
+/// Composite and scale an image buffer into a destination RGBA buffer.
+pub fn composite_image_scaled(
+    src_rgba: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    dest_x: f32,
+    dest_y: f32,
+    target_width: f32,
+    target_height: f32,
+) {
+    if src_width == 0 || src_height == 0 || target_width <= 0.0 || target_height <= 0.0 {
+        return;
+    }
+
     let dx_base = dest_x as i32;
     let dy_base = dest_y as i32;
+    let target_w_i = target_width as i32;
+    let target_h_i = target_height as i32;
 
-    for src_y in 0..src_height as i32 {
-        let d_y = dy_base + src_y;
+    for out_y in 0..target_h_i {
+        let d_y = dy_base + out_y;
         if d_y < 0 || d_y >= dest_height as i32 {
             continue;
         }
 
-        for src_x in 0..src_width as i32 {
-            let d_x = dx_base + src_x;
+        let src_y = ((out_y as f32 / target_height) * src_height as f32)
+            .min((src_height - 1) as f32) as usize;
+
+        for out_x in 0..target_w_i {
+            let d_x = dx_base + out_x;
             if d_x < 0 || d_x >= dest_width as i32 {
                 continue;
             }
 
-            let src_idx = ((src_y as usize) * src_width as usize + (src_x as usize)) * 4;
+            let src_x = ((out_x as f32 / target_width) * src_width as f32)
+                .min((src_width - 1) as f32) as usize;
+
+            let src_idx = (src_y * src_width as usize + src_x) * 4;
             let dst_idx = ((d_y as usize) * dest_width as usize + (d_x as usize)) * 4;
 
             if src_idx + 3 < src_rgba.len() && dst_idx + 3 < dest.len() {
@@ -774,6 +820,228 @@ pub fn composite_image(
             }
         }
     }
+}
+
+/// Helper to blend an RGBA pixel into destination buffer.
+#[inline]
+fn blend_pixel(dest: &mut [u8], dst_idx: usize, color: [u8; 4], alpha_factor: f32) {
+    let a = (color[3] as f32 / 255.0) * alpha_factor;
+    if a <= 0.0 {
+        return;
+    }
+    let inv_a = 1.0 - a;
+    dest[dst_idx] = (color[0] as f32 * a + dest[dst_idx] as f32 * inv_a) as u8;
+    dest[dst_idx + 1] = (color[1] as f32 * a + dest[dst_idx + 1] as f32 * inv_a) as u8;
+    dest[dst_idx + 2] = (color[2] as f32 * a + dest[dst_idx + 2] as f32 * inv_a) as u8;
+    dest[dst_idx + 3] = ((color[3] as f32 * a + dest[dst_idx + 3] as f32 * inv_a).min(255.0)) as u8;
+}
+
+/// Draw a solid colored rectangle with alpha blending.
+pub fn draw_solid_rect(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    color: [u8; 4],
+) {
+    if width <= 0.0 || height <= 0.0 || color[3] == 0 {
+        return;
+    }
+    let x_start = (x as i32).max(0) as usize;
+    let y_start = (y as i32).max(0) as usize;
+    let x_end = ((x + width) as i32).clamp(0, dest_width as i32) as usize;
+    let y_end = ((y + height) as i32).clamp(0, dest_height as i32) as usize;
+
+    for dy in y_start..y_end {
+        for dx in x_start..x_end {
+            let idx = (dy * dest_width as usize + dx) * 4;
+            if idx + 3 < dest.len() {
+                blend_pixel(dest, idx, color, 1.0);
+            }
+        }
+    }
+}
+
+/// Draw a rounded filled rectangle with alpha blending.
+pub fn draw_rounded_rect_fill(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+    color: [u8; 4],
+) {
+    if width <= 0.0 || height <= 0.0 || color[3] == 0 {
+        return;
+    }
+    let r = radius.min(width / 2.0).min(height / 2.0);
+    if r <= 0.5 {
+        draw_solid_rect(dest, dest_width, dest_height, x, y, width, height, color);
+        return;
+    }
+
+    let x_start = (x as i32).max(0) as usize;
+    let y_start = (y as i32).max(0) as usize;
+    let x_end = ((x + width) as i32).clamp(0, dest_width as i32) as usize;
+    let y_end = ((y + height) as i32).clamp(0, dest_height as i32) as usize;
+
+    let r_sq = r * r;
+    let left_corner_cx = x + r;
+    let right_corner_cx = x + width - r;
+    let top_corner_cy = y + r;
+    let bottom_corner_cy = y + height - r;
+
+    for dy in y_start..y_end {
+        let py = dy as f32 + 0.5;
+        for dx in x_start..x_end {
+            let px = dx as f32 + 0.5;
+
+            // Check if pixel is inside rounded corner areas
+            let in_top_left = px < left_corner_cx && py < top_corner_cy;
+            let in_top_right = px > right_corner_cx && py < top_corner_cy;
+            let in_bottom_left = px < left_corner_cx && py > bottom_corner_cy;
+            let in_bottom_right = px > right_corner_cx && py > bottom_corner_cy;
+
+            let mut inside = true;
+            if in_top_left {
+                let dist_sq = (px - left_corner_cx).powi(2) + (py - top_corner_cy).powi(2);
+                inside = dist_sq <= r_sq;
+            } else if in_top_right {
+                let dist_sq = (px - right_corner_cx).powi(2) + (py - top_corner_cy).powi(2);
+                inside = dist_sq <= r_sq;
+            } else if in_bottom_left {
+                let dist_sq = (px - left_corner_cx).powi(2) + (py - bottom_corner_cy).powi(2);
+                inside = dist_sq <= r_sq;
+            } else if in_bottom_right {
+                let dist_sq = (px - right_corner_cx).powi(2) + (py - bottom_corner_cy).powi(2);
+                inside = dist_sq <= r_sq;
+            }
+
+            if inside {
+                let idx = (dy * dest_width as usize + dx) * 4;
+                if idx + 3 < dest.len() {
+                    blend_pixel(dest, idx, color, 1.0);
+                }
+            }
+        }
+    }
+}
+
+/// Draw 4-side borders around a rectangle.
+pub fn draw_rect_borders(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    borders: [f32; 4], // [top, right, bottom, left]
+    color: [u8; 4],
+) {
+    if width <= 0.0 || height <= 0.0 || color[3] == 0 {
+        return;
+    }
+    let [top_w, right_w, bottom_w, left_w] = borders;
+
+    // Top border
+    if top_w > 0.0 {
+        draw_solid_rect(dest, dest_width, dest_height, x, y, width, top_w, color);
+    }
+    // Bottom border
+    if bottom_w > 0.0 {
+        draw_solid_rect(
+            dest,
+            dest_width,
+            dest_height,
+            x,
+            y + height - bottom_w,
+            width,
+            bottom_w,
+            color,
+        );
+    }
+    // Left border
+    if left_w > 0.0 {
+        draw_solid_rect(dest, dest_width, dest_height, x, y, left_w, height, color);
+    }
+    // Right border
+    if right_w > 0.0 {
+        draw_solid_rect(
+            dest,
+            dest_width,
+            dest_height,
+            x + width - right_w,
+            y,
+            right_w,
+            height,
+            color,
+        );
+    }
+}
+
+/// Render an SVG string into an RGBA bitmap at target width and height using resvg.
+pub fn render_svg_to_rgba(
+    svg_data: &str,
+    target_width: f32,
+    target_height: f32,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let opt = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_str(svg_data, &opt).ok()?;
+    let svg_w = tree.size().width();
+    let svg_h = tree.size().height();
+
+    let fit_w = if target_width > 0.0 {
+        target_width
+    } else {
+        svg_w
+    };
+    let fit_h = if target_height > 0.0 {
+        target_height
+    } else {
+        svg_h
+    };
+
+    let pixmap_w = fit_w.round().max(1.0) as u32;
+    let pixmap_h = fit_h.round().max(1.0) as u32;
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(pixmap_w, pixmap_h)?;
+
+    let sx = pixmap_w as f32 / svg_w;
+    let sy = pixmap_h as f32 / svg_h;
+    let transform = resvg::tiny_skia::Transform::from_scale(sx, sy);
+
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    Some((pixmap.take(), pixmap_w, pixmap_h))
+}
+
+/// Draw a line (horizontal underline) with alpha blending.
+pub fn draw_underline(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    thickness: f32,
+    color: [u8; 4],
+) {
+    draw_solid_rect(
+        dest,
+        dest_width,
+        dest_height,
+        x,
+        y,
+        width,
+        thickness.max(1.0),
+        color,
+    );
 }
 
 #[cfg(test)]
@@ -904,5 +1172,69 @@ mod tests {
         // The last column (dest x=3) has no mapped source — should remain 0
         let idx = (0 * 4 + 3) * 4;
         assert_eq!(dest[idx], 0, "dest(0,3) is out of image bounds");
+    }
+
+    #[test]
+    fn test_draw_solid_rect() {
+        let mut dest = vec![0u8; 10 * 10 * 4];
+        let color = [255, 0, 0, 255];
+        draw_solid_rect(&mut dest, 10, 10, 2.0, 2.0, 4.0, 4.0, color);
+
+        // (2,2) should be red
+        let idx = (2 * 10 + 2) * 4;
+        assert_eq!(&dest[idx..idx + 4], &[255, 0, 0, 255]);
+
+        // (0,0) should be untouched (transparent black)
+        assert_eq!(&dest[0..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_draw_rect_borders() {
+        let mut dest = vec![0u8; 10 * 10 * 4];
+        let color = [0, 0, 255, 255];
+        // 1px border on all 4 sides of a 6x6 rect at (2,2)
+        draw_rect_borders(
+            &mut dest,
+            10,
+            10,
+            2.0,
+            2.0,
+            6.0,
+            6.0,
+            [1.0, 1.0, 1.0, 1.0],
+            color,
+        );
+
+        // Top border at (2,2)
+        let top_idx = (2 * 10 + 2) * 4;
+        assert_eq!(&dest[top_idx..top_idx + 4], &[0, 0, 255, 255]);
+
+        // Center at (4,4) should be untouched
+        let center_idx = (4 * 10 + 4) * 4;
+        assert_eq!(&dest[center_idx..center_idx + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_draw_rounded_rect_fill() {
+        let mut dest = vec![0u8; 20 * 20 * 4];
+        let color = [0, 255, 0, 255];
+        draw_rounded_rect_fill(&mut dest, 20, 20, 0.0, 0.0, 20.0, 20.0, 5.0, color);
+
+        // Center at (10,10) should be filled
+        let center_idx = (10 * 20 + 10) * 4;
+        assert_eq!(&dest[center_idx..center_idx + 4], &[0, 255, 0, 255]);
+
+        // Extreme corner at (0,0) should be clipped by corner radius
+        assert_eq!(&dest[0..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_draw_underline() {
+        let mut dest = vec![0u8; 10 * 10 * 4];
+        let color = [255, 255, 0, 255];
+        draw_underline(&mut dest, 10, 10, 1.0, 5.0, 8.0, 1.0, color);
+
+        let line_idx = (5 * 10 + 2) * 4;
+        assert_eq!(&dest[line_idx..line_idx + 4], &[255, 255, 0, 255]);
     }
 }

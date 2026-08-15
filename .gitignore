@@ -6,3 +6,12 @@ target/
 
 wix_bin/
 wix.zip
+
+# Local scratch / debug artifacts
+*.png
+output*.txt
+temp*.rs
+perf_test.rs
+wiki_test*.rs
+wiki_test*.log
+amazon*.html

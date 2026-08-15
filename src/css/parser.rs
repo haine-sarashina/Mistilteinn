@@ -60,6 +60,8 @@ pub enum Combinator {
     AdjacentSibling,
     /// General sibling: `div ~ span`
     GeneralSibling,
+    /// Connects simple selectors within the same compound selector (e.g. `a.class`)
+    Compound,
 }
 
 /// A full CSS selector: a chain of [`SimpleSelector`]s connected by [`Combinator`]s.
@@ -68,6 +70,71 @@ pub struct Selector {
     /// Each entry is `(combinator, simple_selector)`.
     /// The first entry's combinator is always [`Combinator::Descendant`] (placeholder).
     pub complex: Vec<(Combinator, SimpleSelector)>,
+}
+
+/// Evaluate an attribute operator matching against an attribute value.
+pub fn evaluate_attr_operator(
+    attr_val: &str,
+    operator: &AttrOperator,
+    value: Option<&str>,
+) -> bool {
+    match (operator, value) {
+        (AttrOperator::Existence, _) => true,
+        (AttrOperator::Exact, Some(v)) => attr_val == v,
+        (AttrOperator::Includes, Some(v)) => attr_val.split_whitespace().any(|w| w == v),
+        (AttrOperator::DashMatch, Some(v)) => {
+            attr_val == v || attr_val.starts_with(&format!("{}-", v))
+        }
+        (AttrOperator::Prefix, Some(v)) => attr_val.starts_with(v),
+        (AttrOperator::Suffix, Some(v)) => attr_val.ends_with(v),
+        (AttrOperator::Substring, Some(v)) => attr_val.contains(v),
+        _ => false,
+    }
+}
+
+/// Evaluate :nth-child(formula) against a 1-based index (e.g. "odd", "even", "2n+1", "3", "2n-1", "-n+4").
+pub fn matches_nth_child(formula: &str, index_1based: usize) -> bool {
+    let f = formula.trim().to_lowercase();
+    if f == "odd" {
+        return index_1based % 2 == 1;
+    }
+    if f == "even" {
+        return index_1based % 2 == 0;
+    }
+    if let Ok(num) = f.parse::<usize>() {
+        return index_1based == num;
+    }
+    let f = f.replace(' ', "");
+    if let Some(n_pos) = f.find('n') {
+        let a_str = &f[..n_pos];
+        let a: i32 = if a_str.is_empty() || a_str == "+" {
+            1
+        } else if a_str == "-" {
+            -1
+        } else {
+            a_str.parse().unwrap_or(1)
+        };
+        let b_str = &f[n_pos + 1..];
+        let b: i32 = if b_str.is_empty() {
+            0
+        } else if b_str.starts_with('+') {
+            b_str[1..].parse().unwrap_or(0)
+        } else {
+            b_str.parse().unwrap_or(0)
+        };
+        let idx = index_1based as i32;
+        if a == 0 {
+            return idx == b;
+        }
+        let diff = idx - b;
+        if diff % a != 0 {
+            return false;
+        }
+        let k = diff / a;
+        k >= 0
+    } else {
+        false
+    }
 }
 
 impl Selector {
@@ -114,10 +181,6 @@ impl Selector {
     ///
     /// Simplified — does not handle combinators fully (only checks the last
     /// simple-selector chain component).
-    ///
-    /// The `is_first_child` closure is used to evaluate `:first-child`.
-    /// Other pseudo-classes (`:hover`, `:focus`, `:visited`, etc.) return
-    /// `false` during static style computation — they require runtime context.
     pub fn matches_element(
         &self,
         tag_name: &str,
@@ -139,27 +202,21 @@ impl Selector {
         has_id: impl Fn(&str) -> bool,
         is_first_child: impl Fn() -> bool,
     ) -> bool {
-        match sel {
-            SimpleSelector::Universal => true,
-            SimpleSelector::Type(t) => tag_name.eq_ignore_ascii_case(t),
-            SimpleSelector::Class(c) => classes(c),
-            SimpleSelector::Id(i) => has_id(i),
-            SimpleSelector::Attribute { .. } => true,
-            SimpleSelector::PseudoClass { name, .. } => match name.as_str() {
-                "first-child" => is_first_child(),
-                // :hover, :focus, :visited, :active, etc. require runtime context.
-                // Return false during static style computation — they should not
-                // permanently apply their styles.
-                _ => false,
-            },
-            SimpleSelector::PseudoElement(_) => false,
-        }
+        Self::simple_matches_with_context(
+            sel,
+            tag_name,
+            classes,
+            has_id,
+            |_, _, _| false,
+            is_first_child,
+            || false,
+            || false,
+            || 1,
+            || false,
+        )
     }
 
     /// Like [`matches_element`] but also evaluates `:hover` at runtime.
-    ///
-    /// The `is_hovered` closure returns `true` if the element currently being
-    /// tested is under the mouse cursor (or is an ancestor of such an element).
     pub fn matches_element_with_hover(
         &self,
         tag_name: &str,
@@ -169,13 +226,20 @@ impl Selector {
         is_hovered: impl Fn() -> bool,
     ) -> bool {
         if let Some((_, last)) = self.complex.last() {
-            Self::simple_matches_with_hover(last, tag_name, classes, has_id, is_first_child, is_hovered)
+            Self::simple_matches_with_hover(
+                last,
+                tag_name,
+                classes,
+                has_id,
+                is_first_child,
+                is_hovered,
+            )
         } else {
             false
         }
     }
 
-    fn simple_matches_with_hover(
+    pub fn simple_matches_with_hover(
         sel: &SimpleSelector,
         tag_name: &str,
         classes: impl Fn(&str) -> bool,
@@ -183,16 +247,118 @@ impl Selector {
         is_first_child: impl Fn() -> bool,
         is_hovered: impl Fn() -> bool,
     ) -> bool {
+        Self::simple_matches_with_context(
+            sel,
+            tag_name,
+            classes,
+            has_id,
+            |_, _, _| false,
+            is_first_child,
+            || false,
+            || false,
+            || 1,
+            is_hovered,
+        )
+    }
+
+    /// Comprehensive selector matcher evaluating types, classes, IDs, attribute operators, and pseudo-classes.
+    pub fn simple_matches_with_context(
+        sel: &SimpleSelector,
+        tag_name: &str,
+        classes: impl Fn(&str) -> bool,
+        has_id: impl Fn(&str) -> bool,
+        matches_attr: impl Fn(&str, &AttrOperator, Option<&str>) -> bool,
+        is_first_child: impl Fn() -> bool,
+        is_last_child: impl Fn() -> bool,
+        is_only_child: impl Fn() -> bool,
+        child_index_1based: impl Fn() -> usize,
+        is_hovered: impl Fn() -> bool,
+    ) -> bool {
         match sel {
-            SimpleSelector::PseudoClass { name, .. } => match name.as_str() {
+            SimpleSelector::Universal => true,
+            SimpleSelector::Type(t) => tag_name.eq_ignore_ascii_case(t),
+            SimpleSelector::Class(c) => classes(c),
+            SimpleSelector::Id(i) => has_id(i),
+            SimpleSelector::Attribute {
+                name,
+                operator,
+                value,
+            } => matches_attr(name, operator, value.as_deref()),
+            SimpleSelector::PseudoClass { name, arguments } => match name.as_str() {
                 "first-child" => is_first_child(),
+                "last-child" => is_last_child(),
+                "only-child" => is_only_child(),
+                "nth-child" => {
+                    if let Some(arg) = arguments {
+                        matches_nth_child(arg, child_index_1based())
+                    } else {
+                        false
+                    }
+                }
                 "hover" => is_hovered(),
-                // Other pseudo-classes still return false during computation.
                 _ => false,
             },
-            // For non-pseudo selectors, delegate to the regular matcher.
-            _ => Self::simple_matches(sel, tag_name, classes, has_id, is_first_child),
+            SimpleSelector::PseudoElement(_) => false,
         }
+    }
+
+    /// Recursively evaluate a complex selector against the DOM structure.
+    pub fn full_matches(
+        &self,
+        node_id: u32,
+        get_parent: &impl Fn(u32) -> Option<u32>,
+        simple_match: &impl Fn(u32, &SimpleSelector) -> bool,
+    ) -> bool {
+        if self.complex.is_empty() {
+            return false;
+        }
+
+        let mut current_node = node_id;
+        let mut iter = self.complex.iter().rev();
+
+        let &(mut target_combinator, ref last_sel) = iter.next().unwrap();
+        if !simple_match(current_node, last_sel) {
+            return false;
+        }
+
+        for (combinator, sel) in iter {
+            match target_combinator {
+                Combinator::Child => {
+                    if let Some(parent_id) = get_parent(current_node) {
+                        current_node = parent_id;
+                        if !simple_match(current_node, sel) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                Combinator::Descendant => {
+                    let mut matched = false;
+                    while let Some(parent_id) = get_parent(current_node) {
+                        current_node = parent_id;
+                        if simple_match(current_node, sel) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        return false;
+                    }
+                }
+                Combinator::Compound => {
+                    // Same node
+                    if !simple_match(current_node, sel) {
+                        return false;
+                    }
+                }
+                // Sibling combinators not fully supported in this simple engine
+                _ => return false,
+            }
+            target_combinator = *combinator;
+        }
+
+        true
     }
 }
 
@@ -211,11 +377,45 @@ pub struct ImportRule {
     pub url: String,
 }
 
-/// A parsed stylesheet: a collection of CSSRules and @import rules.
+/// A parsed CSS media rule.
+#[derive(Debug, Clone)]
+pub struct MediaRule {
+    pub condition: String,
+    pub rules: Vec<CSSRule>,
+}
+
+/// Evaluates a media condition against a viewport width.
+pub fn evaluate_media_condition(condition: &str, viewport_width: f32) -> bool {
+    let mut matches = true;
+    if let Some(min_idx) = condition.find("min-width:") {
+        let rest = &condition[min_idx + 10..];
+        let end_idx = rest.find(')').unwrap_or(rest.len());
+        let val_str = rest[..end_idx].trim().trim_end_matches("px");
+        if let Ok(min_w) = val_str.parse::<f32>() {
+            if viewport_width < min_w {
+                matches = false;
+            }
+        }
+    }
+    if let Some(max_idx) = condition.find("max-width:") {
+        let rest = &condition[max_idx + 10..];
+        let end_idx = rest.find(')').unwrap_or(rest.len());
+        let val_str = rest[..end_idx].trim().trim_end_matches("px");
+        if let Ok(max_w) = val_str.parse::<f32>() {
+            if viewport_width > max_w {
+                matches = false;
+            }
+        }
+    }
+    matches
+}
+
+/// A parsed CSS stylesheet containing rules.
 #[derive(Debug, Clone)]
 pub struct Stylesheet {
     pub rules: Vec<CSSRule>,
     pub imports: Vec<ImportRule>,
+    pub media_rules: Vec<MediaRule>,
 }
 
 // ------ Helpers ------
@@ -328,6 +528,7 @@ fn try_parse_import(prelude: &str) -> Option<ImportRule> {
 pub fn parse_stylesheet(source: &str) -> Stylesheet {
     let mut rules = Vec::new();
     let mut imports = Vec::new();
+    let mut media_rules = Vec::new();
     let mut pos = 0;
 
     while pos < source.len() {
@@ -339,58 +540,93 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
             break;
         }
 
-        // Check if the first meaningful character is '@' — handle @import before scanning for '{'.
-        // This prevents find_matching_open_brace from finding a '{' in a later rule and skipping over
-        // an @import that appears between two block rules.
         let starts_with_at = trimmed.chars().next() == Some('@');
+        let open_brace_pos = find_matching_open_brace(trimmed);
+
+        // Find the next semicolon, but only outside of strings/brackets if we wanted to be perfectly correct.
+        // However, for this simple parser, we just find the first `;` and `{`.
+        let semi_pos = trimmed.find(';');
+
+        let is_block = match (open_brace_pos, semi_pos) {
+            (Some(b), Some(s)) => b < s,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => {
+                if starts_with_at {
+                    if let Some(import_rule) = try_parse_import(trimmed) {
+                        imports.push(import_rule);
+                    }
+                }
+                break;
+            }
+        };
+
         if starts_with_at {
-            // Find the semicolon that terminates this at-rule
-            if let Some(semi_pos) = trimmed.find(';') {
+            if is_block {
+                let brace_pos = open_brace_pos.unwrap();
+                let prelude = trimmed[..brace_pos].trim();
+                let block_start = brace_pos + 1;
+
+                if let Some(block_end) = find_matching_close_brace(&trimmed[block_start..]) {
+                    let block_text = &trimmed[block_start..block_start + block_end];
+
+                    if prelude.starts_with("@media") {
+                        let condition = prelude[6..].trim().to_string();
+                        // Recursively parse the nested rules
+                        let inner_stylesheet = parse_stylesheet(block_text);
+                        media_rules.push(MediaRule {
+                            condition,
+                            rules: inner_stylesheet.rules,
+                        });
+                    }
+                    pos += brace_pos + 1 + block_end + 1;
+                } else {
+                    break;
+                }
+            } else {
+                let semi_pos = semi_pos.unwrap();
                 let prelude = &trimmed[..semi_pos];
                 if let Some(import_rule) = try_parse_import(prelude) {
                     imports.push(import_rule);
                 }
-                pos += semi_pos + 1; // advance past ';'
-                continue;
-            } else {
-                // No semicolon — end of source. Try to parse @import from remaining text.
-                if let Some(import_rule) = try_parse_import(trimmed) {
-                    imports.push(import_rule);
-                }
-                break;
-            }
-        }
-
-        // Find the opening `{` for the block
-        if let Some(brace_pos) = find_matching_open_brace(trimmed) {
-            let selector_text = &trimmed[..brace_pos];
-            // Find the matching `}`
-            let block_start = brace_pos + 1; // skip `{`
-            if let Some(block_end) = find_matching_close_brace(&trimmed[block_start..]) {
-                let decl_text = &trimmed[block_start..block_start + block_end];
-                let selectors = parse_selectors_from_string(selector_text);
-                let declarations = crate::css::parse_declarations(decl_text);
-                if !selectors.is_empty() {
-                    rules.push(CSSRule {
-                        selectors,
-                        declarations,
-                    });
-                }
-                pos += brace_pos + 1 + block_end + 1; // skip past `}`
-            } else {
-                break;
+                pos += semi_pos + 1;
             }
         } else {
-            // No block found — skip to semicolon or end
-            if let Some(semi_pos) = trimmed.find(';') {
-                pos += semi_pos + 1;
+            // Find the opening `{` for the block
+            if let Some(brace_pos) = find_matching_open_brace(trimmed) {
+                let selector_text = &trimmed[..brace_pos];
+                // Find the matching `}`
+                let block_start = brace_pos + 1; // skip `{`
+                if let Some(block_end) = find_matching_close_brace(&trimmed[block_start..]) {
+                    let decl_text = &trimmed[block_start..block_start + block_end];
+                    let selectors = parse_selectors_from_string(selector_text);
+                    let declarations = crate::css::parse_declarations(decl_text);
+                    if !selectors.is_empty() {
+                        rules.push(CSSRule {
+                            selectors,
+                            declarations,
+                        });
+                    }
+                    pos += brace_pos + 1 + block_end + 1; // skip past `}`
+                } else {
+                    break;
+                }
             } else {
-                break;
+                // No block found — skip to semicolon or end
+                if let Some(semi_pos) = trimmed.find(';') {
+                    pos += semi_pos + 1;
+                } else {
+                    break;
+                }
             }
         }
     }
 
-    Stylesheet { rules, imports }
+    Stylesheet {
+        rules,
+        imports,
+        media_rules,
+    }
 }
 
 /// Finds the position of the `{` that opens a declaration block.
@@ -438,6 +674,39 @@ fn find_matching_close_brace(s: &str) -> Option<usize> {
     None
 }
 
+fn collect_tokens_from_parser<'i, 't>(parser: &mut Parser<'i, 't>, tokens: &mut Vec<Token<'i>>) {
+    loop {
+        match parser.next_including_whitespace_and_comments() {
+            Ok(t) => {
+                let token = (*t).clone();
+                match &token {
+                    Token::SquareBracketBlock => {
+                        tokens.push(Token::SquareBracketBlock);
+                        let _ = parser.parse_nested_block(|nested| {
+                            collect_tokens_from_parser(nested, tokens);
+                            Ok::<(), cssparser::ParseError<'_, ()>>(())
+                        });
+                        tokens.push(Token::CloseSquareBracket);
+                    }
+                    Token::ParenthesisBlock | Token::Function(_) => {
+                        tokens.push(token.clone());
+                        let _ = parser.parse_nested_block(|nested| {
+                            collect_tokens_from_parser(nested, tokens);
+                            Ok::<(), cssparser::ParseError<'_, ()>>(())
+                        });
+                        tokens.push(Token::CloseParenthesis);
+                    }
+                    Token::BadUrl(_) | Token::BadString(_) | Token::Comment(_) => {}
+                    _ => {
+                        tokens.push(token);
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 /// Parses selectors from a CSS selector string using cssparser.
 fn parse_selectors_from_string(selector_text: &str) -> Vec<Selector> {
     let trimmed = selector_text.trim();
@@ -448,20 +717,8 @@ fn parse_selectors_from_string(selector_text: &str) -> Vec<Selector> {
     let mut input = ParserInput::new(trimmed);
     let mut parser = Parser::new(&mut input);
 
-    // Collect all tokens (excluding parse errors)
     let mut tokens: Vec<Token<'_>> = Vec::new();
-    loop {
-        match parser.next() {
-            Ok(t) => {
-                let token = (*t).clone();
-                if matches!(token, Token::BadUrl(_) | Token::BadString(_)) {
-                    continue;
-                }
-                tokens.push(token);
-            }
-            Err(_) => break,
-        }
-    }
+    collect_tokens_from_parser(&mut parser, &mut tokens);
 
     build_selectors_from_tokens(&tokens)
 }
@@ -523,7 +780,13 @@ fn parse_single_selector_impl(tokens: &[&Token<'_>]) -> Selector {
 
         let saved_comb = pending_combinator.take();
         if let Some(sel) = try_parse_simple_selector(token, tokens, &mut i) {
-            let comb = saved_comb.unwrap_or(Combinator::Descendant);
+            let comb = saved_comb.unwrap_or_else(|| {
+                if parts.is_empty() {
+                    Combinator::Descendant // first placeholder
+                } else {
+                    Combinator::Compound
+                }
+            });
             parts.push((comb, sel));
             continue;
         }
@@ -595,15 +858,36 @@ fn try_parse_simple_selector<'t>(
                     *i += 1;
                     return Some(SimpleSelector::PseudoElement(cow_to_string(name)));
                 }
-            } else {
-                if let Token::Ident(name) =
-                    tokens.get(*i).copied().unwrap_or(&Token::CloseCurlyBracket)
-                {
-                    *i += 1;
-                    return Some(SimpleSelector::PseudoClass {
-                        name: cow_to_string(name),
-                        arguments: None,
-                    });
+            } else if *i < tokens.len() {
+                match tokens[*i] {
+                    Token::Ident(name) => {
+                        *i += 1;
+                        return Some(SimpleSelector::PseudoClass {
+                            name: cow_to_string(name),
+                            arguments: None,
+                        });
+                    }
+                    Token::Function(name) => {
+                        *i += 1;
+                        let mut args = String::new();
+                        let mut depth = 1usize;
+                        while *i < tokens.len() && depth > 0 {
+                            let t = &tokens[*i];
+                            if matches!(t, Token::CloseParenthesis) {
+                                depth -= 1;
+                            } else if matches!(t, Token::ParenthesisBlock) {
+                                depth += 1;
+                            } else if !matches!(t, Token::CloseCurlyBracket) {
+                                args.push_str(&token_to_string(t));
+                            }
+                            *i += 1;
+                        }
+                        return Some(SimpleSelector::PseudoClass {
+                            name: cow_to_string(name),
+                            arguments: if args.is_empty() { None } else { Some(args) },
+                        });
+                    }
+                    _ => {}
                 }
             }
             None
@@ -909,9 +1193,7 @@ mod tests {
         // :hover should match when the is_hovered closure returns true
         let ss = parse_stylesheet("a:hover { color: red }");
         let sel = &ss.rules[0].selectors[0];
-        assert!(sel.matches_element_with_hover(
-            "a", |_| false, |_| false, || false, || true
-        ));
+        assert!(sel.matches_element_with_hover("a", |_| false, |_| false, || false, || true));
     }
 
     #[test]
@@ -919,9 +1201,7 @@ mod tests {
         // :hover should NOT match when the is_hovered closure returns false
         let ss = parse_stylesheet("a:hover { color: red }");
         let sel = &ss.rules[0].selectors[0];
-        assert!(!sel.matches_element_with_hover(
-            "a", |_| false, |_| false, || false, || false
-        ));
+        assert!(!sel.matches_element_with_hover("a", |_| false, |_| false, || false, || false));
     }
 
     #[test]
@@ -933,21 +1213,15 @@ mod tests {
         // :hover on its own should match when hovered
         let ss = parse_stylesheet("a:hover { color: blue }");
         let sel = &ss.rules[0].selectors[0];
-        assert!(sel.matches_element_with_hover(
-            "a", |_| false, |_| false, || false, || true
-        ));
+        assert!(sel.matches_element_with_hover("a", |_| false, |_| false, || false, || true));
         // Should NOT match when not hovered
-        assert!(!sel.matches_element_with_hover(
-            "a", |_| false, |_| false, || false, || false
-        ));
+        assert!(!sel.matches_element_with_hover("a", |_| false, |_| false, || false, || false));
 
         // Test :hover with class on a different tag type
         let ss2 = parse_stylesheet(".special:hover { color: green }");
         let sel2 = &ss2.rules[0].selectors[0];
         // Only :hover (last) is checked, so it matches based on hover state only
-        assert!(sel2.matches_element_with_hover(
-            "div", |_| false, |_| false, || false, || true
-        ));
+        assert!(sel2.matches_element_with_hover("div", |_| false, |_| false, || false, || true));
     }
 
     // -- Color tests --

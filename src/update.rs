@@ -5,7 +5,7 @@ use self_update::cargo_crate_version;
 /// This should be run on a separate thread to avoid blocking the main UI.
 pub fn check_and_update() {
     info!("Checking for updates...");
-    
+
     // We run the update logic inside a closure to cleanly handle errors via `?`
     let result = (|| -> Result<self_update::Status, Box<dyn std::error::Error>> {
         let status = self_update::backends::github::Update::configure()
@@ -17,7 +17,7 @@ pub fn check_and_update() {
             .current_version(cargo_crate_version!())
             .build()?
             .update()?;
-            
+
         Ok(status)
     })();
 
@@ -30,7 +30,7 @@ pub fn check_and_update() {
                     .set_description(&format!("新しいバージョン ({}) へのアップデートが完了しました。\n今すぐ再起動しますか？", status.version()))
                     .set_buttons(rfd::MessageButtons::YesNo)
                     .show();
-                    
+
                 if ans == rfd::MessageDialogResult::Yes {
                     if let Ok(current_exe) = std::env::current_exe() {
                         let _ = std::process::Command::new(current_exe).spawn();

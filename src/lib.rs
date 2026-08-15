@@ -1,19 +1,19 @@
-mod app;
-mod browser;
-mod css;
-mod html;
-mod js;
-mod layout;
+pub mod app;
+pub mod browser;
+pub mod css;
+pub mod html;
+pub mod js;
+pub mod layout;
 #[cfg(feature = "memprof")]
-mod memprof;
-mod network;
-mod page;
-mod render;
+pub mod memprof;
+pub mod network;
+pub mod page;
+pub mod render;
 
-mod update;
+pub mod update;
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     #[test]
     fn engine_smoke_test() {
         assert!(true, "Mistilteinn engine test suite initialized");

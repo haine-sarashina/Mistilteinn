@@ -249,13 +249,6 @@ impl TextRenderer {
     }
 
     /// Rasterize laid-out text into an RGBA bitmap buffer using swash.
-    ///
-    /// Uses Parley to shape and layout the text, then uses swash's Scaler
-    /// (via parley's re-export of swash 0.2) to rasterize each glyph into
-    /// the destination buffer at the correct position.
-    ///
-    /// The `buffer` must be large enough to hold `width * height * 4` bytes
-    /// (RGBA). Glyphs are drawn with alpha blending against existing content.
     pub fn rasterize_to_bitmap(
         &mut self,
         text: &str,
@@ -265,6 +258,28 @@ impl TextRenderer {
         origin_x: f32,
         origin_y: f32,
         max_width: f32,
+        buffer: &mut [u8],
+        width: u32,
+        height: u32,
+    ) {
+        self.rasterize_to_bitmap_styled(
+            text, font_size, family, color, origin_x, origin_y, max_width, false, false, buffer,
+            width, height,
+        );
+    }
+
+    /// Rasterize laid-out text with optional bold and underline styling.
+    pub fn rasterize_to_bitmap_styled(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        family: &str,
+        color: [f32; 4],
+        origin_x: f32,
+        origin_y: f32,
+        max_width: f32,
+        is_bold: bool,
+        is_underline: bool,
         buffer: &mut [u8],
         width: u32,
         height: u32,
@@ -281,6 +296,9 @@ impl TextRenderer {
         builder.push_default(parley::StyleProperty::FontSize(font_size));
         builder.push_default(parley::StyleProperty::FontStack(family.into()));
         builder.push_default(parley::StyleProperty::LineHeight(1.2));
+        if is_bold {
+            builder.push_default(parley::StyleProperty::FontWeight(parley::FontWeight::BOLD));
+        }
 
         let mut layout: Layout<()> = builder.build(text);
         layout.break_all_lines(Some(max_width));
@@ -298,6 +316,7 @@ impl TextRenderer {
             let metrics = line.metrics();
             let baseline = line_y + metrics.ascent;
             let mut cursor_x = origin_x;
+            let line_start_x = cursor_x;
 
             for item in line.items() {
                 match item {
@@ -328,12 +347,12 @@ impl TextRenderer {
                         let render = swash::scale::Render::new(&sources);
 
                         for g in glyph_run.glyphs() {
-                            let px = ((cursor_x + g.x).round()) as i32;
-                            let py = (baseline - g.y) as i32;
+                            let px = ((cursor_x + g.x).round()).clamp(-10000.0, 10000.0) as i32;
+                            let py = (baseline - g.y).clamp(-10000.0, 10000.0) as i32;
 
                             if let Some(image) = render.render(&mut scaler, g.id) {
-                                let glyph_x = px + image.placement.left;
-                                let glyph_y = py - image.placement.top;
+                                let glyph_x = px.saturating_add(image.placement.left);
+                                let glyph_y = py.saturating_sub(image.placement.top);
                                 Self::draw_glyph_alpha(
                                     &image, glyph_x, glyph_y, color, buffer, width, height,
                                 );
@@ -345,6 +364,28 @@ impl TextRenderer {
                     PositionedLayoutItem::InlineBox(_) => {
                         // Skip inline boxes
                     }
+                }
+            }
+
+            if is_underline {
+                let underline_w = (cursor_x - line_start_x).max(0.0);
+                if underline_w > 0.0 {
+                    let u_color = [
+                        (color[0] * 255.0) as u8,
+                        (color[1] * 255.0) as u8,
+                        (color[2] * 255.0) as u8,
+                        (color[3] * 255.0) as u8,
+                    ];
+                    crate::render::draw_underline(
+                        buffer,
+                        width,
+                        height,
+                        line_start_x,
+                        baseline + 2.0,
+                        underline_w,
+                        (font_size / 14.0).max(1.0),
+                        u_color,
+                    );
                 }
             }
 
@@ -409,9 +450,8 @@ impl TextRenderer {
                 buffer[buf_idx + 2] = ((color[2] * a * 255.0)
                     + (buffer[buf_idx + 2] as f32 / 255.0 * (1.0 - a)) * 255.0)
                     as u8;
-                buffer[buf_idx + 3] = (a * 255.0 
-                    + (buffer[buf_idx + 3] as f32 / 255.0 * (1.0 - a)) * 255.0) 
-                    as u8;
+                buffer[buf_idx + 3] =
+                    (a * 255.0 + (buffer[buf_idx + 3] as f32 / 255.0 * (1.0 - a)) * 255.0) as u8;
             }
         }
     }

@@ -936,6 +936,8 @@ pub struct ComputedValues {
     pub text_style: TextStyleFlags,
     pub text_align: TextAlign,
     pub visibility: Visibility,
+    /// `z-index`; `None` is the initial `auto`.
+    pub z_index: Option<i32>,
     // CSS Custom Properties (CSS variables --*)
     pub custom_properties: rustc_hash::FxHashMap<String, String>,
 }
@@ -1135,6 +1137,7 @@ impl Default for ComputedValues {
             text_style: TextStyleFlags::default(),
             text_align: TextAlign::Left,
             visibility: Visibility::Visible,
+            z_index: None,
             custom_properties: rustc_hash::FxHashMap::default(),
         }
     }
@@ -1653,6 +1656,11 @@ impl ComputedValues {
                 self.text_style.underline = lower.contains("underline");
                 self.text_style.line_through = lower.contains("line-through");
                 self.text_style.overline = lower.contains("overline");
+            }
+            "z-index" => {
+                // `auto` (and anything unparseable) leaves the element in
+                // document order, which `None` represents.
+                self.z_index = val.trim().parse::<i32>().ok();
             }
             "visibility" => {
                 self.visibility = match val.to_ascii_lowercase().as_str() {
@@ -3901,6 +3909,37 @@ mod tests {
         let div = styles_for_tag(&arena, &styles, "div");
         assert_eq!(div.width, Some(120.0));
         assert_eq!(div.padding, [8.0; 4]);
+    }
+
+    #[test]
+    fn z_index_parses_integers_and_auto() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div>x</div></body></html>",
+            "div { z-index: 5; }",
+        );
+        assert_eq!(styles_for_tag(&arena, &styles, "div").z_index, Some(5));
+
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div>x</div></body></html>",
+            "div { z-index: -2; }",
+        );
+        assert_eq!(styles_for_tag(&arena, &styles, "div").z_index, Some(-2));
+
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div>x</div></body></html>",
+            "div { z-index: auto; }",
+        );
+        assert_eq!(styles_for_tag(&arena, &styles, "div").z_index, None);
+    }
+
+    #[test]
+    fn z_index_does_not_inherit() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div><span>x</span></div></body></html>",
+            "div { z-index: 7; }",
+        );
+        assert_eq!(styles_for_tag(&arena, &styles, "div").z_index, Some(7));
+        assert_eq!(styles_for_tag(&arena, &styles, "span").z_index, None);
     }
 
     #[test]

@@ -233,6 +233,8 @@ pub struct LayoutNode {
     pub text_align: crate::css::TextAlign,
     /// `visibility` — hidden nodes still lay out, they are just not painted.
     pub visibility: crate::css::Visibility,
+    /// `z-index`; `None` is `auto`, which sorts as 0 alongside its siblings.
+    pub z_index: Option<i32>,
     pub is_line_break: bool,
 }
 
@@ -287,6 +289,7 @@ impl LayoutNode {
             text_style: crate::css::TextStyleFlags::default(),
             text_align: crate::css::TextAlign::Left,
             visibility: crate::css::Visibility::Visible,
+            z_index: None,
             is_line_break: false,
         }
     }
@@ -501,6 +504,7 @@ where
     root_layout.border_radius = root_styles.border_radius;
     root_layout.text_style = root_styles.text_style;
     root_layout.visibility = root_styles.visibility;
+    root_layout.z_index = root_styles.z_index;
     root_layout.text_align = root_styles.text_align;
 
     // Propagate font properties from computed styles
@@ -657,6 +661,7 @@ fn build_layout_children<N, F>(
                     layout_node.border_radius = child_styles.border_radius;
                     layout_node.text_style = child_styles.text_style;
                     layout_node.visibility = child_styles.visibility;
+                    layout_node.z_index = child_styles.z_index;
                     layout_node.text_align = child_styles.text_align;
 
                     // Extract image src and dimensions from <img> and <svg> tags
@@ -877,6 +882,7 @@ fn build_layout_children<N, F>(
                     layout_node.border_radius = child_styles.border_radius;
                     layout_node.text_style = child_styles.text_style;
                     layout_node.visibility = child_styles.visibility;
+                    layout_node.z_index = child_styles.z_index;
                     layout_node.text_align = child_styles.text_align;
 
                     // Extract image src and dimensions from <img> and <svg> tags
@@ -1198,6 +1204,15 @@ pub fn extract_absolute_children(node: &mut LayoutNode) {
             i += 1;
         }
     }
+
+    // Paint order among positioned siblings is by z-index, lowest first, with
+    // document order breaking ties. `sort_by_key` is stable, so equal keys keep
+    // their original order. `auto` participates as 0.
+    //
+    // This covers positioned siblings, which is what pages actually rely on;
+    // full stacking contexts (where a positioned ancestor traps its subtree's
+    // z-indices) are not modelled yet.
+    abs_children.sort_by_key(|c| c.z_index.unwrap_or(0));
 
     node.absolute_children = abs_children;
 
@@ -4909,6 +4924,50 @@ mod tests {
 
         let texts = collect_text_nodes(&root);
         assert!(texts.is_empty(), "Zero-dimension text nodes are skipped");
+    }
+
+    /// Build an absolutely positioned child with the given z-index and marker text.
+    fn abs_child(z: Option<i32>, text: &str) -> LayoutNode {
+        let mut n = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 50.0));
+        n.position = PositionType::Absolute;
+        n.z_index = z;
+        n.text = Some(text.to_string());
+        n
+    }
+
+    #[test]
+    fn absolute_children_paint_in_z_index_order() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(abs_child(Some(5), "top"));
+        root.add_child(abs_child(Some(-1), "bottom"));
+        root.add_child(abs_child(Some(1), "middle"));
+
+        extract_absolute_children(&mut root);
+
+        let order: Vec<&str> = root
+            .absolute_children
+            .iter()
+            .map(|c| c.text.as_deref().unwrap())
+            .collect();
+        assert_eq!(order, vec!["bottom", "middle", "top"]);
+    }
+
+    #[test]
+    fn equal_z_index_keeps_document_order() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(abs_child(Some(2), "first"));
+        root.add_child(abs_child(Some(2), "second"));
+        // `auto` participates as 0, so it sorts below both.
+        root.add_child(abs_child(None, "auto"));
+
+        extract_absolute_children(&mut root);
+
+        let order: Vec<&str> = root
+            .absolute_children
+            .iter()
+            .map(|c| c.text.as_deref().unwrap())
+            .collect();
+        assert_eq!(order, vec!["auto", "first", "second"]);
     }
 
     #[test]

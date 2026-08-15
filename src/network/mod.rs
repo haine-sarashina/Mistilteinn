@@ -8,6 +8,13 @@ pub enum NetworkError {
     Timeout,
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
+    /// The server answered, but with nothing to render.
+    ///
+    /// Kept separate from [`NetworkError::Http`] because it is not a transport
+    /// failure: without it an empty body silently becomes a blank page with no
+    /// indication that anything went wrong.
+    #[error("{0}")]
+    EmptyResponse(String),
 }
 
 /// Max number of external stylesheets to fetch per page.
@@ -39,11 +46,7 @@ pub async fn fetch(url: &str) -> Result<FetchResult, NetworkError> {
         .map_err(NetworkError::Http)?;
 
     match client.get(url).send().await {
-        Ok(response) => {
-            let final_url = response.url().to_string();
-            let content = response.text().await?;
-            Ok(FetchResult { content, final_url })
-        }
+        Ok(response) => into_fetch_result(response).await,
         Err(e) => {
             if url.starts_with("https://") {
                 let http_url = format!("http://{}", &url[8..]);
@@ -53,14 +56,57 @@ pub async fn fetch(url: &str) -> Result<FetchResult, NetworkError> {
                     http_url
                 );
                 if let Ok(response) = client.get(&http_url).send().await {
-                    let final_url = response.url().to_string();
-                    let content = response.text().await?;
-                    return Ok(FetchResult { content, final_url });
+                    return into_fetch_result(response).await;
                 }
             }
             Err(NetworkError::Http(e))
         }
     }
+}
+
+/// Describe an empty response, naming bot protection when the server admits to it.
+fn empty_response_detail(final_url: &str, status: u16, waf_action: Option<&str>) -> String {
+    match waf_action {
+        Some(action) => format!(
+            "{final_url} returned HTTP {status} with an empty body \
+             (bot protection: x-amzn-waf-action: {action}). \
+             Passing it needs JavaScript execution and cookie storage."
+        ),
+        None => format!("{final_url} returned HTTP {status} with an empty body"),
+    }
+}
+
+/// Turn a response into a [`FetchResult`], rejecting ones with nothing to show.
+///
+/// A non-2xx status is *not* by itself an error: servers routinely send a
+/// readable 404 or 500 page, and a browser is expected to render it. What
+/// cannot be rendered is an empty body, which previously sailed through as a
+/// successful load and painted a blank window with no explanation.
+async fn into_fetch_result(response: reqwest::Response) -> Result<FetchResult, NetworkError> {
+    let final_url = response.url().to_string();
+    let status = response.status();
+
+    // AWS WAF signals "solve a JS challenge and retry" with this header and an
+    // empty body. Naming it is far more useful than a bare "empty response".
+    let waf_challenge = response
+        .headers()
+        .get("x-amzn-waf-action")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase());
+
+    let content = response.text().await?;
+
+    if content.trim().is_empty() {
+        let detail = empty_response_detail(&final_url, status.as_u16(), waf_challenge.as_deref());
+        log::warn!("{detail}");
+        return Err(NetworkError::EmptyResponse(detail));
+    }
+
+    if !status.is_success() {
+        log::warn!("{final_url} returned HTTP {status}; rendering the body anyway");
+    }
+
+    Ok(FetchResult { content, final_url })
 }
 
 /// Resolve a potentially relative URL against a base URL.
@@ -468,23 +514,61 @@ pub async fn fetch_external_css(
 mod tests {
     use super::*;
 
+    #[test]
+    fn empty_response_detail_names_bot_protection() {
+        let detail = empty_response_detail("https://www.amazon.co.jp/", 202, Some("challenge"));
+        assert!(detail.contains("https://www.amazon.co.jp/"));
+        assert!(detail.contains("202"));
+        assert!(
+            detail.contains("bot protection"),
+            "a WAF challenge must be named, not reported as a generic failure: {detail}"
+        );
+        assert!(
+            detail.contains("JavaScript"),
+            "says what it would take: {detail}"
+        );
+    }
+
+    #[test]
+    fn empty_response_detail_without_waf_header() {
+        let detail = empty_response_detail("https://example.com/", 204, None);
+        assert!(detail.contains("204"));
+        assert!(detail.contains("empty body"));
+        assert!(
+            !detail.contains("bot protection"),
+            "do not claim bot protection without the header: {detail}"
+        );
+    }
+
     #[tokio::test]
     #[ignore] // Requires network access and Amazon may return WAF challenge page
     async fn test_fetch_amazon() {
-        let result = fetch("https://www.amazon.co.jp").await;
-        assert!(result.is_ok(), "Fetch should succeed");
-        let fetch_result = result.unwrap();
-        assert!(
-            !fetch_result.final_url.is_empty(),
-            "final_url should be set"
-        );
-        assert!(
-            fetch_result.final_url.contains("amazon"),
-            "Should redirect to amazon domain: {}",
-            fetch_result.final_url
-        );
-        // Note: Amazon may return empty content or a WAF challenge page for automated requests.
-        // Content validation is skipped in CI/automated environments.
+        // amazon.co.jp answers automated clients with an AWS WAF challenge:
+        // HTTP 202, `x-amzn-waf-action: challenge`, and a zero-length body.
+        // The old version of this test only checked the final URL, so it passed
+        // green while the fetch returned nothing and the page rendered blank.
+        //
+        // Either outcome is legitimate depending on what the WAF decides, but a
+        // silent empty success is not: assert we either get real content or a
+        // named EmptyResponse.
+        match fetch("https://www.amazon.co.jp").await {
+            Ok(r) => {
+                assert!(
+                    r.final_url.contains("amazon"),
+                    "should stay on amazon: {}",
+                    r.final_url
+                );
+                assert!(
+                    !r.content.trim().is_empty(),
+                    "a successful fetch must carry a body"
+                );
+            }
+            Err(NetworkError::EmptyResponse(detail)) => {
+                println!("amazon.co.jp is gating this client: {detail}");
+                assert!(detail.contains("amazon"), "detail names the URL: {detail}");
+            }
+            Err(e) => panic!("unexpected transport failure: {e:?}"),
+        }
     }
 
     #[tokio::test]

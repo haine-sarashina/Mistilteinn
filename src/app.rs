@@ -967,17 +967,32 @@ impl MistilteinnApp {
             Err(e) => {
                 log::error!("Failed to fetch {}: {:?}", url, e);
                 let err_str = format!("{:?}", e);
-                let (err_code, reason) =
-                    if err_str.contains("TimedOut") || err_str.contains("Timeout") {
-                        ("ERR_CONNECTION_TIMED_OUT", "からの応答時間が長すぎます。")
-                    } else if err_str.contains("Connect") || err_str.contains("dns") {
+                // An empty body is a distinct failure from a transport error:
+                // the server answered fine, it just sent nothing to render.
+                // Reporting it as "connection failed" would send the user
+                // chasing their network instead of the real cause.
+                let (err_code, reason) = match &e {
+                    crate::network::NetworkError::EmptyResponse(detail)
+                        if detail.contains("waf-action") =>
+                    {
                         (
-                            "ERR_NAME_NOT_RESOLVED",
-                            "のサーバーの IP アドレスが見つかりませんでした。",
+                            "ERR_BLOCKED_BY_BOT_PROTECTION",
+                            "はボット対策により空の応答を返しました。通過には JavaScript の実行と Cookie の保存が必要です。",
                         )
-                    } else {
-                        ("ERR_CONNECTION_FAILED", "への接続中に問題が発生しました。")
-                    };
+                    }
+                    crate::network::NetworkError::EmptyResponse(_) => (
+                        "ERR_EMPTY_RESPONSE",
+                        "は空の応答を返しました。表示できる内容がありません。",
+                    ),
+                    _ if err_str.contains("TimedOut") || err_str.contains("Timeout") => {
+                        ("ERR_CONNECTION_TIMED_OUT", "からの応答時間が長すぎます。")
+                    }
+                    _ if err_str.contains("Connect") || err_str.contains("dns") => (
+                        "ERR_NAME_NOT_RESOLVED",
+                        "のサーバーの IP アドレスが見つかりませんでした。",
+                    ),
+                    _ => ("ERR_CONNECTION_FAILED", "への接続中に問題が発生しました。"),
+                };
 
                 let host = url
                     .strip_prefix("https://")

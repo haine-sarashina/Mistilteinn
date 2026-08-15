@@ -231,6 +231,8 @@ pub struct LayoutNode {
     /// Typography properties
     pub text_style: crate::css::TextStyleFlags,
     pub text_align: crate::css::TextAlign,
+    /// `visibility` — hidden nodes still lay out, they are just not painted.
+    pub visibility: crate::css::Visibility,
     pub is_line_break: bool,
 }
 
@@ -284,6 +286,7 @@ impl LayoutNode {
             border_radius: 0.0,
             text_style: crate::css::TextStyleFlags::default(),
             text_align: crate::css::TextAlign::Left,
+            visibility: crate::css::Visibility::Visible,
             is_line_break: false,
         }
     }
@@ -497,6 +500,7 @@ where
     root_layout.border_color = root_styles.border_color;
     root_layout.border_radius = root_styles.border_radius;
     root_layout.text_style = root_styles.text_style;
+    root_layout.visibility = root_styles.visibility;
     root_layout.text_align = root_styles.text_align;
 
     // Propagate font properties from computed styles
@@ -652,6 +656,7 @@ fn build_layout_children<N, F>(
                     layout_node.border_color = child_styles.border_color;
                     layout_node.border_radius = child_styles.border_radius;
                     layout_node.text_style = child_styles.text_style;
+                    layout_node.visibility = child_styles.visibility;
                     layout_node.text_align = child_styles.text_align;
 
                     // Extract image src and dimensions from <img> and <svg> tags
@@ -871,6 +876,7 @@ fn build_layout_children<N, F>(
                     layout_node.border_color = child_styles.border_color;
                     layout_node.border_radius = child_styles.border_radius;
                     layout_node.text_style = child_styles.text_style;
+                    layout_node.visibility = child_styles.visibility;
                     layout_node.text_align = child_styles.text_align;
 
                     // Extract image src and dimensions from <img> and <svg> tags
@@ -1731,7 +1737,13 @@ fn compute_shrink_to_fit_width(
         return node.rect.width;
     }
     if let Some(ref text) = node.text {
-        let (w, _) = text_renderer.measure(text, node.font_size, "sans-serif");
+        let transformed = node.text_style.transform.apply(text);
+        let (w, _) = text_renderer.measure_styled(
+            &transformed,
+            node.font_size,
+            "sans-serif",
+            node.text_style,
+        );
         return w;
     }
     let mut max_child_w = 0.0f32;
@@ -1819,12 +1831,19 @@ fn measure_item_content_widths(
         return (w, w);
     }
     if let Some(ref text) = node.text {
+        let text = node.text_style.transform.apply(text);
         // Measure the full text line
-        let (max_content, _) = text_renderer.measure(text, node.font_size, &node.font_family);
+        let (max_content, _) =
+            text_renderer.measure_styled(&text, node.font_size, &node.font_family, node.text_style);
         // Min-content is the longest word
         let mut min_content = 0.0f32;
         for word in text.split_whitespace() {
-            let (word_width, _) = text_renderer.measure(word, node.font_size, &node.font_family);
+            let (word_width, _) = text_renderer.measure_styled(
+                word,
+                node.font_size,
+                &node.font_family,
+                node.text_style,
+            );
             min_content = min_content.max(word_width);
         }
         if min_content == 0.0 {
@@ -2805,7 +2824,9 @@ fn collect_inline_boxes_recursive(
             });
         } else {
             boxes.push(InlineBox::Text {
-                text: text.clone(),
+                // `text-transform` is applied here, before the run is measured,
+                // so wrapping accounts for the transformed text.
+                text: text_style.transform.apply(text).into_owned(),
                 width: 0.0,
                 color,
                 font_size,
@@ -3206,7 +3227,12 @@ pub fn break_into_lines(
                     match token {
                         LineBreakToken::Space => {
                             if !current_line_boxes.is_empty() {
-                                let (sw, _) = text_renderer.measure(" ", *font_size, "sans-serif");
+                                let (sw, _) = text_renderer.measure_styled(
+                                    " ",
+                                    *font_size,
+                                    "sans-serif",
+                                    *text_style,
+                                );
                                 current_line_boxes.push(InlineBox::Whitespace {
                                     collapsible: true,
                                     width: sw,
@@ -3215,8 +3241,12 @@ pub fn break_into_lines(
                             }
                         }
                         LineBreakToken::Text(word) => {
-                            let (word_width, _) =
-                                text_renderer.measure(word, *font_size, "sans-serif");
+                            let (word_width, _) = text_renderer.measure_styled(
+                                word,
+                                *font_size,
+                                "sans-serif",
+                                *text_style,
+                            );
 
                             let tentative = current_line_width + word_width;
 
@@ -3438,8 +3468,10 @@ pub fn collect_render_rects_with_clipping(
         clip_stack.pop();
     }
 
-    // Collect this node's own rect(s), clipped by the current clip stack
-    if node.background_color.is_some() {
+    // Collect this node's own rect(s), clipped by the current clip stack.
+    // `visibility: hidden` suppresses only this node's own paint — descendants
+    // that set `visibility: visible` still show through.
+    if node.background_color.is_some() && node.visibility.is_painted() {
         add_clipped_rect(node.rect, node.background_color, clip_stack, out);
     }
 }
@@ -3485,7 +3517,11 @@ pub fn collect_decorations(node: &LayoutNode) -> Vec<VisualDecoration> {
 fn collect_decorations_internal(node: &LayoutNode, out: &mut Vec<VisualDecoration>) {
     let has_bg = node.background_color.is_some();
     let has_border = node.border_color.is_some() && node.border.iter().any(|&w| w > 0.0);
-    if (has_bg || has_border) && node.rect.width >= 2.0 && node.rect.height >= 2.0 {
+    if (has_bg || has_border)
+        && node.visibility.is_painted()
+        && node.rect.width >= 2.0
+        && node.rect.height >= 2.0
+    {
         out.push(VisualDecoration {
             x: node.rect.x,
             y: node.rect.y,
@@ -3537,6 +3573,12 @@ pub struct TextInfo {
 pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
     let mut texts = Vec::new();
 
+    // `visibility: hidden` still occupies its layout box, so the subtree keeps
+    // its geometry — only the text inside it goes uncollected. A descendant
+    // that sets `visibility: visible` is a separate node and paints normally,
+    // so the recursion below still has to run.
+    let paint_own_text = node.visibility.is_painted();
+
     // If this node has inline layout (line_boxes), walk them instead of recursing
     // into children for text collection — the line boxes hold the authoritative
     // positions and word-split text fragments.
@@ -3558,7 +3600,7 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
                         text_style,
                         ..
                     } => {
-                        if !text.trim().is_empty() {
+                        if paint_own_text && !text.trim().is_empty() {
                             // Use CSS `color` (foreground), default to black
                             let text_color = color.unwrap_or(node.color.unwrap_or([0, 0, 0, 255]));
 
@@ -3600,7 +3642,11 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
     } else {
         if let Some(ref text) = node.text {
             // Fallback: no inline layout was computed, use the block-level approach.
-            if !text.trim().is_empty() && node.rect.width > 0.0 && node.rect.height > 0.0 {
+            if paint_own_text
+                && !text.trim().is_empty()
+                && node.rect.width > 0.0
+                && node.rect.height > 0.0
+            {
                 // Use CSS `color` (foreground) as text color, default to black
                 let color = node.color.unwrap_or([0, 0, 0, 255]);
 
@@ -3608,7 +3654,7 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
                     x: node.rect.x,
                     y: node.rect.y,
                     width: node.rect.width,
-                    text: text.clone(),
+                    text: node.text_style.transform.apply(text).into_owned(),
                     color,
                     font_size: node.font_size,
                     text_style: node.text_style,
@@ -3659,7 +3705,9 @@ fn collect_image_nodes_inner(node: &LayoutNode, images: &mut Vec<ImageInfo>) {
         return;
     }
 
-    if let Some(src) = &node.image_src {
+    if let Some(src) = &node.image_src
+        && node.visibility.is_painted()
+    {
         images.push(ImageInfo {
             x: node.rect.x,
             y: node.rect.y,
@@ -4861,6 +4909,71 @@ mod tests {
 
         let texts = collect_text_nodes(&root);
         assert!(texts.is_empty(), "Zero-dimension text nodes are skipped");
+    }
+
+    #[test]
+    fn collect_text_nodes_skips_hidden_nodes() {
+        let mut hidden = LayoutNode::new(Rect::new(10.0, 10.0, 150.0, 25.0));
+        hidden.text = Some("Invisible".to_string());
+        hidden.visibility = crate::css::Visibility::Hidden;
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(hidden);
+
+        assert!(
+            collect_text_nodes(&root).is_empty(),
+            "visibility: hidden text is not painted"
+        );
+    }
+
+    #[test]
+    fn hidden_parent_does_not_hide_visible_child() {
+        // The child re-declared `visibility: visible`, so the cascade left it
+        // visible and it must still paint inside a hidden ancestor.
+        let mut visible_child = LayoutNode::new(Rect::new(20.0, 20.0, 150.0, 25.0));
+        visible_child.text = Some("Shown".to_string());
+
+        let mut hidden = LayoutNode::new(Rect::new(10.0, 10.0, 200.0, 100.0));
+        hidden.text = Some("Invisible".to_string());
+        hidden.visibility = crate::css::Visibility::Hidden;
+        hidden.add_child(visible_child);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(hidden);
+
+        let texts = collect_text_nodes(&root);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].text, "Shown");
+    }
+
+    #[test]
+    fn hidden_node_keeps_its_background_out_of_the_render_list() {
+        let mut hidden = LayoutNode::new(Rect::new(10.0, 10.0, 100.0, 50.0));
+        hidden.background_color = Some([255, 0, 0, 255]);
+        hidden.visibility = crate::css::Visibility::Hidden;
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(hidden);
+
+        let rects = collect_render_rects(&root);
+        assert!(
+            rects.is_empty(),
+            "hidden backgrounds are not drawn, but the box still laid out"
+        );
+    }
+
+    #[test]
+    fn text_transform_is_applied_to_block_text() {
+        let mut child = LayoutNode::new(Rect::new(10.0, 10.0, 150.0, 25.0));
+        child.text = Some("hello world".to_string());
+        child.text_style.transform = crate::css::TextTransform::Uppercase;
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(child);
+
+        let texts = collect_text_nodes(&root);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].text, "HELLO WORLD");
     }
 
     #[test]

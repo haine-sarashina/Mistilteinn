@@ -288,11 +288,14 @@ fn inherit_properties(parent: &ComputedValues, mut child: ComputedValues) -> Com
     // `font-weight` / `font-style` inherit. Decoration lines do not technically
     // inherit, but they are drawn across descendant text, so propagating them
     // here produces the same result.
-    child.text_style.bold |= parent.text_style.bold;
-    child.text_style.italic |= parent.text_style.italic;
-    child.text_style.underline |= parent.text_style.underline;
-    child.text_style.line_through |= parent.text_style.line_through;
-    child.text_style.overline |= parent.text_style.overline;
+    // `letter-spacing`, `word-spacing` and `text-transform` inherit too, and
+    // `merged_with` already resolves "child's own value wins" for each.
+    child.text_style = child.text_style.merged_with(parent.text_style);
+    // `visibility` inherits, but a child may declare `visible` to escape a
+    // hidden ancestor, so only fill in when the child left it at the initial.
+    if child.visibility == Visibility::Visible && parent.visibility != Visibility::Visible {
+        child.visibility = parent.visibility;
+    }
     // CSS custom properties (variables) always inherit
     for (k, v) in &parent.custom_properties {
         if !child.custom_properties.contains_key(k) {
@@ -932,16 +935,76 @@ pub struct ComputedValues {
     // Typography
     pub text_style: TextStyleFlags,
     pub text_align: TextAlign,
+    pub visibility: Visibility,
     // CSS Custom Properties (CSS variables --*)
     pub custom_properties: rustc_hash::FxHashMap<String, String>,
 }
 
-/// The text styling flags that travel from the cascade through layout into
-/// the glyph rasterizer.
-///
-/// Kept as one `Copy` struct rather than loose booleans because every text
-/// box, inline run, and render command has to carry the whole set.
+/// How `text-transform` rewrites a run's text before it is measured and drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextTransform {
+    #[default]
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+}
+
+impl TextTransform {
+    /// Apply the transform, returning the original string when it is a no-op.
+    pub fn apply(self, text: &str) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
+        match self {
+            Self::None => Cow::Borrowed(text),
+            Self::Uppercase => Cow::Owned(text.to_uppercase()),
+            Self::Lowercase => Cow::Owned(text.to_lowercase()),
+            Self::Capitalize => {
+                // Uppercase the first letter of each whitespace-separated word,
+                // leaving the rest of the word as authored (per CSS).
+                let mut out = String::with_capacity(text.len());
+                let mut at_word_start = true;
+                for ch in text.chars() {
+                    if ch.is_whitespace() {
+                        at_word_start = true;
+                        out.push(ch);
+                    } else if at_word_start {
+                        at_word_start = false;
+                        out.extend(ch.to_uppercase());
+                    } else {
+                        out.push(ch);
+                    }
+                }
+                Cow::Owned(out)
+            }
+        }
+    }
+}
+
+/// The computed `visibility` property.
+///
+/// Hidden and collapsed elements still take part in layout — they are simply
+/// not painted — which is what separates this from `display: none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Visibility {
+    #[default]
+    Visible,
+    Hidden,
+    Collapse,
+}
+
+impl Visibility {
+    /// Whether an element with this visibility should be painted.
+    pub fn is_painted(self) -> bool {
+        matches!(self, Self::Visible)
+    }
+}
+
+/// The text styling that travels from the cascade through layout into the
+/// glyph rasterizer.
+///
+/// Kept as one `Copy` struct rather than loose fields because every text box,
+/// inline run, and render command has to carry the whole set.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TextStyleFlags {
     /// `font-weight: bold` (or numeric >= 600).
     pub bold: bool,
@@ -953,6 +1016,12 @@ pub struct TextStyleFlags {
     pub line_through: bool,
     /// `text-decoration-line: overline`.
     pub overline: bool,
+    /// `letter-spacing` in pixels; 0 is the initial `normal`.
+    pub letter_spacing: f32,
+    /// `word-spacing` in pixels; 0 is the initial `normal`.
+    pub word_spacing: f32,
+    /// `text-transform`.
+    pub transform: TextTransform,
 }
 
 impl TextStyleFlags {
@@ -965,7 +1034,8 @@ impl TextStyleFlags {
     ///
     /// A flag set anywhere up the chain stays set: an `<em>` inside a bold
     /// heading is both bold and italic, and a decoration on an ancestor is
-    /// drawn across the descendant text it contains.
+    /// drawn across the descendant text it contains. Spacing and transform are
+    /// single-valued, so the element's own value wins when it set one.
     pub fn merged_with(self, inherited: Self) -> Self {
         Self {
             bold: self.bold || inherited.bold,
@@ -973,6 +1043,21 @@ impl TextStyleFlags {
             underline: self.underline || inherited.underline,
             line_through: self.line_through || inherited.line_through,
             overline: self.overline || inherited.overline,
+            letter_spacing: if self.letter_spacing != 0.0 {
+                self.letter_spacing
+            } else {
+                inherited.letter_spacing
+            },
+            word_spacing: if self.word_spacing != 0.0 {
+                self.word_spacing
+            } else {
+                inherited.word_spacing
+            },
+            transform: if self.transform != TextTransform::None {
+                self.transform
+            } else {
+                inherited.transform
+            },
         }
     }
 }
@@ -1049,6 +1134,7 @@ impl Default for ComputedValues {
             border_radius: 0.0,
             text_style: TextStyleFlags::default(),
             text_align: TextAlign::Left,
+            visibility: Visibility::Visible,
             custom_properties: rustc_hash::FxHashMap::default(),
         }
     }
@@ -1567,6 +1653,36 @@ impl ComputedValues {
                 self.text_style.underline = lower.contains("underline");
                 self.text_style.line_through = lower.contains("line-through");
                 self.text_style.overline = lower.contains("overline");
+            }
+            "visibility" => {
+                self.visibility = match val.to_ascii_lowercase().as_str() {
+                    "hidden" => Visibility::Hidden,
+                    "collapse" => Visibility::Collapse,
+                    _ => Visibility::Visible,
+                };
+            }
+            "letter-spacing" => {
+                // `normal` is the initial value and means no extra tracking.
+                self.text_style.letter_spacing = if val.eq_ignore_ascii_case("normal") {
+                    0.0
+                } else {
+                    parse_length(val).unwrap_or(0.0)
+                };
+            }
+            "word-spacing" => {
+                self.text_style.word_spacing = if val.eq_ignore_ascii_case("normal") {
+                    0.0
+                } else {
+                    parse_length(val).unwrap_or(0.0)
+                };
+            }
+            "text-transform" => {
+                self.text_style.transform = match val.to_ascii_lowercase().as_str() {
+                    "uppercase" => TextTransform::Uppercase,
+                    "lowercase" => TextTransform::Lowercase,
+                    "capitalize" => TextTransform::Capitalize,
+                    _ => TextTransform::None,
+                };
             }
             "text-align" => {
                 self.text_align = match val {
@@ -3330,6 +3446,135 @@ mod tests {
         let merged = child.merged_with(ancestor);
         assert!(merged.bold && merged.italic && merged.underline);
         assert!(!merged.line_through && !merged.overline);
+    }
+
+    // ------ visibility / spacing / text-transform ------
+
+    #[test]
+    fn visibility_keywords_parse() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div>a</div></body></html>",
+            "div { visibility: hidden; }",
+        );
+        assert_eq!(
+            styles_for_tag(&arena, &styles, "div").visibility,
+            Visibility::Hidden
+        );
+        assert!(
+            !styles_for_tag(&arena, &styles, "div")
+                .visibility
+                .is_painted()
+        );
+
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div>a</div></body></html>",
+            "div { visibility: collapse; }",
+        );
+        assert_eq!(
+            styles_for_tag(&arena, &styles, "div").visibility,
+            Visibility::Collapse
+        );
+    }
+
+    #[test]
+    fn visibility_inherits_but_child_can_override() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div><span>a</span></div></body></html>",
+            "div { visibility: hidden; }",
+        );
+        assert_eq!(
+            styles_for_tag(&arena, &styles, "span").visibility,
+            Visibility::Hidden,
+            "inherits hidden from the parent"
+        );
+
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div><span>a</span></div></body></html>",
+            "div { visibility: hidden; } span { visibility: visible; }",
+        );
+        assert_eq!(
+            styles_for_tag(&arena, &styles, "span").visibility,
+            Visibility::Visible,
+            "a child may re-show itself inside a hidden parent"
+        );
+    }
+
+    #[test]
+    fn letter_and_word_spacing_parse_lengths() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div>a</div></body></html>",
+            "div { font-size: 10px; letter-spacing: 0.2em; word-spacing: 4px; }",
+        );
+
+        let div = styles_for_tag(&arena, &styles, "div");
+        assert_eq!(div.text_style.letter_spacing, 2.0, "0.2em of 10px");
+        assert_eq!(div.text_style.word_spacing, 4.0);
+    }
+
+    #[test]
+    fn spacing_normal_is_zero() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div>a</div></body></html>",
+            "div { letter-spacing: normal; word-spacing: normal; }",
+        );
+
+        let div = styles_for_tag(&arena, &styles, "div");
+        assert_eq!(div.text_style.letter_spacing, 0.0);
+        assert_eq!(div.text_style.word_spacing, 0.0);
+    }
+
+    #[test]
+    fn text_transform_parses_and_inherits() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div><span>a</span></div></body></html>",
+            "div { text-transform: uppercase; }",
+        );
+
+        assert_eq!(
+            styles_for_tag(&arena, &styles, "div").text_style.transform,
+            TextTransform::Uppercase
+        );
+        assert_eq!(
+            styles_for_tag(&arena, &styles, "span").text_style.transform,
+            TextTransform::Uppercase,
+            "text-transform inherits"
+        );
+    }
+
+    #[test]
+    fn text_transform_applies_to_text() {
+        assert_eq!(TextTransform::None.apply("hello world"), "hello world");
+        assert_eq!(TextTransform::Uppercase.apply("hello world"), "HELLO WORLD");
+        assert_eq!(TextTransform::Lowercase.apply("HELLO World"), "hello world");
+        assert_eq!(
+            TextTransform::Capitalize.apply("hello world"),
+            "Hello World"
+        );
+    }
+
+    #[test]
+    fn capitalize_leaves_the_rest_of_each_word_alone() {
+        // Per CSS, capitalize only touches the first letter of each word.
+        assert_eq!(
+            TextTransform::Capitalize.apply("hELLO wORLD"),
+            "HELLO WORLD"
+        );
+        assert_eq!(
+            TextTransform::Capitalize.apply("  spaced  out "),
+            "  Spaced  Out "
+        );
+        assert_eq!(TextTransform::Capitalize.apply(""), "");
+    }
+
+    #[test]
+    fn text_transform_handles_non_ascii() {
+        assert_eq!(TextTransform::Uppercase.apply("straße"), "STRASSE");
+        assert_eq!(
+            TextTransform::Capitalize.apply("études du soir"),
+            "Études Du Soir"
+        );
+        // Japanese has no case, so it must pass through untouched.
+        assert_eq!(TextTransform::Uppercase.apply("日本語"), "日本語");
     }
 
     #[test]

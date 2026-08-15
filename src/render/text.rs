@@ -89,6 +89,46 @@ impl TextRenderer {
     /// This is used by the layout engine to compute text box dimensions
     /// before rendering.
     pub fn measure(&mut self, text: &str, font_size: f32, family: &str) -> (f32, f32) {
+        self.measure_styled(
+            text,
+            font_size,
+            family,
+            crate::css::TextStyleFlags::default(),
+        )
+    }
+
+    /// Push the weight, slant and spacing properties shared by measuring and
+    /// rasterizing, so both agree on how wide a run is.
+    fn push_text_style(
+        builder: &mut parley::RangedBuilder<'_, ()>,
+        style: crate::css::TextStyleFlags,
+    ) {
+        if style.bold {
+            builder.push_default(parley::StyleProperty::FontWeight(parley::FontWeight::BOLD));
+        }
+        if style.italic {
+            builder.push_default(parley::StyleProperty::FontStyle(parley::FontStyle::Italic));
+        }
+        if style.letter_spacing != 0.0 {
+            builder.push_default(parley::StyleProperty::LetterSpacing(style.letter_spacing));
+        }
+        if style.word_spacing != 0.0 {
+            builder.push_default(parley::StyleProperty::WordSpacing(style.word_spacing));
+        }
+    }
+
+    /// Measure a string with the bold/italic/spacing styling that will be used
+    /// to draw it.
+    ///
+    /// Layout must measure with the same styling the rasterizer applies, or
+    /// bold and letter-spaced text overflows the box it was measured into.
+    pub fn measure_styled(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        family: &str,
+        style: crate::css::TextStyleFlags,
+    ) -> (f32, f32) {
         let display_scale = 1.0;
         let mut builder = self
             .layout_ctx
@@ -98,6 +138,7 @@ impl TextRenderer {
         builder.push_default(parley::StyleProperty::FontSize(font_size));
         builder.push_default(parley::StyleProperty::FontStack(family.into()));
         builder.push_default(parley::StyleProperty::LineHeight(1.2));
+        Self::push_text_style(&mut builder, style);
 
         let mut layout: Layout<()> = builder.build(text);
 
@@ -304,12 +345,7 @@ impl TextRenderer {
         builder.push_default(parley::StyleProperty::FontSize(font_size));
         builder.push_default(parley::StyleProperty::FontStack(family.into()));
         builder.push_default(parley::StyleProperty::LineHeight(1.2));
-        if style.bold {
-            builder.push_default(parley::StyleProperty::FontWeight(parley::FontWeight::BOLD));
-        }
-        if style.italic {
-            builder.push_default(parley::StyleProperty::FontStyle(parley::FontStyle::Italic));
-        }
+        Self::push_text_style(&mut builder, style);
 
         let mut layout: Layout<()> = builder.build(text);
         layout.break_all_lines(Some(max_width));

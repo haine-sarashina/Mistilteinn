@@ -80,8 +80,7 @@ pub enum InlineBox {
         font_size: f32,
         dom_node_id: Option<u32>,
         interaction_type: InteractionType,
-        is_bold: bool,
-        is_underline: bool,
+        text_style: crate::css::TextStyleFlags,
     },
     Element {
         child_index: usize, // index into parent's children vec for the LayoutNode
@@ -108,8 +107,7 @@ impl InlineBox {
             font_size,
             dom_node_id: None,
             interaction_type: InteractionType::None,
-            is_bold: false,
-            is_underline: false,
+            text_style: crate::css::TextStyleFlags::default(),
         }
     }
 
@@ -231,8 +229,7 @@ pub struct LayoutNode {
     /// Border radius in pixels
     pub border_radius: f32,
     /// Typography properties
-    pub is_bold: bool,
-    pub is_underline: bool,
+    pub text_style: crate::css::TextStyleFlags,
     pub text_align: crate::css::TextAlign,
     pub is_line_break: bool,
 }
@@ -285,8 +282,7 @@ impl LayoutNode {
             clear: ClearType::None,
             border_color: None,
             border_radius: 0.0,
-            is_bold: false,
-            is_underline: false,
+            text_style: crate::css::TextStyleFlags::default(),
             text_align: crate::css::TextAlign::Left,
             is_line_break: false,
         }
@@ -500,8 +496,7 @@ where
     root_layout.border = root_styles.border_width;
     root_layout.border_color = root_styles.border_color;
     root_layout.border_radius = root_styles.border_radius;
-    root_layout.is_bold = root_styles.is_bold;
-    root_layout.is_underline = root_styles.is_underline;
+    root_layout.text_style = root_styles.text_style;
     root_layout.text_align = root_styles.text_align;
 
     // Propagate font properties from computed styles
@@ -656,8 +651,7 @@ fn build_layout_children<N, F>(
                     layout_node.border = child_styles.border_width;
                     layout_node.border_color = child_styles.border_color;
                     layout_node.border_radius = child_styles.border_radius;
-                    layout_node.is_bold = child_styles.is_bold;
-                    layout_node.is_underline = child_styles.is_underline;
+                    layout_node.text_style = child_styles.text_style;
                     layout_node.text_align = child_styles.text_align;
 
                     // Extract image src and dimensions from <img> and <svg> tags
@@ -876,8 +870,7 @@ fn build_layout_children<N, F>(
                     layout_node.border = child_styles.border_width;
                     layout_node.border_color = child_styles.border_color;
                     layout_node.border_radius = child_styles.border_radius;
-                    layout_node.is_bold = child_styles.is_bold;
-                    layout_node.is_underline = child_styles.is_underline;
+                    layout_node.text_style = child_styles.text_style;
                     layout_node.text_align = child_styles.text_align;
 
                     // Extract image src and dimensions from <img> and <svg> tags
@@ -2782,8 +2775,7 @@ fn collect_inline_boxes_recursive(
     inherited_font_size: f32,
     inherited_dom_id: Option<u32>,
     inherited_interaction: InteractionType,
-    inherited_bold: bool,
-    inherited_underline: bool,
+    inherited_style: crate::css::TextStyleFlags,
     boxes: &mut Vec<InlineBox>,
 ) {
     let color = child.color.or(inherited_color);
@@ -2798,8 +2790,7 @@ fn collect_inline_boxes_recursive(
     } else {
         inherited_interaction
     };
-    let is_bold = child.is_bold || inherited_bold;
-    let is_underline = child.is_underline || inherited_underline;
+    let text_style = child.text_style.merged_with(inherited_style);
 
     if child.is_line_break {
         boxes.push(InlineBox::LineBreak);
@@ -2820,8 +2811,7 @@ fn collect_inline_boxes_recursive(
                 font_size,
                 dom_node_id: dom_id,
                 interaction_type: interaction,
-                is_bold,
-                is_underline,
+                text_style,
             });
         }
     } else if child.image_src.is_some() || matches!(child.display, DisplayType::InlineBlock) {
@@ -2845,8 +2835,7 @@ fn collect_inline_boxes_recursive(
                     font_size,
                     dom_id,
                     interaction,
-                    is_bold,
-                    is_underline,
+                    text_style,
                     boxes,
                 );
             }
@@ -2876,8 +2865,7 @@ fn build_inline_boxes(parent: &LayoutNode, children: &[LayoutNode]) -> Vec<Inlin
     };
     let p_dom_id = parent.dom_node_id;
     let p_interaction = parent.interaction_type;
-    let p_bold = parent.is_bold;
-    let p_underline = parent.is_underline;
+    let p_style = parent.text_style;
 
     for (idx, child) in children.iter().enumerate() {
         collect_inline_boxes_recursive(
@@ -2887,8 +2875,7 @@ fn build_inline_boxes(parent: &LayoutNode, children: &[LayoutNode]) -> Vec<Inlin
             p_fs,
             p_dom_id,
             p_interaction,
-            p_bold,
-            p_underline,
+            p_style,
             &mut boxes,
         );
     }
@@ -2908,8 +2895,7 @@ fn build_inline_boxes_from_slice(parent: &LayoutNode, children: &[LayoutNode]) -
     };
     let p_dom_id = parent.dom_node_id;
     let p_interaction = parent.interaction_type;
-    let p_bold = parent.is_bold;
-    let p_underline = parent.is_underline;
+    let p_style = parent.text_style;
 
     for (idx, child) in children.iter().enumerate() {
         collect_inline_boxes_recursive(
@@ -2919,8 +2905,7 @@ fn build_inline_boxes_from_slice(parent: &LayoutNode, children: &[LayoutNode]) -
             p_fs,
             p_dom_id,
             p_interaction,
-            p_bold,
-            p_underline,
+            p_style,
             &mut boxes,
         );
     }
@@ -3213,8 +3198,7 @@ pub fn break_into_lines(
                 font_size,
                 dom_node_id,
                 interaction_type,
-                is_bold,
-                is_underline,
+                text_style,
             } => {
                 let tokens = tokenize_text_for_line_breaking(text);
 
@@ -3264,8 +3248,7 @@ pub fn break_into_lines(
                                 font_size: *font_size,
                                 dom_node_id: *dom_node_id,
                                 interaction_type: *interaction_type,
-                                is_bold: *is_bold,
-                                is_underline: *is_underline,
+                                text_style: *text_style,
                             });
 
                             current_line_width += word_width;
@@ -3538,10 +3521,8 @@ pub struct TextInfo {
     pub color: [u8; 4],
     /// Font size in pixels.
     pub font_size: f32,
-    /// Whether the text is bold.
-    pub is_bold: bool,
-    /// Whether the text is underlined.
-    pub is_underline: bool,
+    /// Bold / italic / decoration flags for this run.
+    pub text_style: crate::css::TextStyleFlags,
 }
 
 /// Collect all text nodes from the layout tree for rendering.
@@ -3574,8 +3555,7 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
                         width,
                         color,
                         font_size,
-                        is_bold,
-                        is_underline,
+                        text_style,
                         ..
                     } => {
                         if !text.trim().is_empty() {
@@ -3589,8 +3569,7 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
                                 text: text.clone(),
                                 color: text_color,
                                 font_size: *font_size,
-                                is_bold: *is_bold || node.is_bold,
-                                is_underline: *is_underline || node.is_underline,
+                                text_style: text_style.merged_with(node.text_style),
                             });
                         }
                         x_offset += *width;
@@ -3632,8 +3611,7 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
                     text: text.clone(),
                     color,
                     font_size: node.font_size,
-                    is_bold: node.is_bold,
-                    is_underline: node.is_underline,
+                    text_style: node.text_style,
                 });
             }
         }
@@ -5571,8 +5549,7 @@ mod tests {
                     font_size: 16.0,
                     dom_node_id: None,
                     interaction_type: InteractionType::None,
-                    is_bold: false,
-                    is_underline: false,
+                    text_style: crate::css::TextStyleFlags::default(),
                 },
                 InlineBox::Whitespace {
                     collapsible: false,
@@ -5585,8 +5562,7 @@ mod tests {
                     font_size: 16.0,
                     dom_node_id: None,
                     interaction_type: InteractionType::None,
-                    is_bold: false,
-                    is_underline: false,
+                    text_style: crate::css::TextStyleFlags::default(),
                 },
             ],
         }];
@@ -5641,8 +5617,7 @@ mod tests {
                 font_size: 16.0,
                 dom_node_id: None,
                 interaction_type: InteractionType::None,
-                is_bold: false,
-                is_underline: false,
+                text_style: crate::css::TextStyleFlags::default(),
             }],
         }];
         root.line_boxes = Some(line_boxes);
@@ -6654,8 +6629,7 @@ mod tests {
                     font_size: 16.0,
                     dom_node_id: None,
                     interaction_type: InteractionType::None,
-                    is_bold: false,
-                    is_underline: false,
+                    text_style: crate::css::TextStyleFlags::default(),
                 },
                 InlineBox::Text {
                     text: "Nostradamus".to_string(),
@@ -6664,8 +6638,10 @@ mod tests {
                     font_size: 16.0,
                     dom_node_id: Some(42),
                     interaction_type: InteractionType::Link,
-                    is_bold: false,
-                    is_underline: true,
+                    text_style: crate::css::TextStyleFlags {
+                        underline: true,
+                        ..Default::default()
+                    },
                 },
             ],
         }];

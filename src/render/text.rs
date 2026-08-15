@@ -263,12 +263,21 @@ impl TextRenderer {
         height: u32,
     ) {
         self.rasterize_to_bitmap_styled(
-            text, font_size, family, color, origin_x, origin_y, max_width, false, false, buffer,
-            width, height,
+            text,
+            font_size,
+            family,
+            color,
+            origin_x,
+            origin_y,
+            max_width,
+            crate::css::TextStyleFlags::default(),
+            buffer,
+            width,
+            height,
         );
     }
 
-    /// Rasterize laid-out text with optional bold and underline styling.
+    /// Rasterize laid-out text, applying the bold/italic/decoration flags.
     pub fn rasterize_to_bitmap_styled(
         &mut self,
         text: &str,
@@ -278,8 +287,7 @@ impl TextRenderer {
         origin_x: f32,
         origin_y: f32,
         max_width: f32,
-        is_bold: bool,
-        is_underline: bool,
+        style: crate::css::TextStyleFlags,
         buffer: &mut [u8],
         width: u32,
         height: u32,
@@ -296,8 +304,11 @@ impl TextRenderer {
         builder.push_default(parley::StyleProperty::FontSize(font_size));
         builder.push_default(parley::StyleProperty::FontStack(family.into()));
         builder.push_default(parley::StyleProperty::LineHeight(1.2));
-        if is_bold {
+        if style.bold {
             builder.push_default(parley::StyleProperty::FontWeight(parley::FontWeight::BOLD));
+        }
+        if style.italic {
+            builder.push_default(parley::StyleProperty::FontStyle(parley::FontStyle::Italic));
         }
 
         let mut layout: Layout<()> = builder.build(text);
@@ -367,25 +378,40 @@ impl TextRenderer {
                 }
             }
 
-            if is_underline {
-                let underline_w = (cursor_x - line_start_x).max(0.0);
-                if underline_w > 0.0 {
+            if style.has_decoration() {
+                let line_w = (cursor_x - line_start_x).max(0.0);
+                if line_w > 0.0 {
                     let u_color = [
                         (color[0] * 255.0) as u8,
                         (color[1] * 255.0) as u8,
                         (color[2] * 255.0) as u8,
                         (color[3] * 255.0) as u8,
                     ];
-                    crate::render::draw_underline(
-                        buffer,
-                        width,
-                        height,
-                        line_start_x,
-                        baseline + 2.0,
-                        underline_w,
-                        (font_size / 14.0).max(1.0),
-                        u_color,
-                    );
+                    let thickness = (font_size / 14.0).max(1.0);
+                    // Each decoration sits at a different height relative to the
+                    // baseline: under it, through the middle of the x-height, and
+                    // above the ascender.
+                    let mut draw_at = |y: f32| {
+                        crate::render::draw_underline(
+                            buffer,
+                            width,
+                            height,
+                            line_start_x,
+                            y,
+                            line_w,
+                            thickness,
+                            u_color,
+                        );
+                    };
+                    if style.underline {
+                        draw_at(baseline + 2.0);
+                    }
+                    if style.line_through {
+                        draw_at(baseline - metrics.ascent * 0.32);
+                    }
+                    if style.overline {
+                        draw_at(line_y);
+                    }
                 }
             }
 

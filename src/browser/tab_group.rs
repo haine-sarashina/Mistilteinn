@@ -45,8 +45,8 @@ impl GroupColor {
         match self {
             GroupColor::Blue => (86.0 / 255.0, 170.0 / 255.0, 249.0 / 255.0),
             GroupColor::Green => (103.0 / 255.0, 211.0 / 255.0, 103.0 / 255.0),
-            GroupColor::Yellow => (255.0 / 255.0, 220.0 / 255.0, 80.0 / 255.0),
-            GroupColor::Orange => (255.0 / 255.0, 160.0 / 255.0, 60.0 / 255.0),
+            GroupColor::Yellow => (1.0, 220.0 / 255.0, 80.0 / 255.0),
+            GroupColor::Orange => (1.0, 160.0 / 255.0, 60.0 / 255.0),
             GroupColor::Red => (249.0 / 255.0, 117.0 / 255.0, 117.0 / 255.0),
             GroupColor::Purple => (199.0 / 255.0, 128.0 / 255.0, 249.0 / 255.0),
         }

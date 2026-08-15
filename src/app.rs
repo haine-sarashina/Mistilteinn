@@ -324,7 +324,7 @@ impl MistilteinnApp {
             window_height as f32,
         ));
         let (addr_r, addr_g, addr_b) = if self.is_address_focused {
-            (255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0) // White when focused
+            (1.0, 1.0, 1.0) // White when focused
         } else if self.hovered_address_bar {
             (75.0 / 255.0, 75.0 / 255.0, 85.0 / 255.0)
         } else {
@@ -747,8 +747,7 @@ impl MistilteinnApp {
                 text_x,
                 text_y,
                 text_info.width,
-                text_info.is_bold,
-                text_info.is_underline,
+                text_info.text_style,
                 &mut composite_buffer,
                 win_w,
                 win_h,

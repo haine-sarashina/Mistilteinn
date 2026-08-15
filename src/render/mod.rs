@@ -1119,7 +1119,7 @@ mod tests {
         assert_eq!(dest[idx + 2], 0);
         assert_eq!(dest[idx + 3], 255);
 
-        let idx = (0 * 4 + 0) * 4;
+        let idx = 0;
         assert_eq!(dest[idx], 0);
     }
 
@@ -1158,7 +1158,7 @@ mod tests {
         composite_image(&src, 4, 4, &mut dest, 4, 4, -1.0, -1.0);
 
         // Source pixel (1,1) maps to dest(0,0) — should be painted
-        let idx = (0 * 4 + 0) * 4;
+        let idx = 0;
         assert_eq!(dest[idx], 255, "dest(0,0) gets source(1,1)");
 
         // Source pixel (3,3) maps to dest(2,2) — should be painted
@@ -1170,7 +1170,7 @@ mod tests {
         assert_eq!(dest[idx], 0, "dest(3,0) is out of image bounds");
 
         // The last column (dest x=3) has no mapped source — should remain 0
-        let idx = (0 * 4 + 3) * 4;
+        let idx = 3 * 4;
         assert_eq!(dest[idx], 0, "dest(0,3) is out of image bounds");
     }
 

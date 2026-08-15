@@ -285,6 +285,14 @@ fn inherit_properties(parent: &ComputedValues, mut child: ComputedValues) -> Com
     if child.text_align == TextAlign::Left && parent.text_align != TextAlign::Left {
         child.text_align = parent.text_align;
     }
+    // `font-weight` / `font-style` inherit. Decoration lines do not technically
+    // inherit, but they are drawn across descendant text, so propagating them
+    // here produces the same result.
+    child.text_style.bold |= parent.text_style.bold;
+    child.text_style.italic |= parent.text_style.italic;
+    child.text_style.underline |= parent.text_style.underline;
+    child.text_style.line_through |= parent.text_style.line_through;
+    child.text_style.overline |= parent.text_style.overline;
     // CSS custom properties (variables) always inherit
     for (k, v) in &parent.custom_properties {
         if !child.custom_properties.contains_key(k) {
@@ -922,12 +930,63 @@ pub struct ComputedValues {
     pub border_color: Option<[u8; 4]>,
     pub border_radius: f32,
     // Typography
-    pub is_bold: bool,
-    pub is_italic: bool,
-    pub is_underline: bool,
+    pub text_style: TextStyleFlags,
     pub text_align: TextAlign,
     // CSS Custom Properties (CSS variables --*)
     pub custom_properties: rustc_hash::FxHashMap<String, String>,
+}
+
+/// The text styling flags that travel from the cascade through layout into
+/// the glyph rasterizer.
+///
+/// Kept as one `Copy` struct rather than loose booleans because every text
+/// box, inline run, and render command has to carry the whole set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TextStyleFlags {
+    /// `font-weight: bold` (or numeric >= 600).
+    pub bold: bool,
+    /// `font-style: italic | oblique`.
+    pub italic: bool,
+    /// `text-decoration-line: underline`.
+    pub underline: bool,
+    /// `text-decoration-line: line-through`.
+    pub line_through: bool,
+    /// `text-decoration-line: overline`.
+    pub overline: bool,
+}
+
+impl TextStyleFlags {
+    /// Whether any decoration line needs to be drawn.
+    pub fn has_decoration(&self) -> bool {
+        self.underline || self.line_through || self.overline
+    }
+
+    /// Combine with styles coming from an ancestor.
+    ///
+    /// A flag set anywhere up the chain stays set: an `<em>` inside a bold
+    /// heading is both bold and italic, and a decoration on an ancestor is
+    /// drawn across the descendant text it contains.
+    pub fn merged_with(self, inherited: Self) -> Self {
+        Self {
+            bold: self.bold || inherited.bold,
+            italic: self.italic || inherited.italic,
+            underline: self.underline || inherited.underline,
+            line_through: self.line_through || inherited.line_through,
+            overline: self.overline || inherited.overline,
+        }
+    }
+}
+
+/// Decide whether a `font-weight` value renders as bold.
+///
+/// Accepts the keywords plus numeric weights, treating 600 and above as bold
+/// (the threshold browsers use when only a regular and a bold face exist).
+fn parse_is_bold(val: &str) -> bool {
+    let val = val.trim();
+    if let Ok(n) = val.parse::<f32>() {
+        return n >= 600.0;
+    }
+    matches!(val.to_ascii_lowercase().as_str(), "bold" | "bolder")
 }
 
 /// CSS text-align property
@@ -988,9 +1047,7 @@ impl Default for ComputedValues {
             border_width: [0.0; 4],
             border_color: None,
             border_radius: 0.0,
-            is_bold: false,
-            is_italic: false,
-            is_underline: false,
+            text_style: TextStyleFlags::default(),
             text_align: TextAlign::Left,
             custom_properties: rustc_hash::FxHashMap::default(),
         }
@@ -1496,13 +1553,20 @@ impl ComputedValues {
                 }
             }
             "font-weight" => {
-                self.is_bold = matches!(val, "bold" | "bolder" | "700" | "800" | "900");
+                self.text_style.bold = parse_is_bold(val);
             }
             "font-style" => {
-                self.is_italic = matches!(val, "italic" | "oblique");
+                self.text_style.italic =
+                    matches!(val.to_ascii_lowercase().as_str(), "italic" | "oblique");
             }
             "text-decoration" | "text-decoration-line" => {
-                self.is_underline = val.contains("underline");
+                // The shorthand also carries color/style/thickness, which we
+                // ignore; only the line keywords affect what we draw. `none`
+                // clears any decoration inherited from an earlier declaration.
+                let lower = val.to_ascii_lowercase();
+                self.text_style.underline = lower.contains("underline");
+                self.text_style.line_through = lower.contains("line-through");
+                self.text_style.overline = lower.contains("overline");
             }
             "text-align" => {
                 self.text_align = match val {
@@ -1988,6 +2052,35 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
         ("figcaption", "display: block"),
         ("span", "display: inline"),
         ("br", "display: inline"),
+        // Inline text semantics. Without these the cascade never sets the
+        // bold/italic/decoration flags, so real markup renders flat.
+        ("b", "display: inline; font-weight: bold"),
+        ("strong", "display: inline; font-weight: bold"),
+        ("i", "display: inline; font-style: italic"),
+        ("em", "display: inline; font-style: italic"),
+        ("cite", "display: inline; font-style: italic"),
+        ("var", "display: inline; font-style: italic"),
+        ("dfn", "display: inline; font-style: italic"),
+        ("address", "display: block; font-style: italic"),
+        ("u", "display: inline; text-decoration: underline"),
+        ("ins", "display: inline; text-decoration: underline"),
+        ("s", "display: inline; text-decoration: line-through"),
+        ("strike", "display: inline; text-decoration: line-through"),
+        ("del", "display: inline; text-decoration: line-through"),
+        (
+            "a",
+            "display: inline; text-decoration: underline; color: #0000ee",
+        ),
+        ("small", "display: inline; font-size: 0.8em"),
+        ("big", "display: inline; font-size: 1.2em"),
+        ("code", "display: inline; font-family: monospace"),
+        ("kbd", "display: inline; font-family: monospace"),
+        ("samp", "display: inline; font-family: monospace"),
+        (
+            "pre",
+            "display: block; font-family: monospace; margin: 1em 0",
+        ),
+        ("mark", "display: inline; background-color: #ffff00"),
         ("form", "display: block"),
         (
             "input",
@@ -3121,6 +3214,122 @@ mod tests {
         let styles = compute_styles_for_tree(&arena, &author, (1024.0, 768.0));
 
         assert_eq!(styles_for_tag(&arena, &styles, "span").font_size, 30.0);
+    }
+
+    // ------ Text style flags ------
+
+    /// Compute styles over the UA stylesheet plus the given author CSS.
+    fn styles_with_ua(
+        html: &str,
+        author_css: &str,
+    ) -> (crate::html::DomArena, FxHashMap<u32, ComputedValues>) {
+        let arena = crate::html::parse_html(html);
+        let merged = merge_stylesheets_with_author(
+            &user_agent_stylesheet(),
+            &parser::parse_stylesheet(author_css),
+        );
+        let styles = compute_styles_for_tree(&arena, &merged, (1024.0, 768.0));
+        (arena, styles)
+    }
+
+    #[test]
+    fn font_weight_keywords_and_numbers() {
+        assert!(parse_is_bold("bold"));
+        assert!(parse_is_bold("BOLD"));
+        assert!(parse_is_bold("bolder"));
+        assert!(parse_is_bold("700"));
+        assert!(parse_is_bold("600"));
+        assert!(!parse_is_bold("500"));
+        assert!(!parse_is_bold("normal"));
+        assert!(!parse_is_bold("lighter"));
+    }
+
+    #[test]
+    fn ua_marks_strong_bold_and_em_italic() {
+        let (arena, styles) =
+            styles_with_ua("<html><body><strong>a</strong><em>b</em></body></html>", "");
+
+        assert!(styles_for_tag(&arena, &styles, "strong").text_style.bold);
+        assert!(!styles_for_tag(&arena, &styles, "strong").text_style.italic);
+        assert!(styles_for_tag(&arena, &styles, "em").text_style.italic);
+        assert!(!styles_for_tag(&arena, &styles, "em").text_style.bold);
+    }
+
+    #[test]
+    fn ua_underlines_links_and_strikes_del() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><a href='#'>x</a><del>y</del></body></html>",
+            "",
+        );
+
+        let a = styles_for_tag(&arena, &styles, "a");
+        assert!(a.text_style.underline);
+        assert!(!a.text_style.line_through);
+
+        let del = styles_for_tag(&arena, &styles, "del");
+        assert!(del.text_style.line_through);
+        assert!(!del.text_style.underline);
+    }
+
+    #[test]
+    fn text_decoration_parses_every_line_keyword() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><div>x</div></body></html>",
+            "div { text-decoration: underline overline line-through; }",
+        );
+
+        let div = styles_for_tag(&arena, &styles, "div");
+        assert!(div.text_style.underline);
+        assert!(div.text_style.overline);
+        assert!(div.text_style.line_through);
+        assert!(div.text_style.has_decoration());
+    }
+
+    #[test]
+    fn text_decoration_none_clears_ua_underline() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><a href='#'>x</a></body></html>",
+            "a { text-decoration: none; }",
+        );
+
+        assert!(!styles_for_tag(&arena, &styles, "a").text_style.underline);
+    }
+
+    #[test]
+    fn bold_and_italic_combine_across_nesting() {
+        let (arena, styles) =
+            styles_with_ua("<html><body><strong><em>x</em></strong></body></html>", "");
+
+        let em = styles_for_tag(&arena, &styles, "em");
+        assert!(em.text_style.bold, "inherits bold from <strong>");
+        assert!(em.text_style.italic, "italic from its own UA rule");
+    }
+
+    #[test]
+    fn font_weight_normal_overrides_inherited_bold() {
+        let (arena, styles) = styles_with_ua(
+            "<html><body><strong><span>x</span></strong></body></html>",
+            "span { font-weight: normal; }",
+        );
+
+        assert!(!styles_for_tag(&arena, &styles, "span").text_style.bold);
+    }
+
+    #[test]
+    fn merged_with_keeps_flags_set_by_either_side() {
+        let child = TextStyleFlags {
+            italic: true,
+            ..Default::default()
+        };
+        let ancestor = TextStyleFlags {
+            bold: true,
+            underline: true,
+            ..Default::default()
+        };
+
+        let merged = child.merged_with(ancestor);
+        assert!(merged.bold && merged.italic && merged.underline);
+        assert!(!merged.line_through && !merged.overline);
     }
 
     #[test]

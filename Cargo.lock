@@ -2916,6 +2916,7 @@ dependencies = [
  "bytemuck",
  "cssparser 0.34.0",
  "cssparser-color",
+ "encoding_rs",
  "env_logger",
  "fontdb 0.23.0",
  "futures",

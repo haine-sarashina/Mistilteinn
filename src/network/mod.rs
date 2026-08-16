@@ -26,12 +26,159 @@ const MAX_IMPORT_DEPTH: usize = 10;
 /// Maximum total number of @import requests across all levels.
 const MAX_TOTAL_IMPORTS: usize = 50;
 
+/// How much of the body the meta-charset prescan looks at, per the HTML spec.
+const CHARSET_PRESCAN_BYTES: usize = 1024;
+
 /// Result of a network fetch, including the resolved (post-redirect) URL.
 pub struct FetchResult {
     pub content: String,
     /// The final URL after following all redirects. If no redirect occurred,
     /// this equals the original request URL.
     pub final_url: String,
+    /// The encoding the body was decoded with, for logging and diagnostics.
+    pub encoding: &'static str,
+}
+
+/// Decode a response body the way a browser does.
+///
+/// The order is the HTML spec's: a byte order mark wins outright, then the
+/// `Content-Type` charset, then a `<meta>` declaration found by scanning the
+/// first kilobyte of the body, and finally UTF-8.
+///
+/// The prescan is why this is not simply `Response::text()`: reqwest only
+/// consults the `Content-Type` header, so a Shift_JIS page that declares its
+/// encoding in `<meta>` alone — as most older Japanese sites do — decoded as
+/// mojibake.
+pub fn decode_body(bytes: &[u8], content_type: Option<&str>) -> (String, &'static str) {
+    if let Some((encoding, bom_len)) = encoding_rs::Encoding::for_bom(bytes) {
+        let (text, _) = encoding.decode_without_bom_handling(&bytes[bom_len..]);
+        return (text.into_owned(), encoding.name());
+    }
+
+    let encoding = content_type
+        .and_then(charset_from_content_type)
+        .or_else(|| prescan_meta_charset(bytes))
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+
+    let (text, _, _) = encoding.decode(bytes);
+    (text.into_owned(), encoding.name())
+}
+
+/// Pull the `charset` parameter out of a `Content-Type` header value.
+fn charset_from_content_type(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let idx = lower.find("charset")?;
+    let rest = value[idx + "charset".len()..].trim_start();
+    let rest = rest.strip_prefix('=')?.trim();
+    let end = rest
+        .find(|c: char| c == ';' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let label = rest[..end].trim_matches(|c| c == '"' || c == '\'').trim();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label.to_string())
+    }
+}
+
+/// Scan the start of a document for a `<meta>` charset declaration.
+///
+/// Deliberately a byte scan rather than a parse: the encoding has to be known
+/// *before* the document can be decoded, so there is nothing to parse yet.
+/// Both spellings are recognised — `<meta charset=…>` and the older
+/// `<meta http-equiv="content-type" content="…; charset=…">`.
+fn prescan_meta_charset(bytes: &[u8]) -> Option<String> {
+    let window = &bytes[..bytes.len().min(CHARSET_PRESCAN_BYTES)];
+    // The prescan runs over ASCII markup, so a lossy conversion is safe here:
+    // any non-ASCII byte can only be inside content we are not looking at.
+    let text = String::from_utf8_lossy(window).to_ascii_lowercase();
+
+    let mut search_from = 0usize;
+    while let Some(offset) = text[search_from..].find("<meta") {
+        let tag_start = search_from + offset;
+        let tag_end = text[tag_start..]
+            .find('>')
+            .map(|e| tag_start + e)
+            .unwrap_or(text.len());
+        let attrs = tag_attributes(&text[tag_start..tag_end]);
+        search_from = tag_end.max(tag_start + 5);
+
+        let lookup = |name: &str| {
+            attrs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+
+        // `<meta charset="shift_jis">`
+        if let Some(label) = lookup("charset") {
+            return Some(label.to_string());
+        }
+        // `<meta http-equiv="content-type" content="text/html; charset=euc-jp">`
+        if let Some(label) = lookup("content").and_then(charset_from_content_type) {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// Split a raw tag into its attribute name/value pairs.
+///
+/// Attributes are parsed rather than searched for, because `charset` also
+/// occurs *inside* the value of `content="text/html; charset=euc-jp"` — a
+/// substring search would read the wrong one and stop at the wrong delimiter.
+fn tag_attributes(tag: &str) -> Vec<(String, String)> {
+    let mut attrs = Vec::new();
+    let bytes: Vec<char> = tag.chars().collect();
+    let mut i = 0usize;
+
+    // Skip `<` and the tag name.
+    while i < bytes.len() && !bytes[i].is_whitespace() {
+        i += 1;
+    }
+
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_whitespace() || bytes[i] == '/') {
+            i += 1;
+        }
+        let name_start = i;
+        while i < bytes.len() && !bytes[i].is_whitespace() && bytes[i] != '=' && bytes[i] != '/' {
+            i += 1;
+        }
+        if i == name_start {
+            break;
+        }
+        let name: String = bytes[name_start..i].iter().collect();
+
+        while i < bytes.len() && bytes[i].is_whitespace() {
+            i += 1;
+        }
+        let mut value = String::new();
+        if i < bytes.len() && bytes[i] == '=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == '"' || bytes[i] == '\'') {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    value.push(bytes[i]);
+                    i += 1;
+                }
+                i += 1; // closing quote
+            } else {
+                while i < bytes.len() && !bytes[i].is_whitespace() && bytes[i] != '>' {
+                    value.push(bytes[i]);
+                    i += 1;
+                }
+            }
+        }
+        attrs.push((name, value.trim().to_string()));
+    }
+
+    attrs
 }
 
 /// Fetches the content of a URL with a proper User-Agent and timeout.
@@ -94,7 +241,16 @@ async fn into_fetch_result(response: reqwest::Response) -> Result<FetchResult, N
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_ascii_lowercase());
 
-    let content = response.text().await?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+
+    // Take the raw bytes rather than `Response::text()`: the encoding may only
+    // be declared in a `<meta>` tag, which reqwest does not look at.
+    let bytes = response.bytes().await?;
+    let (content, encoding) = decode_body(&bytes, content_type.as_deref());
 
     if content.trim().is_empty() {
         let detail = empty_response_detail(&final_url, status.as_u16(), waf_challenge.as_deref());
@@ -105,8 +261,15 @@ async fn into_fetch_result(response: reqwest::Response) -> Result<FetchResult, N
     if !status.is_success() {
         log::warn!("{final_url} returned HTTP {status}; rendering the body anyway");
     }
+    if encoding != "UTF-8" {
+        log::info!("{final_url} decoded as {encoding}");
+    }
 
-    Ok(FetchResult { content, final_url })
+    Ok(FetchResult {
+        content,
+        final_url,
+        encoding,
+    })
 }
 
 /// Resolve a potentially relative URL against a base URL.
@@ -329,8 +492,17 @@ async fn fetch_css_file(url: &str) -> Result<String, NetworkError> {
         .build()
         .map_err(NetworkError::Http)?;
 
-    let response = client.get(url).send().await?.text().await?;
-    Ok(response)
+    let response = client.get(url).send().await?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let bytes = response.bytes().await?;
+    // Stylesheets are far more often UTF-8 than documents are, but a BOM or a
+    // declared charset still has to be honoured.
+    let (content, _) = decode_body(&bytes, content_type.as_deref());
+    Ok(content)
 }
 
 /// Recursively resolve @import rules in CSS text.
@@ -583,11 +755,108 @@ mod tests {
         assert!(fetch_result.final_url.starts_with("http://example.com"));
     }
 
+    /// Encode `text` with a named encoding, for round-trip decode tests.
+    fn encode_as(label: &str, text: &str) -> Vec<u8> {
+        let encoding = encoding_rs::Encoding::for_label(label.as_bytes()).unwrap();
+        encoding.encode(text).0.into_owned()
+    }
+
+    #[test]
+    fn meta_charset_decodes_a_shift_jis_page() {
+        // The header says nothing; only the document declares the encoding.
+        let html = "<html><head><meta charset=\"Shift_JIS\"></head><body>日本語</body></html>";
+        let bytes = encode_as("shift_jis", html);
+        assert!(
+            std::str::from_utf8(&bytes).is_err(),
+            "the fixture must really be Shift_JIS, not UTF-8"
+        );
+
+        let (decoded, encoding) = decode_body(&bytes, Some("text/html"));
+        assert_eq!(encoding, "Shift_JIS");
+        assert!(decoded.contains("日本語"), "got: {decoded}");
+    }
+
+    #[test]
+    fn http_equiv_meta_is_understood_too() {
+        let html = "<html><head><meta http-equiv=\"Content-Type\" \
+                    content=\"text/html; charset=EUC-JP\"></head><body>日本語</body></html>";
+        let bytes = encode_as("euc-jp", html);
+
+        let (decoded, encoding) = decode_body(&bytes, None);
+        assert_eq!(encoding, "EUC-JP");
+        assert!(decoded.contains("日本語"), "got: {decoded}");
+    }
+
+    #[test]
+    fn content_type_header_beats_the_document() {
+        // A header charset is authoritative; the meta tag must not override it.
+        let html = "<html><head><meta charset=\"utf-8\"></head><body>日本語</body></html>";
+        let bytes = encode_as("shift_jis", html);
+
+        let (decoded, encoding) = decode_body(&bytes, Some("text/html; charset=Shift_JIS"));
+        assert_eq!(encoding, "Shift_JIS");
+        assert!(decoded.contains("日本語"), "got: {decoded}");
+    }
+
+    #[test]
+    fn a_bom_wins_over_every_declaration() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice("<meta charset=\"shift_jis\">日本語".as_bytes());
+
+        let (decoded, encoding) = decode_body(&bytes, Some("text/html; charset=euc-jp"));
+        assert_eq!(encoding, "UTF-8");
+        assert!(decoded.contains("日本語"), "got: {decoded}");
+        assert!(!decoded.starts_with('\u{feff}'), "the BOM is consumed");
+    }
+
+    #[test]
+    fn plain_utf8_is_unaffected() {
+        let html = "<html><body>日本語 and ASCII</body></html>";
+        let (decoded, encoding) = decode_body(html.as_bytes(), Some("text/html; charset=utf-8"));
+        assert_eq!(encoding, "UTF-8");
+        assert_eq!(decoded, html);
+    }
+
+    #[test]
+    fn a_meta_charset_past_the_prescan_window_is_not_used() {
+        // Browsers only scan the first kilobyte; a declaration after it is too
+        // late to change the decode.
+        let padding = " ".repeat(CHARSET_PRESCAN_BYTES + 64);
+        let html = format!("<html><head>{padding}<meta charset=\"shift_jis\"></head></html>");
+        assert_eq!(decode_body(html.as_bytes(), None).1, "UTF-8");
+    }
+
+    #[test]
+    fn charset_from_content_type_handles_quotes_and_extra_params() {
+        assert_eq!(
+            charset_from_content_type("text/html; charset=\"Shift_JIS\"; boundary=x").as_deref(),
+            Some("Shift_JIS")
+        );
+        assert_eq!(
+            charset_from_content_type("text/html; Charset = euc-jp").as_deref(),
+            Some("euc-jp")
+        );
+        assert_eq!(charset_from_content_type("text/html").as_deref(), None);
+    }
+
+    #[test]
+    fn prescan_ignores_attributes_that_merely_end_in_charset() {
+        let html = "<html><head><meta data-charset=\"shift_jis\"></head></html>";
+        assert_eq!(prescan_meta_charset(html.as_bytes()), None);
+    }
+
+    #[test]
+    fn an_unknown_charset_label_falls_back_to_utf8() {
+        let html = "<html><head><meta charset=\"not-a-real-encoding\"></head><body>x</body></html>";
+        assert_eq!(decode_body(html.as_bytes(), None).1, "UTF-8");
+    }
+
     #[test]
     fn test_fetch_result_fields() {
         let fr = FetchResult {
             content: "hello".to_string(),
             final_url: "https://example.com".to_string(),
+            encoding: "UTF-8",
         };
         assert_eq!(fr.content, "hello");
         assert_eq!(fr.final_url, "https://example.com");

@@ -3140,41 +3140,154 @@ fn is_cjk_char(c: char) -> bool {
     )
 }
 
+/// Characters that may not begin a line (行頭禁則).
+///
+/// Closing brackets, the sentence punctuation, the small kana and the
+/// prolonged sound mark all belong to the text before them; a line that starts
+/// with one reads as broken. Latin closers are included because Japanese text
+/// mixes them freely.
+fn forbidden_at_line_start(c: char) -> bool {
+    matches!(
+        c,
+        // Japanese punctuation and closers
+        '、' | '。' | '，' | '．' | '・' | '：' | '；' | '？' | '！'
+        | '）' | '］' | '｝' | '〕' | '〉' | '》' | '」' | '』' | '】' | '〙' | '〗' | '〟'
+        | '’' | '”' | '｠' | '»'
+        // Iteration marks and the prolonged sound mark
+        | 'ー' | '〜' | '～' | 'ゝ' | 'ゞ' | 'ヽ' | 'ヾ' | '々' | '〆' | 'ゕ' | 'ゖ'
+        // Small kana
+        | 'ぁ' | 'ぃ' | 'ぅ' | 'ぇ' | 'ぉ' | 'っ' | 'ゃ' | 'ゅ' | 'ょ' | 'ゎ'
+        | 'ァ' | 'ィ' | 'ゥ' | 'ェ' | 'ォ' | 'ッ' | 'ャ' | 'ュ' | 'ョ' | 'ヮ' | 'ヵ' | 'ヶ'
+        // Ellipsis and dashes
+        | '…' | '‥' | '―' | '–' | '‐'
+        // Latin closers and trailing punctuation
+        | ')' | ']' | '}' | ',' | '.' | ':' | ';' | '?' | '!' | '%' | '°' | '′' | '″' | '℃'
+    )
+}
+
+/// Characters that may not end a line (行末禁則).
+///
+/// Opening brackets and currency signs bind to what follows them.
+fn forbidden_at_line_end(c: char) -> bool {
+    matches!(
+        c,
+        '（' | '［'
+            | '｛'
+            | '〔'
+            | '〈'
+            | '《'
+            | '「'
+            | '『'
+            | '【'
+            | '〘'
+            | '〖'
+            | '〝'
+            | '‘'
+            | '“'
+            | '｟'
+            | '«'
+            | '('
+            | '['
+            | '{'
+            | '$'
+            | '£'
+            | '¥'
+            | '＄'
+            | '￥'
+    )
+}
+
+/// How many characters a run of unbreakable text may grow to before the line
+/// breaker is allowed to split it anyway.
+///
+/// Kinsoku forbids a break, but a long enough run of forbidden characters
+/// would otherwise produce a token no line can hold. Browsers give up in the
+/// same way rather than overflow indefinitely.
+const MAX_UNBREAKABLE_CHARS: usize = 24;
+
 enum LineBreakToken<'a> {
     Text(&'a str),
     Space,
 }
 
-fn tokenize_text_for_line_breaking<'a>(text: &'a str) -> Vec<LineBreakToken<'a>> {
-    let mut tokens = Vec::new();
+/// Split text into the units line breaking may separate.
+///
+/// Latin words break at whitespace. CJK has no word spaces, so a break is
+/// allowed between any two CJK characters — except where the Japanese line
+/// breaking rules (禁則処理) forbid it, which is what the merging pass below
+/// enforces: a character that may not start a line is glued to the text before
+/// it, and one that may not end a line to the text after it.
+fn tokenize_text_for_line_breaking(text: &str) -> Vec<LineBreakToken<'_>> {
+    /// A token as a byte range, or the whitespace between two of them.
+    enum Raw {
+        Range(usize, usize),
+        Space,
+    }
+
+    let mut raw: Vec<Raw> = Vec::new();
     let mut word_start = None;
     let mut char_indices = text.char_indices().peekable();
 
     while let Some((idx, c)) = char_indices.next() {
         if c.is_whitespace() {
             if let Some(start) = word_start.take() {
-                tokens.push(LineBreakToken::Text(&text[start..idx]));
+                raw.push(Raw::Range(start, idx));
             }
-            tokens.push(LineBreakToken::Space);
+            raw.push(Raw::Space);
         } else if is_cjk_char(c) {
             if let Some(start) = word_start.take() {
-                tokens.push(LineBreakToken::Text(&text[start..idx]));
+                raw.push(Raw::Range(start, idx));
             }
             let next_idx = char_indices
                 .peek()
                 .map(|(n_idx, _)| *n_idx)
                 .unwrap_or(text.len());
-            tokens.push(LineBreakToken::Text(&text[idx..next_idx]));
-        } else {
-            if word_start.is_none() {
-                word_start = Some(idx);
-            }
+            raw.push(Raw::Range(idx, next_idx));
+        } else if word_start.is_none() {
+            word_start = Some(idx);
         }
     }
     if let Some(start) = word_start {
-        tokens.push(LineBreakToken::Text(&text[start..]));
+        raw.push(Raw::Range(start, text.len()));
     }
-    tokens
+
+    // Merge adjacent tokens the rules forbid breaking between. Whitespace is
+    // never merged across: an authored space is a break opportunity the author
+    // asked for.
+    let mut merged: Vec<Raw> = Vec::new();
+    for token in raw {
+        let Raw::Range(start, end) = token else {
+            merged.push(Raw::Space);
+            continue;
+        };
+
+        let attaches = match merged.last() {
+            Some(Raw::Range(prev_start, prev_end)) if *prev_end == start => {
+                let first = text[start..end].chars().next();
+                let prev_last = text[*prev_start..*prev_end].chars().next_back();
+                let forbidden = first.is_some_and(forbidden_at_line_start)
+                    || prev_last.is_some_and(forbidden_at_line_end);
+                forbidden && text[*prev_start..*prev_end].chars().count() < MAX_UNBREAKABLE_CHARS
+            }
+            _ => false,
+        };
+
+        if attaches {
+            if let Some(Raw::Range(_, prev_end)) = merged.last_mut() {
+                *prev_end = end;
+            }
+        } else {
+            merged.push(Raw::Range(start, end));
+        }
+    }
+
+    merged
+        .into_iter()
+        .map(|token| match token {
+            Raw::Range(start, end) => LineBreakToken::Text(&text[start..end]),
+            Raw::Space => LineBreakToken::Space,
+        })
+        .collect()
 }
 
 /// Text is measured using the `TextRenderer`, and lines wrap at word / CJK character boundaries.
@@ -5498,6 +5611,74 @@ mod tests {
         root.add_child(text_block("kept", 60.0));
 
         assert_eq!(paint_order(&root), vec!["kept"]);
+    }
+
+    /// The text of each line-break token, for readable assertions.
+    fn tokens(text: &str) -> Vec<&str> {
+        tokenize_text_for_line_breaking(text)
+            .into_iter()
+            .map(|t| match t {
+                LineBreakToken::Text(s) => s,
+                LineBreakToken::Space => " ",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cjk_still_breaks_between_ordinary_characters() {
+        assert_eq!(tokens("東西屋"), vec!["東", "西", "屋"]);
+    }
+
+    #[test]
+    fn closing_punctuation_never_starts_a_line() {
+        // 行頭禁則: `、` and `。` belong to the character before them.
+        assert_eq!(
+            tokens("広目屋、東西屋。"),
+            vec!["広", "目", "屋、", "東", "西", "屋。"]
+        );
+    }
+
+    #[test]
+    fn opening_brackets_never_end_a_line() {
+        // 行末禁則: `（` binds to what follows, across the CJK/Latin boundary.
+        assert_eq!(tokens("虐殺（1819年）"), vec!["虐", "殺", "（1819", "年）"]);
+    }
+
+    #[test]
+    fn small_kana_and_the_prolonged_sound_mark_stay_attached() {
+        assert_eq!(tokens("ピータールー"), vec!["ピー", "ター", "ルー"]);
+        // Only `ょ` is a small kana; `う` is an ordinary one and breaks freely.
+        assert_eq!(tokens("きょう"), vec!["きょ", "う"]);
+    }
+
+    #[test]
+    fn nested_closers_chain_onto_the_same_token() {
+        assert_eq!(tokens("「あ」。"), vec!["「あ」。"]);
+    }
+
+    #[test]
+    fn an_authored_space_stays_a_break_opportunity() {
+        // Merging across whitespace would discard a break the author asked for.
+        assert_eq!(tokens("屋 、東"), vec!["屋", " ", "、", "東"]);
+    }
+
+    #[test]
+    fn a_runaway_unbreakable_run_is_eventually_split() {
+        // Every `ー` forbids a break before it, so without a cap the whole run
+        // would become one token no line could hold.
+        let text = "ア".to_string() + &"ー".repeat(60);
+        let toks = tokens(&text);
+        assert!(toks.len() > 1, "the run must be split somewhere");
+        assert!(
+            toks.iter()
+                .all(|t| t.chars().count() <= MAX_UNBREAKABLE_CHARS + 1),
+            "no token may exceed the cap: {toks:?}"
+        );
+    }
+
+    #[test]
+    fn latin_words_are_unaffected() {
+        assert_eq!(tokens("hello world"), vec!["hello", " ", "world"]);
     }
 
     #[test]

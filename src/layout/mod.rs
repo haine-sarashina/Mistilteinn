@@ -227,8 +227,10 @@ pub struct LayoutNode {
     pub float: FloatType,
     /// CSS clear property (left, right, both, none)
     pub clear: ClearType,
-    /// Border color
-    pub border_color: Option<[u8; 4]>,
+    /// Resolved border colour per side: [top, right, bottom, left].
+    pub border_color: [[u8; 4]; 4],
+    /// Border style per side: [top, right, bottom, left].
+    pub border_style: [crate::css::BorderStyle; 4],
     /// Border radius in pixels
     pub border_radius: f32,
     /// Typography properties
@@ -287,7 +289,8 @@ impl LayoutNode {
             align_self: None,
             float: FloatType::None,
             clear: ClearType::None,
-            border_color: None,
+            border_color: [[0, 0, 0, 255]; 4],
+            border_style: [crate::css::BorderStyle::None; 4],
             border_radius: 0.0,
             text_style: crate::css::TextStyleFlags::default(),
             text_align: crate::css::TextAlign::Left,
@@ -502,8 +505,9 @@ where
     ];
     root_layout.float = root_styles.float;
     root_layout.clear = root_styles.clear;
-    root_layout.border = root_styles.border_width;
-    root_layout.border_color = root_styles.border_color;
+    root_layout.border = root_styles.used_border_width();
+    root_layout.border_color = resolved_border_colors(&root_styles);
+    root_layout.border_style = root_styles.border_style;
     root_layout.border_radius = root_styles.border_radius;
     root_layout.text_style = root_styles.text_style;
     root_layout.visibility = root_styles.visibility;
@@ -659,8 +663,9 @@ fn build_layout_children<N, F>(
                     ];
                     layout_node.float = child_styles.float;
                     layout_node.clear = child_styles.clear;
-                    layout_node.border = child_styles.border_width;
-                    layout_node.border_color = child_styles.border_color;
+                    layout_node.border = child_styles.used_border_width();
+                    layout_node.border_color = resolved_border_colors(&child_styles);
+                    layout_node.border_style = child_styles.border_style;
                     layout_node.border_radius = child_styles.border_radius;
                     layout_node.text_style = child_styles.text_style;
                     layout_node.visibility = child_styles.visibility;
@@ -880,8 +885,9 @@ fn build_layout_children<N, F>(
                     ];
                     layout_node.float = child_styles.float;
                     layout_node.clear = child_styles.clear;
-                    layout_node.border = child_styles.border_width;
-                    layout_node.border_color = child_styles.border_color;
+                    layout_node.border = child_styles.used_border_width();
+                    layout_node.border_color = resolved_border_colors(&child_styles);
+                    layout_node.border_style = child_styles.border_style;
                     layout_node.border_radius = child_styles.border_radius;
                     layout_node.text_style = child_styles.text_style;
                     layout_node.visibility = child_styles.visibility;
@@ -3519,6 +3525,17 @@ fn add_clipped_rect(
     out.push((current, color));
 }
 
+/// Resolve every side's `currentColor` border colour against the element's own
+/// `color`, so the painter never has to consult the cascade again.
+fn resolved_border_colors(styles: &crate::css::ComputedValues) -> [[u8; 4]; 4] {
+    [
+        styles.resolved_border_color(0),
+        styles.resolved_border_color(1),
+        styles.resolved_border_color(2),
+        styles.resolved_border_color(3),
+    ]
+}
+
 /// Information about background, borders, and visual decorations of a layout node.
 #[derive(Clone, Debug)]
 pub struct VisualDecoration {
@@ -3528,7 +3545,10 @@ pub struct VisualDecoration {
     pub height: f32,
     pub background_color: Option<[u8; 4]>,
     pub border_width: [f32; 4],
-    pub border_color: Option<[u8; 4]>,
+    /// Per-side border colour: [top, right, bottom, left].
+    pub border_color: [[u8; 4]; 4],
+    /// Per-side border style: [top, right, bottom, left].
+    pub border_style: [crate::css::BorderStyle; 4],
     pub border_radius: f32,
 }
 
@@ -3541,7 +3561,8 @@ pub fn collect_decorations(node: &LayoutNode) -> Vec<VisualDecoration> {
 
 fn collect_decorations_internal(node: &LayoutNode, out: &mut Vec<VisualDecoration>) {
     let has_bg = node.background_color.is_some();
-    let has_border = node.border_color.is_some() && node.border.iter().any(|&w| w > 0.0);
+    // `node.border` is already the *used* width, so a side with no style is 0.
+    let has_border = (0..4).any(|i| node.border[i] > 0.0 && node.border_style[i].is_visible());
     if (has_bg || has_border)
         && node.visibility.is_painted()
         && node.rect.width >= 2.0
@@ -3555,6 +3576,7 @@ fn collect_decorations_internal(node: &LayoutNode, out: &mut Vec<VisualDecoratio
             background_color: node.background_color,
             border_width: node.border,
             border_color: node.border_color,
+            border_style: node.border_style,
             border_radius: node.border_radius,
         });
     }

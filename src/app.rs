@@ -709,19 +709,18 @@ impl MistilteinnApp {
                 }
             }
 
-            if let Some(b_color) = deco.border_color {
-                crate::render::draw_rect_borders(
-                    &mut composite_buffer,
-                    win_w,
-                    win_h,
-                    dx,
-                    dy,
-                    deco.width,
-                    deco.height,
-                    deco.border_width,
-                    b_color,
-                );
-            }
+            crate::render::draw_rect_borders(
+                &mut composite_buffer,
+                win_w,
+                win_h,
+                dx,
+                dy,
+                deco.width,
+                deco.height,
+                deco.border_width,
+                deco.border_color,
+                deco.border_style,
+            );
         }
 
         let mut text_renderer = TextRenderer::new();
@@ -820,7 +819,8 @@ impl MistilteinnApp {
                     rect.width + 2.0,
                     rect.height + 2.0,
                     [2.0, 2.0, 2.0, 2.0],
-                    [66, 133, 244, 255],
+                    [[66, 133, 244, 255]; 4],
+                    [crate::css::BorderStyle::Solid; 4],
                 );
             }
         }

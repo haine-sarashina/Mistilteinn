@@ -864,6 +864,60 @@ pub enum ClearType {
     Both,
 }
 
+// ------ Borders ------
+
+/// The computed `border-style` of one side.
+///
+/// The initial value is `None`, and CSS gives a side with no style a *used*
+/// border width of zero — so `border-width: 2px` on its own paints nothing,
+/// exactly as in a real browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BorderStyle {
+    #[default]
+    None,
+    /// Same as `None` for painting; differs only in border-conflict resolution
+    /// for collapsed tables.
+    Hidden,
+    Solid,
+    Dashed,
+    Dotted,
+    /// Two solid lines with a gap between them.
+    Double,
+    /// The 3D styles. We have no lighting model, so these paint solid — which
+    /// is what they degrade to at the 1–2px widths pages actually use.
+    Groove,
+    Ridge,
+    Inset,
+    Outset,
+}
+
+impl BorderStyle {
+    /// Parse a `border-style` keyword; `None` for anything unrecognised.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "none" => Self::None,
+            "hidden" => Self::Hidden,
+            "solid" => Self::Solid,
+            "dashed" => Self::Dashed,
+            "dotted" => Self::Dotted,
+            "double" => Self::Double,
+            "groove" => Self::Groove,
+            "ridge" => Self::Ridge,
+            "inset" => Self::Inset,
+            "outset" => Self::Outset,
+            _ => return None,
+        })
+    }
+
+    /// Whether this style paints anything at all.
+    pub fn is_visible(self) -> bool {
+        !matches!(self, Self::None | Self::Hidden)
+    }
+}
+
+/// The `medium` border width, used when a side declares a style but no width.
+const MEDIUM_BORDER_WIDTH: f32 = 3.0;
+
 // ------ Computed Values ------
 
 /// Fully resolved CSS property values for a single element.
@@ -929,8 +983,13 @@ pub struct ComputedValues {
     pub float: FloatType,
     pub clear: ClearType,
     // Border & Radius
+    /// Specified border width per side, before `border-style` is applied.
+    /// Use [`ComputedValues::used_border_width`] for the value layout should see.
     pub border_width: [f32; 4],
-    pub border_color: Option<[u8; 4]>,
+    /// Per-side border colour; `None` means `currentColor`.
+    pub border_color: [Option<[u8; 4]>; 4],
+    /// Per-side `border-style`: [top, right, bottom, left].
+    pub border_style: [BorderStyle; 4],
     pub border_radius: f32,
     // Typography
     pub text_style: TextStyleFlags,
@@ -1132,7 +1191,8 @@ impl Default for ComputedValues {
             float: FloatType::None,
             clear: ClearType::None,
             border_width: [0.0; 4],
-            border_color: None,
+            border_color: [None; 4],
+            border_style: [BorderStyle::None; 4],
             border_radius: 0.0,
             text_style: TextStyleFlags::default(),
             text_align: TextAlign::Left,
@@ -1235,6 +1295,32 @@ fn find_top_level_comma(s: &str) -> Option<usize> {
 }
 
 impl ComputedValues {
+    /// The border widths layout should use.
+    ///
+    /// A side whose `border-style` is `none` or `hidden` contributes nothing to
+    /// the box, however wide `border-width` says it is — so `border-width: 2px`
+    /// without a style occupies no space and paints nothing, matching browsers.
+    pub fn used_border_width(&self) -> [f32; 4] {
+        let mut used = [0.0; 4];
+        for i in 0..4 {
+            if self.border_style[i].is_visible() {
+                used[i] = self.border_width[i];
+            }
+        }
+        used
+    }
+
+    /// The border colour of one side, resolving the `currentColor` initial
+    /// value against the element's own `color`.
+    pub fn resolved_border_color(&self, side: usize) -> [u8; 4] {
+        self.border_color[side].unwrap_or(self.color.unwrap_or([0, 0, 0, 255]))
+    }
+
+    /// Whether any side paints a border.
+    pub fn has_visible_border(&self) -> bool {
+        (0..4).any(|i| self.border_style[i].is_visible() && self.border_width[i] > 0.0)
+    }
+
     /// Parse a single [`Declaration`] and apply it to a clone of `self`.
     ///
     /// Returns a new `ComputedValues` with the declaration applied on top
@@ -1584,59 +1670,70 @@ impl ComputedValues {
             "align-self" => {
                 self.align_self = parse_align_self(val);
             }
-            "border" => {
-                let (w, c) = parse_border_shorthand(val);
-                if let Some(width) = w {
-                    self.border_width = [width; 4];
-                }
-                if let Some(color) = c {
-                    self.border_color = Some(color);
-                }
-            }
-            "border-top" => {
-                let (w, c) = parse_border_shorthand(val);
-                if let Some(width) = w {
-                    self.border_width[0] = width;
-                }
-                if let Some(color) = c {
-                    self.border_color = Some(color);
-                }
-            }
-            "border-right" => {
-                let (w, c) = parse_border_shorthand(val);
-                if let Some(width) = w {
-                    self.border_width[1] = width;
-                }
-                if let Some(color) = c {
-                    self.border_color = Some(color);
+            "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
+                let sides: &[usize] = match prop.as_str() {
+                    "border-top" => &[0],
+                    "border-right" => &[1],
+                    "border-bottom" => &[2],
+                    "border-left" => &[3],
+                    _ => &[0, 1, 2, 3],
+                };
+                let parsed = parse_border_shorthand(val, ctx);
+                for &i in sides {
+                    // A shorthand resets the sides it names, so an omitted
+                    // component goes back to its initial value rather than
+                    // keeping whatever an earlier declaration left there.
+                    self.border_style[i] = parsed.style.unwrap_or_default();
+                    self.border_color[i] = parsed.color;
+                    self.border_width[i] =
+                        parsed
+                            .width
+                            .unwrap_or(if self.border_style[i].is_visible() {
+                                MEDIUM_BORDER_WIDTH
+                            } else {
+                                0.0
+                            });
                 }
             }
-            "border-bottom" => {
-                let (w, c) = parse_border_shorthand(val);
-                if let Some(width) = w {
-                    self.border_width[2] = width;
-                }
-                if let Some(color) = c {
-                    self.border_color = Some(color);
+            "border-top-width"
+            | "border-right-width"
+            | "border-bottom-width"
+            | "border-left-width" => {
+                if let Some(w) = parse_length_ctx(val, ctx) {
+                    self.border_width[border_side_index(&prop)] = w;
                 }
             }
-            "border-left" => {
-                let (w, c) = parse_border_shorthand(val);
-                if let Some(width) = w {
-                    self.border_width[3] = width;
+            "border-top-color"
+            | "border-right-color"
+            | "border-bottom-color"
+            | "border-left-color" => {
+                if let Some(c) = parse_color_value(val) {
+                    let (r, g, b, a) = c.to_rgba();
+                    self.border_color[border_side_index(&prop)] = Some([r, g, b, a]);
                 }
-                if let Some(color) = c {
-                    self.border_color = Some(color);
+            }
+            "border-top-style"
+            | "border-right-style"
+            | "border-bottom-style"
+            | "border-left-style" => {
+                if let Some(s) = BorderStyle::parse(val) {
+                    self.border_style[border_side_index(&prop)] = s;
                 }
             }
             "border-width" => {
                 self.border_width = parse_box_four(val, self.border_width);
             }
             "border-color" => {
-                if let Some(c) = parse_color_value(val) {
-                    let (r, g, b, a) = c.to_rgba();
-                    self.border_color = Some([r, g, b, a]);
-                }
+                self.border_color = parse_box_four_generic(val, self.border_color, |p| {
+                    parse_color_value(p).map(|c| {
+                        let (r, g, b, a) = c.to_rgba();
+                        Some([r, g, b, a])
+                    })
+                });
+            }
+            "border-style" => {
+                self.border_style =
+                    parse_box_four_generic(val, self.border_style, BorderStyle::parse);
             }
             "border-radius" => {
                 if let Some(r) = parse_length(val) {
@@ -1710,24 +1807,57 @@ impl ComputedValues {
 }
 
 /// Helper to parse CSS border shorthand like "1px solid #ccc"
-fn parse_border_shorthand(val: &str) -> (Option<f32>, Option<[u8; 4]>) {
-    let mut width = None;
-    let mut color = None;
-    for part in val.split_whitespace() {
-        if width.is_none() {
-            if let Some(w) = parse_length(part) {
-                width = Some(w);
+/// The three components a `border` shorthand can carry, each absent when the
+/// author omitted it.
+struct BorderShorthand {
+    width: Option<f32>,
+    style: Option<BorderStyle>,
+    color: Option<[u8; 4]>,
+}
+
+/// Parse a `border` / `border-<side>` shorthand.
+///
+/// The components may appear in any order, so each token is offered to the
+/// style keywords first — `solid` and friends would otherwise be swallowed by
+/// the colour parser as unknown names.
+fn parse_border_shorthand(val: &str, ctx: LengthContext) -> BorderShorthand {
+    let mut out = BorderShorthand {
+        width: None,
+        style: None,
+        color: None,
+    };
+    for part in split_components(val) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if out.style.is_none() {
+            if let Some(s) = BorderStyle::parse(part) {
+                out.style = Some(s);
                 continue;
             }
         }
-        if color.is_none() {
+        if out.width.is_none() {
+            // The `thin`/`medium`/`thick` keywords are widths, not lengths.
+            let keyword = match part.to_ascii_lowercase().as_str() {
+                "thin" => Some(1.0),
+                "medium" => Some(MEDIUM_BORDER_WIDTH),
+                "thick" => Some(5.0),
+                _ => None,
+            };
+            if let Some(w) = keyword.or_else(|| parse_length_ctx(part, ctx)) {
+                out.width = Some(w);
+                continue;
+            }
+        }
+        if out.color.is_none() {
             if let Some(c) = parse_color_value(part) {
                 let (r, g, b, a) = c.to_rgba();
-                color = Some([r, g, b, a]);
+                out.color = Some([r, g, b, a]);
             }
         }
     }
-    (width, color)
+    out
 }
 
 /// Parse a CSS offset value (top/right/bottom/left) allowing negative pixels.
@@ -2232,6 +2362,40 @@ fn parse_box_four(s: &str, fallback: [f32; 4], ctx: LengthContext) -> [f32; 4] {
         3 => [parts[0], parts[1], parts[2], parts[1]],
         4 => [parts[0], parts[1], parts[2], parts[3]],
         _ => fallback,
+    }
+}
+
+/// The same 1/2/3/4-value box expansion as [`parse_box_four`], for any value
+/// type — `border-color` and `border-style` take the identical shorthand form.
+fn parse_box_four_generic<T: Copy>(
+    s: &str,
+    fallback: [T; 4],
+    parse_one: impl Fn(&str) -> Option<T>,
+) -> [T; 4] {
+    let parts: Vec<T> = split_components(s)
+        .into_iter()
+        .filter_map(|p| parse_one(p.trim()))
+        .collect();
+
+    match parts.len() {
+        1 => [parts[0]; 4],
+        2 => [parts[0], parts[1], parts[0], parts[1]],
+        3 => [parts[0], parts[1], parts[2], parts[1]],
+        4 => [parts[0], parts[1], parts[2], parts[3]],
+        _ => fallback,
+    }
+}
+
+/// Map `border-<side>-*` to its index in a `[top, right, bottom, left]` array.
+fn border_side_index(property: &str) -> usize {
+    if property.contains("-right-") {
+        1
+    } else if property.contains("-bottom-") {
+        2
+    } else if property.contains("-left-") {
+        3
+    } else {
+        0
     }
 }
 
@@ -4533,6 +4697,81 @@ mod tests {
             value: value.to_string(),
             important: false,
         })
+    }
+
+    #[test]
+    fn border_shorthand_reads_all_three_components_in_any_order() {
+        let cv = declare("border", "dashed 2px #ff0000");
+        assert_eq!(cv.border_style, [BorderStyle::Dashed; 4]);
+        assert_eq!(cv.border_width, [2.0; 4]);
+        assert_eq!(cv.border_color, [Some([255, 0, 0, 255]); 4]);
+    }
+
+    #[test]
+    fn border_shorthand_without_a_width_uses_medium() {
+        let cv = declare("border", "solid red");
+        assert_eq!(cv.used_border_width(), [MEDIUM_BORDER_WIDTH; 4]);
+        assert_eq!(cv.border_width, [MEDIUM_BORDER_WIDTH; 4]);
+    }
+
+    #[test]
+    fn border_none_clears_an_earlier_border() {
+        let cv = declare("border", "4px solid black").from_declaration(&Declaration {
+            property: "border".to_string(),
+            value: "none".to_string(),
+            important: false,
+        });
+        assert_eq!(cv.used_border_width(), [0.0; 4]);
+        assert!(!cv.has_visible_border());
+    }
+
+    #[test]
+    fn border_width_without_a_style_occupies_no_space() {
+        // CSS: `border-style` is initially `none`, which forces the used width
+        // to zero however wide `border-width` says the side is.
+        let cv = declare("border-width", "5px");
+        assert_eq!(cv.border_width, [5.0; 4]);
+        assert_eq!(cv.used_border_width(), [0.0; 4]);
+        assert!(!cv.has_visible_border());
+    }
+
+    #[test]
+    fn border_style_expands_like_any_box_shorthand() {
+        let cv = declare("border-style", "solid dotted");
+        assert_eq!(
+            cv.border_style,
+            [
+                BorderStyle::Solid,
+                BorderStyle::Dotted,
+                BorderStyle::Solid,
+                BorderStyle::Dotted
+            ]
+        );
+    }
+
+    #[test]
+    fn per_side_borders_keep_their_own_colour_and_style() {
+        let cv = declare("border-top", "1px solid red").from_declaration(&Declaration {
+            property: "border-bottom".to_string(),
+            value: "2px dotted blue".to_string(),
+            important: false,
+        });
+        assert_eq!(cv.border_style[0], BorderStyle::Solid);
+        assert_eq!(cv.border_style[2], BorderStyle::Dotted);
+        assert_eq!(cv.border_color[0], Some([255, 0, 0, 255]));
+        assert_eq!(cv.border_color[2], Some([0, 0, 255, 255]));
+        assert_eq!(cv.used_border_width(), [1.0, 0.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn border_colour_defaults_to_current_color() {
+        let cv = declare("color", "#00ff00").from_declaration(&Declaration {
+            property: "border".to_string(),
+            value: "1px solid".to_string(),
+            important: false,
+        });
+        assert_eq!(cv.border_color[0], None, "currentColor stays unresolved");
+        assert_eq!(cv.resolved_border_color(0), [0, 255, 0, 255]);
     }
 
     #[test]

@@ -8,6 +8,8 @@
 /// 3. For each frame: clear → draw rectangles → draw text → present
 pub mod text;
 
+use crate::css::BorderStyle;
+
 /// Maximum number of rectangles the GPU render pipeline can handle in a single frame.
 pub const MAX_RECTS: usize = 2048;
 
@@ -943,46 +945,125 @@ pub fn draw_rect_borders(
     width: f32,
     height: f32,
     borders: [f32; 4], // [top, right, bottom, left]
-    color: [u8; 4],
+    colors: [[u8; 4]; 4],
+    styles: [BorderStyle; 4],
 ) {
-    if width <= 0.0 || height <= 0.0 || color[3] == 0 {
+    if width <= 0.0 || height <= 0.0 {
         return;
     }
     let [top_w, right_w, bottom_w, left_w] = borders;
 
-    // Top border
-    if top_w > 0.0 {
-        draw_solid_rect(dest, dest_width, dest_height, x, y, width, top_w, color);
-    }
-    // Bottom border
-    if bottom_w > 0.0 {
-        draw_solid_rect(
+    // Each side spans the full edge, so adjacent sides overlap in the corners.
+    // Real browsers mitre the join; painting the full edge is close enough at
+    // the widths pages use, and keeps corners filled rather than notched.
+    let sides = [
+        // (index, x, y, w, h, horizontal?)
+        (0usize, x, y, width, top_w, true),
+        (1usize, x + width - right_w, y, right_w, height, false),
+        (2usize, x, y + height - bottom_w, width, bottom_w, true),
+        (3usize, x, y, left_w, height, false),
+    ];
+
+    for (i, sx, sy, sw, sh, horizontal) in sides {
+        if sw <= 0.0 || sh <= 0.0 || colors[i][3] == 0 || !styles[i].is_visible() {
+            continue;
+        }
+        draw_border_side(
             dest,
             dest_width,
             dest_height,
-            x,
-            y + height - bottom_w,
-            width,
-            bottom_w,
-            color,
+            sx,
+            sy,
+            sw,
+            sh,
+            horizontal,
+            styles[i],
+            colors[i],
+            if horizontal { sh } else { sw },
         );
     }
-    // Left border
-    if left_w > 0.0 {
-        draw_solid_rect(dest, dest_width, dest_height, x, y, left_w, height, color);
-    }
-    // Right border
-    if right_w > 0.0 {
-        draw_solid_rect(
-            dest,
-            dest_width,
-            dest_height,
-            x + width - right_w,
-            y,
-            right_w,
-            height,
-            color,
-        );
+}
+
+/// Paint one border edge in its declared style.
+///
+/// `thickness` is the edge's own width — the dash and dot geometry is derived
+/// from it, as CSS specifies, so a thick border gets proportionally long
+/// dashes rather than a fine stipple.
+#[allow(clippy::too_many_arguments)]
+fn draw_border_side(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    horizontal: bool,
+    style: BorderStyle,
+    color: [u8; 4],
+    thickness: f32,
+) {
+    match style {
+        BorderStyle::None | BorderStyle::Hidden => {}
+        BorderStyle::Dashed | BorderStyle::Dotted => {
+            // Dashes are 3× the border thickness with a gap of the same size;
+            // dots are square segments of one thickness.
+            let (seg, gap) = if style == BorderStyle::Dotted {
+                (thickness, thickness)
+            } else {
+                (thickness * 3.0, thickness * 2.0)
+            };
+            let span = if horizontal { w } else { h };
+            let step = seg + gap;
+            if step <= 0.0 {
+                return;
+            }
+            let mut offset = 0.0;
+            while offset < span {
+                let len = seg.min(span - offset);
+                if horizontal {
+                    draw_solid_rect(dest, dest_width, dest_height, x + offset, y, len, h, color);
+                } else {
+                    draw_solid_rect(dest, dest_width, dest_height, x, y + offset, w, len, color);
+                }
+                offset += step;
+            }
+        }
+        BorderStyle::Double => {
+            // Three equal bands: line, gap, line. Below 3px there is no room to
+            // split, so it degrades to solid — as browsers do.
+            let band = (thickness / 3.0).floor();
+            if band < 1.0 {
+                draw_solid_rect(dest, dest_width, dest_height, x, y, w, h, color);
+                return;
+            }
+            if horizontal {
+                draw_solid_rect(dest, dest_width, dest_height, x, y, w, band, color);
+                draw_solid_rect(
+                    dest,
+                    dest_width,
+                    dest_height,
+                    x,
+                    y + h - band,
+                    w,
+                    band,
+                    color,
+                );
+            } else {
+                draw_solid_rect(dest, dest_width, dest_height, x, y, band, h, color);
+                draw_solid_rect(
+                    dest,
+                    dest_width,
+                    dest_height,
+                    x + w - band,
+                    y,
+                    band,
+                    h,
+                    color,
+                );
+            }
+        }
+        _ => draw_solid_rect(dest, dest_width, dest_height, x, y, w, h, color),
     }
 }
 
@@ -1202,7 +1283,8 @@ mod tests {
             6.0,
             6.0,
             [1.0, 1.0, 1.0, 1.0],
-            color,
+            [color; 4],
+            [BorderStyle::Solid; 4],
         );
 
         // Top border at (2,2)
@@ -1212,6 +1294,131 @@ mod tests {
         // Center at (4,4) should be untouched
         let center_idx = (4 * 10 + 4) * 4;
         assert_eq!(&dest[center_idx..center_idx + 4], &[0, 0, 0, 0]);
+    }
+
+    /// Whether the top-edge pixel at `x` was painted.
+    fn top_edge_painted(dest: &[u8], stride: usize, x: usize) -> bool {
+        dest[x * 4 + 3] != 0
+    }
+
+    #[test]
+    fn dotted_border_leaves_gaps_along_the_edge() {
+        let mut dest = vec![0u8; 20 * 20 * 4];
+        draw_rect_borders(
+            &mut dest,
+            20,
+            20,
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            [1.0, 0.0, 0.0, 0.0],
+            [[0, 0, 0, 255]; 4],
+            [BorderStyle::Dotted; 4],
+        );
+
+        // 1px thickness → 1px on, 1px off.
+        assert!(top_edge_painted(&dest, 20, 0), "first dot is painted");
+        assert!(!top_edge_painted(&dest, 20, 1), "gap follows the dot");
+        assert!(top_edge_painted(&dest, 20, 2), "second dot is painted");
+    }
+
+    #[test]
+    fn dashed_border_draws_longer_runs_than_dotted() {
+        let mut dest = vec![0u8; 40 * 20 * 4];
+        draw_rect_borders(
+            &mut dest,
+            40,
+            20,
+            0.0,
+            0.0,
+            40.0,
+            20.0,
+            [2.0, 0.0, 0.0, 0.0],
+            [[0, 0, 0, 255]; 4],
+            [BorderStyle::Dashed; 4],
+        );
+
+        // 2px thickness → 6px dash, 4px gap.
+        for x in 0..6 {
+            assert!(top_edge_painted(&dest, 40, x), "dash pixel {x}");
+        }
+        for x in 6..10 {
+            assert!(!top_edge_painted(&dest, 40, x), "gap pixel {x}");
+        }
+        assert!(top_edge_painted(&dest, 40, 10), "next dash starts");
+    }
+
+    #[test]
+    fn double_border_splits_into_two_bands() {
+        let mut dest = vec![0u8; 20 * 20 * 4];
+        draw_rect_borders(
+            &mut dest,
+            20,
+            20,
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            [6.0, 0.0, 0.0, 0.0],
+            [[0, 0, 0, 255]; 4],
+            [BorderStyle::Double; 4],
+        );
+
+        let row_painted = |y: usize| dest[(y * 20) * 4 + 3] != 0;
+        assert!(row_painted(0), "outer band");
+        assert!(row_painted(1), "outer band is 2px for a 6px border");
+        assert!(!row_painted(2), "gap between the bands");
+        assert!(!row_painted(3), "gap between the bands");
+        assert!(row_painted(4), "inner band");
+        assert!(row_painted(5), "inner band");
+    }
+
+    #[test]
+    fn border_style_none_paints_nothing() {
+        let mut dest = vec![0u8; 10 * 10 * 4];
+        draw_rect_borders(
+            &mut dest,
+            10,
+            10,
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            [2.0; 4],
+            [[255, 0, 0, 255]; 4],
+            [BorderStyle::None; 4],
+        );
+        assert!(dest.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn each_side_paints_in_its_own_colour() {
+        let mut dest = vec![0u8; 10 * 10 * 4];
+        draw_rect_borders(
+            &mut dest,
+            10,
+            10,
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            [1.0; 4],
+            [
+                [255, 0, 0, 255],
+                [0, 255, 0, 255],
+                [0, 0, 255, 255],
+                [255, 255, 0, 255],
+            ],
+            [BorderStyle::Solid; 4],
+        );
+
+        // Sample the middle of each edge to stay clear of the corner overlaps.
+        let px = |x: usize, y: usize| dest[(y * 10 + x) * 4..(y * 10 + x) * 4 + 4].to_vec();
+        assert_eq!(px(5, 0), vec![255, 0, 0, 255], "top");
+        assert_eq!(px(9, 5), vec![0, 255, 0, 255], "right");
+        assert_eq!(px(5, 9), vec![0, 0, 255, 255], "bottom");
+        assert_eq!(px(0, 5), vec![255, 255, 0, 255], "left");
     }
 
     #[test]

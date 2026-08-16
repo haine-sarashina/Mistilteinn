@@ -3670,7 +3670,7 @@ fn paint_stacking_context(root: &LayoutNode, out: &mut Vec<PaintItem>) {
         .extend(collect_own_image(root).map(PaintItem::Image));
 
     for child in child_boxes(root) {
-        collect_into_layers(child, &mut layers);
+        collect_into_layers(child, text_flattened_into_parent(root, child), &mut layers);
     }
 
     // Lowest z-index first, document order breaking ties — `sort_by_key` is
@@ -3694,7 +3694,16 @@ fn paint_stacking_context(root: &LayoutNode, out: &mut Vec<PaintItem>) {
 
 /// Sort a non-root box of the current stacking context into its layer, and
 /// recurse into the parts of its subtree that belong to the same context.
-fn collect_into_layers<'a>(node: &'a LayoutNode, layers: &mut StackingLayers<'a>) {
+///
+/// `text_already_painted` marks a box whose text an ancestor's line boxes have
+/// already emitted. The walk still descends — an inline `<span>` background and
+/// an inline `<img>` inside it have to paint — but its text must not be emitted
+/// twice.
+fn collect_into_layers<'a>(
+    node: &'a LayoutNode,
+    text_already_painted: bool,
+    layers: &mut StackingLayers<'a>,
+) {
     if matches!(node.display, DisplayType::None) {
         return;
     }
@@ -3735,15 +3744,26 @@ fn collect_into_layers<'a>(node: &'a LayoutNode, layers: &mut StackingLayers<'a>
         layers.block_backgrounds.extend(decoration);
     }
 
-    layers
-        .inline_content
-        .extend(collect_own_text(node).into_iter().map(PaintItem::Text));
+    // A box with its own line boxes owns those runs outright — it is a block
+    // container, so no ancestor's line boxes can have contained them.
+    if !text_already_painted || node.line_boxes.is_some() {
+        layers
+            .inline_content
+            .extend(collect_own_text(node).into_iter().map(PaintItem::Text));
+    }
     layers
         .inline_content
         .extend(collect_own_image(node).map(PaintItem::Image));
 
     for child in child_boxes(node) {
-        collect_into_layers(child, layers);
+        // Suppression is inherited: inline layout flattens a whole inline
+        // subtree, not just its top node.
+        let child_flattened = if node.line_boxes.is_some() {
+            text_flattened_into_parent(node, child)
+        } else {
+            text_already_painted
+        };
+        collect_into_layers(child, child_flattened, layers);
     }
 }
 
@@ -3840,20 +3860,28 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
     texts
 }
 
+/// Whether `parent`'s line boxes have already flattened `child`'s text into
+/// positioned runs.
+///
+/// Inline layout copies the text of an inline subtree into its container's line
+/// boxes. The original nodes stay in the tree, but their text has already been
+/// painted — from the line box, at the position line breaking gave it. Painting
+/// it again from the child stacks a second copy on top, at whatever stale rect
+/// the child was left with.
+fn text_flattened_into_parent(parent: &LayoutNode, child: &LayoutNode) -> bool {
+    parent.line_boxes.is_some()
+        && (matches!(
+            child.display,
+            DisplayType::Inline | DisplayType::InlineBlock
+        ) || child.text.is_some())
+}
+
 /// The children whose text this node's own line boxes have *not* already
 /// accounted for.
-///
-/// A node with line boxes has flattened its inline descendants into runs, so
-/// recursing into those children again would emit every word twice.
 fn text_recursion_children(node: &LayoutNode) -> impl Iterator<Item = &LayoutNode> {
-    let has_line_boxes = node.line_boxes.is_some();
-    node.children.iter().filter(move |child| {
-        !has_line_boxes
-            || (!matches!(
-                child.display,
-                DisplayType::Inline | DisplayType::InlineBlock
-            ) && child.text.is_none())
-    })
+    node.children
+        .iter()
+        .filter(move |child| !text_flattened_into_parent(node, child))
 }
 
 /// The text belonging to this box itself — the runs in its own line boxes, or
@@ -5470,6 +5498,85 @@ mod tests {
         root.add_child(text_block("kept", 60.0));
 
         assert_eq!(paint_order(&root), vec!["kept"]);
+    }
+
+    #[test]
+    fn text_flattened_into_line_boxes_is_not_painted_a_second_time() {
+        // A block container with inline layout has already flattened its inline
+        // children into positioned runs. Walking into those children again and
+        // painting their raw text piles a second, unpositioned copy on top.
+        let mut para = LayoutNode::new(Rect::new(0.0, 0.0, 400.0, 40.0));
+        para.line_boxes = Some(vec![LineBox {
+            y: 0.0,
+            x: 0.0,
+            baseline_y: 12.8,
+            height: 19.2,
+            boxes: vec![InlineBox::Text {
+                text: "flattened".to_string(),
+                width: 60.0,
+                color: None,
+                font_size: 16.0,
+                font_family: crate::css::DEFAULT_FONT_FAMILY.to_string(),
+                dom_node_id: None,
+                interaction_type: InteractionType::None,
+                text_style: crate::css::TextStyleFlags::default(),
+            }],
+        }]);
+
+        // The child the run came from is still in the tree.
+        let mut inline_child = LayoutNode::new(Rect::new(0.0, 0.0, 60.0, 19.2));
+        inline_child.display = DisplayType::Inline;
+        inline_child.text = Some("flattened".to_string());
+        para.add_child(inline_child);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(para);
+
+        assert_eq!(
+            paint_order(&root),
+            vec!["flattened"],
+            "the run must be painted once, from the line box"
+        );
+    }
+
+    #[test]
+    fn an_inline_child_still_paints_its_background_and_image() {
+        // Suppressing the duplicated text must not suppress the rest of the
+        // child — a <span> background and an inline <img> still have to paint.
+        let mut para = LayoutNode::new(Rect::new(0.0, 0.0, 400.0, 40.0));
+        para.line_boxes = Some(vec![LineBox {
+            y: 0.0,
+            x: 0.0,
+            baseline_y: 12.8,
+            height: 19.2,
+            boxes: vec![InlineBox::test_text("highlighted", 16.0)],
+        }]);
+
+        let mut span = LayoutNode::new(Rect::new(0.0, 0.0, 80.0, 19.2));
+        span.display = DisplayType::Inline;
+        span.text = Some("highlighted".to_string());
+        span.background_color = Some([255, 255, 0, 255]);
+
+        let mut img = LayoutNode::new(Rect::new(80.0, 0.0, 16.0, 16.0));
+        img.display = DisplayType::Inline;
+        img.image_src = Some("icon.png".to_string());
+        span.add_child(img);
+        para.add_child(span);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(para);
+
+        let list = build_display_list(&root);
+        assert!(
+            list.iter().any(|i| matches!(i, PaintItem::Decoration(d)
+                if d.background_color == Some([255, 255, 0, 255]))),
+            "the inline background is still painted"
+        );
+        assert!(
+            list.iter()
+                .any(|i| matches!(i, PaintItem::Image(im) if im.src == "icon.png")),
+            "the inline image is still painted"
+        );
     }
 
     #[test]

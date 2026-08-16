@@ -117,6 +117,30 @@ pub struct TextRenderer {
     /// Maps a lowercased `@font-face` family to the family name the font file
     /// actually registered itself under.
     web_font_aliases: rustc_hash::FxHashMap<String, String>,
+    /// System families that cover CJK, appended to the stack for runs that
+    /// need them. See [`TextRenderer::resolve_stack`].
+    cjk_fallback: Vec<String>,
+}
+
+/// Whether a character lives in one of the CJK blocks.
+///
+/// Used to decide when a font stack needs a CJK family appended. The
+/// punctuation blocks matter most: those characters have Unicode script
+/// `Common`, so they carry no fallback identity of their own.
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{2E80}'..='\u{2EFF}'   // CJK Radicals Supplement
+        | '\u{3000}'..='\u{303F}' // CJK Symbols and Punctuation
+        | '\u{3040}'..='\u{309F}' // Hiragana
+        | '\u{30A0}'..='\u{30FF}' // Katakana
+        | '\u{31F0}'..='\u{31FF}' // Katakana Phonetic Extensions
+        | '\u{3200}'..='\u{32FF}' // Enclosed CJK Letters and Months
+        | '\u{3400}'..='\u{4DBF}' // CJK Unified Ideographs Extension A
+        | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+        | '\u{AC00}'..='\u{D7AF}' // Hangul Syllables
+        | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+        | '\u{FF00}'..='\u{FFEF}' // Halfwidth and Fullwidth Forms
+    )
 }
 
 impl TextRenderer {
@@ -129,9 +153,42 @@ impl TextRenderer {
             font_ctx: FontContext::new(),
             layout_ctx: LayoutContext::new(),
             web_font_aliases: rustc_hash::FxHashMap::default(),
+            cjk_fallback: Vec::new(),
         };
+        renderer.cjk_fallback = renderer.discover_cjk_fallback();
         renderer.install_web_fonts();
         renderer
+    }
+
+    /// Ask the system which families cover CJK.
+    ///
+    /// The shaper resolves fallback from a run's Unicode script, so a run of
+    /// kanji finds a Japanese font on its own. CJK *punctuation* is script
+    /// `Common`, which resolves to nothing in particular — the names found here
+    /// are what [`TextRenderer::resolve_stack`] appends to give it somewhere to
+    /// land.
+    fn discover_cjk_fallback(&mut self) -> Vec<String> {
+        use parley::fontique::{FallbackKey, Script};
+
+        let mut names = Vec::new();
+        // Hiragana first: on a system with both Japanese and Chinese fonts it
+        // picks the Japanese one, which has the right punctuation shapes.
+        for script in [Script(*b"Hira"), Script(*b"Hani")] {
+            let ids: Vec<_> = self
+                .font_ctx
+                .collection
+                .fallback_families(FallbackKey::new(script, None))
+                .collect();
+            for id in ids {
+                if let Some(name) = self.font_ctx.collection.family_name(id) {
+                    let name = name.to_string();
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        names
     }
 
     /// Register the page's web fonts into this renderer's font collection.
@@ -156,31 +213,53 @@ impl TextRenderer {
         }
     }
 
-    /// Rewrite any `@font-face` family in a font stack to the name the
-    /// downloaded file registered itself under.
+    /// Prepare a font stack for one run of text.
     ///
-    /// Returns the stack unchanged — without allocating — when the page
-    /// declared no web fonts, which is the common case.
-    fn resolve_stack<'a>(&self, stack: &'a str) -> std::borrow::Cow<'a, str> {
-        if self.web_font_aliases.is_empty() {
+    /// Two rewrites happen here:
+    ///
+    /// * an `@font-face` family becomes the name the downloaded file actually
+    ///   registered itself under, which need not be what the CSS called it;
+    /// * a CJK family is appended when the run contains CJK characters.
+    ///
+    /// The second is not redundant with the shaper's own fallback. The shaper
+    /// picks a fallback from the run's Unicode script and inherits `Common`
+    /// characters from whatever preceded them *in the same call* — but line
+    /// breaking hands us one CJK character at a time, so a run holding only
+    /// `、` or `）` has nothing to inherit from and resolves to a Latin font
+    /// that has no such glyph. Appending keeps Latin families ahead of the CJK
+    /// one, so Latin text is unaffected; only characters the earlier families
+    /// do not cover reach it.
+    fn resolve_stack<'a>(&self, stack: &'a str, text: &str) -> std::borrow::Cow<'a, str> {
+        let needs_cjk = !self.cjk_fallback.is_empty() && text.chars().any(is_cjk);
+        if self.web_font_aliases.is_empty() && !needs_cjk {
             return std::borrow::Cow::Borrowed(stack);
         }
-        let mut changed = false;
-        let resolved: Vec<&str> = stack
+
+        let mut changed = needs_cjk;
+        let mut families: Vec<String> = stack
             .split(',')
             .map(|entry| {
                 let name = entry.trim();
                 match self.web_font_aliases.get(&name.to_ascii_lowercase()) {
                     Some(actual) => {
                         changed = true;
-                        actual.as_str()
+                        actual.clone()
                     }
-                    None => name,
+                    None => name.to_string(),
                 }
             })
             .collect();
+
+        if needs_cjk {
+            for name in &self.cjk_fallback {
+                if !families.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+                    families.push(name.clone());
+                }
+            }
+        }
+
         if changed {
-            std::borrow::Cow::Owned(resolved.join(", "))
+            std::borrow::Cow::Owned(families.join(", "))
         } else {
             std::borrow::Cow::Borrowed(stack)
         }
@@ -232,7 +311,7 @@ impl TextRenderer {
         style: crate::css::TextStyleFlags,
     ) -> (f32, f32) {
         let display_scale = 1.0;
-        let family = self.resolve_stack(family);
+        let family = self.resolve_stack(family, text);
         let mut builder = self
             .layout_ctx
             .ranged_builder(&mut self.font_ctx, text, display_scale);
@@ -287,7 +366,7 @@ impl TextRenderer {
         max_width: f32,
     ) -> Vec<(f32, f32, f32)> {
         let display_scale = 1.0;
-        let family = self.resolve_stack(family);
+        let family = self.resolve_stack(family, text);
         let mut builder = self
             .layout_ctx
             .ranged_builder(&mut self.font_ctx, text, display_scale);
@@ -338,7 +417,7 @@ impl TextRenderer {
         color: [f32; 4],
     ) -> Vec<GlyphInfo> {
         let display_scale = 1.0;
-        let family = self.resolve_stack(family);
+        let family = self.resolve_stack(family, text);
         let mut builder = self
             .layout_ctx
             .ranged_builder(&mut self.font_ctx, text, display_scale);
@@ -443,7 +522,7 @@ impl TextRenderer {
         }
 
         let display_scale = 1.0;
-        let family = self.resolve_stack(family);
+        let family = self.resolve_stack(family, text);
         let mut builder = self
             .layout_ctx
             .ranged_builder(&mut self.font_ctx, text, display_scale);
@@ -641,8 +720,36 @@ mod tests {
         let renderer = TextRenderer::new();
         let stack = "Inter, Helvetica, sans-serif";
         assert!(
-            matches!(renderer.resolve_stack(stack), std::borrow::Cow::Borrowed(s) if s == stack),
+            matches!(renderer.resolve_stack(stack, "latin text"), std::borrow::Cow::Borrowed(s) if s == stack),
             "the common case must not allocate"
+        );
+    }
+
+    #[test]
+    fn cjk_punctuation_gets_a_cjk_family_appended() {
+        // A run holding only `、` has no preceding character for the shaper to
+        // inherit a script from, so without this it resolves to a Latin font
+        // and renders as .notdef — the tofu boxes seen on Japanese pages.
+        let renderer = TextRenderer::new();
+        if renderer.cjk_fallback.is_empty() {
+            return; // no CJK fonts installed; nothing to assert
+        }
+
+        let stack = "Segoe UI, Arial, sans-serif";
+        let resolved = renderer.resolve_stack(stack, "、");
+        assert!(
+            resolved.starts_with(stack),
+            "the authored families stay in front: {resolved}"
+        );
+        assert!(
+            resolved.contains(&renderer.cjk_fallback[0]),
+            "a CJK family is appended: {resolved}"
+        );
+
+        assert_eq!(
+            renderer.resolve_stack(stack, "plain latin"),
+            stack,
+            "Latin-only runs are left alone"
         );
     }
 
@@ -656,11 +763,11 @@ mod tests {
             .insert("myicons".to_string(), "Font Awesome 6 Free".to_string());
 
         assert_eq!(
-            renderer.resolve_stack("MyIcons, sans-serif"),
+            renderer.resolve_stack("MyIcons, sans-serif", "icons"),
             "Font Awesome 6 Free, sans-serif"
         );
         assert_eq!(
-            renderer.resolve_stack("Helvetica, serif"),
+            renderer.resolve_stack("Helvetica, serif", "text"),
             "Helvetica, serif",
             "families that are not web fonts are left alone"
         );

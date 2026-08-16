@@ -65,22 +65,124 @@ pub struct TextRun {
     pub line_height: f32,
 }
 
+/// A font downloaded for an `@font-face` rule.
+#[derive(Clone)]
+struct WebFont {
+    /// The family name the CSS asked for, lowercased for matching.
+    css_family: String,
+    /// The decoded sfnt bytes, shared between the renderers that register them.
+    data: std::sync::Arc<Vec<u8>>,
+}
+
+/// Web fonts declared by the current page.
+///
+/// Process-wide because a `TextRenderer` is built fresh for every measure and
+/// every paint pass — a font registered into one renderer's collection would
+/// otherwise be gone by the time the next one measures with it.
+static WEB_FONTS: std::sync::Mutex<Vec<WebFont>> = std::sync::Mutex::new(Vec::new());
+
+/// Make a downloaded font available to every renderer built from now on.
+///
+/// `css_family` is the name from the `@font-face` rule, which need not match
+/// the family name inside the file; the mapping between them is resolved when
+/// a renderer registers the font.
+pub fn register_web_font(css_family: &str, sfnt: Vec<u8>) {
+    let mut fonts = WEB_FONTS.lock().unwrap();
+    let css_family = css_family.to_ascii_lowercase();
+    if fonts.iter().any(|f| f.css_family == css_family) {
+        return;
+    }
+    fonts.push(WebFont {
+        css_family,
+        data: std::sync::Arc::new(sfnt),
+    });
+}
+
+/// Drop the previous page's web fonts. Called when navigating.
+pub fn clear_web_fonts() {
+    WEB_FONTS.lock().unwrap().clear();
+}
+
+/// How many web fonts are currently registered.
+pub fn web_font_count() -> usize {
+    WEB_FONTS.lock().unwrap().len()
+}
+
 /// Text renderer using Parley for glyph layout and swash for rasterization.
 pub struct TextRenderer {
     /// Font context for loading font faces (system fonts auto-discovered).
     font_ctx: FontContext,
     /// Layout context for caching/scratch space.
     layout_ctx: LayoutContext<()>,
+    /// Maps a lowercased `@font-face` family to the family name the font file
+    /// actually registered itself under.
+    web_font_aliases: rustc_hash::FxHashMap<String, String>,
 }
 
 impl TextRenderer {
     /// Create a new text renderer with system fonts loaded.
     ///
     /// Parley's `FontContext::new()` auto-discovers system fonts via Fontique.
+    /// Any web fonts the page has downloaded are registered on top.
     pub fn new() -> Self {
-        Self {
+        let mut renderer = Self {
             font_ctx: FontContext::new(),
             layout_ctx: LayoutContext::new(),
+            web_font_aliases: rustc_hash::FxHashMap::default(),
+        };
+        renderer.install_web_fonts();
+        renderer
+    }
+
+    /// Register the page's web fonts into this renderer's font collection.
+    fn install_web_fonts(&mut self) {
+        let fonts = WEB_FONTS.lock().unwrap().clone();
+        for font in fonts {
+            let registered = self
+                .font_ctx
+                .collection
+                .register_fonts(font.data.as_ref().clone());
+            // A font file names its own family, which is often — but not
+            // always — what the @font-face rule called it. Record the real name
+            // so the CSS name can be rewritten to it at lookup time.
+            let Some((family_id, _)) = registered.first() else {
+                log::warn!("web font '{}' registered no families", font.css_family);
+                continue;
+            };
+            if let Some(name) = self.font_ctx.collection.family_name(*family_id) {
+                self.web_font_aliases
+                    .insert(font.css_family.clone(), name.to_string());
+            }
+        }
+    }
+
+    /// Rewrite any `@font-face` family in a font stack to the name the
+    /// downloaded file registered itself under.
+    ///
+    /// Returns the stack unchanged — without allocating — when the page
+    /// declared no web fonts, which is the common case.
+    fn resolve_stack<'a>(&self, stack: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.web_font_aliases.is_empty() {
+            return std::borrow::Cow::Borrowed(stack);
+        }
+        let mut changed = false;
+        let resolved: Vec<&str> = stack
+            .split(',')
+            .map(|entry| {
+                let name = entry.trim();
+                match self.web_font_aliases.get(&name.to_ascii_lowercase()) {
+                    Some(actual) => {
+                        changed = true;
+                        actual.as_str()
+                    }
+                    None => name,
+                }
+            })
+            .collect();
+        if changed {
+            std::borrow::Cow::Owned(resolved.join(", "))
+        } else {
+            std::borrow::Cow::Borrowed(stack)
         }
     }
 
@@ -130,13 +232,14 @@ impl TextRenderer {
         style: crate::css::TextStyleFlags,
     ) -> (f32, f32) {
         let display_scale = 1.0;
+        let family = self.resolve_stack(family);
         let mut builder = self
             .layout_ctx
             .ranged_builder(&mut self.font_ctx, text, display_scale);
 
         // Set default styles
         builder.push_default(parley::StyleProperty::FontSize(font_size));
-        builder.push_default(parley::StyleProperty::FontStack(family.into()));
+        builder.push_default(parley::StyleProperty::FontStack(family.as_ref().into()));
         builder.push_default(parley::StyleProperty::LineHeight(1.2));
         Self::push_text_style(&mut builder, style);
 
@@ -184,12 +287,13 @@ impl TextRenderer {
         max_width: f32,
     ) -> Vec<(f32, f32, f32)> {
         let display_scale = 1.0;
+        let family = self.resolve_stack(family);
         let mut builder = self
             .layout_ctx
             .ranged_builder(&mut self.font_ctx, text, display_scale);
 
         builder.push_default(parley::StyleProperty::FontSize(font_size));
-        builder.push_default(parley::StyleProperty::FontStack(family.into()));
+        builder.push_default(parley::StyleProperty::FontStack(family.as_ref().into()));
         builder.push_default(parley::StyleProperty::LineHeight(1.2));
 
         let mut layout: Layout<()> = builder.build(text);
@@ -234,12 +338,13 @@ impl TextRenderer {
         color: [f32; 4],
     ) -> Vec<GlyphInfo> {
         let display_scale = 1.0;
+        let family = self.resolve_stack(family);
         let mut builder = self
             .layout_ctx
             .ranged_builder(&mut self.font_ctx, text, display_scale);
 
         builder.push_default(parley::StyleProperty::FontSize(font_size));
-        builder.push_default(parley::StyleProperty::FontStack(family.into()));
+        builder.push_default(parley::StyleProperty::FontStack(family.as_ref().into()));
         builder.push_default(parley::StyleProperty::LineHeight(1.2));
 
         let mut layout: Layout<()> = builder.build(text);
@@ -338,12 +443,13 @@ impl TextRenderer {
         }
 
         let display_scale = 1.0;
+        let family = self.resolve_stack(family);
         let mut builder = self
             .layout_ctx
             .ranged_builder(&mut self.font_ctx, text, display_scale);
 
         builder.push_default(parley::StyleProperty::FontSize(font_size));
-        builder.push_default(parley::StyleProperty::FontStack(family.into()));
+        builder.push_default(parley::StyleProperty::FontStack(family.as_ref().into()));
         builder.push_default(parley::StyleProperty::LineHeight(1.2));
         Self::push_text_style(&mut builder, style);
 
@@ -528,6 +634,36 @@ mod tests {
         let _renderer = TextRenderer::new();
         // Just verify it creates without panic
         assert!(true);
+    }
+
+    #[test]
+    fn a_stack_is_untouched_when_no_web_fonts_are_registered() {
+        let renderer = TextRenderer::new();
+        let stack = "Inter, Helvetica, sans-serif";
+        assert!(
+            matches!(renderer.resolve_stack(stack), std::borrow::Cow::Borrowed(s) if s == stack),
+            "the common case must not allocate"
+        );
+    }
+
+    #[test]
+    fn a_web_font_family_is_rewritten_to_the_name_the_file_registered() {
+        // The @font-face name and the family inside the file often differ; the
+        // stack has to be rewritten or the lookup finds nothing.
+        let mut renderer = TextRenderer::new();
+        renderer
+            .web_font_aliases
+            .insert("myicons".to_string(), "Font Awesome 6 Free".to_string());
+
+        assert_eq!(
+            renderer.resolve_stack("MyIcons, sans-serif"),
+            "Font Awesome 6 Free, sans-serif"
+        );
+        assert_eq!(
+            renderer.resolve_stack("Helvetica, serif"),
+            "Helvetica, serif",
+            "families that are not web fonts are left alone"
+        );
     }
 
     #[test]

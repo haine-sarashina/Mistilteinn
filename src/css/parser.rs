@@ -410,12 +410,153 @@ pub fn evaluate_media_condition(condition: &str, viewport_width: f32) -> bool {
     matches
 }
 
+/// Where one `@font-face` source points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FontFaceSource {
+    /// A font file to download.
+    Url {
+        url: String,
+        /// The declared `format(...)`, lowercased; `None` when omitted.
+        format: Option<String>,
+    },
+    /// A font already installed on this machine.
+    Local(String),
+}
+
+/// A parsed `@font-face` rule.
+///
+/// Only the family and its sources are kept. The `font-weight` and
+/// `font-style` descriptors, which let one family name cover several files,
+/// are not modelled — every source is registered under the family name and
+/// the shaper picks between them by the font's own metadata.
+#[derive(Debug, Clone)]
+pub struct FontFaceRule {
+    pub family: String,
+    pub sources: Vec<FontFaceSource>,
+}
+
 /// A parsed CSS stylesheet containing rules.
 #[derive(Debug, Clone)]
 pub struct Stylesheet {
     pub rules: Vec<CSSRule>,
     pub imports: Vec<ImportRule>,
     pub media_rules: Vec<MediaRule>,
+    pub font_faces: Vec<FontFaceRule>,
+}
+
+/// Parse the body of an `@font-face` block.
+///
+/// Returns `None` unless the rule names a family and offers at least one
+/// source — a rule missing either cannot load anything.
+pub fn parse_font_face(block: &str) -> Option<FontFaceRule> {
+    let mut family = None;
+    let mut sources = Vec::new();
+
+    for decl in crate::css::parse_declarations(block) {
+        match decl.property.to_ascii_lowercase().as_str() {
+            "font-family" => {
+                let name = decl
+                    .value
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .trim();
+                if !name.is_empty() {
+                    family = Some(name.to_string());
+                }
+            }
+            "src" => sources.extend(parse_font_face_src(&decl.value)),
+            _ => {}
+        }
+    }
+
+    let family = family?;
+    if sources.is_empty() {
+        return None;
+    }
+    Some(FontFaceRule { family, sources })
+}
+
+/// Parse the comma-separated `src:` list of an `@font-face` rule.
+fn parse_font_face_src(value: &str) -> Vec<FontFaceSource> {
+    let mut sources = Vec::new();
+
+    for entry in split_top_level(value, ',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        // Each entry is `url(...) format(...)` or `local(...)`; the format hint
+        // is optional and may be followed by nothing else we care about.
+        let mut url = None;
+        let mut format = None;
+        let mut local = None;
+
+        for token in split_top_level(entry, ' ') {
+            let token = token.trim();
+            if let Some(inner) = strip_css_function(token, "url") {
+                url = Some(unquote(inner).to_string());
+            } else if let Some(inner) = strip_css_function(token, "format") {
+                format = Some(unquote(inner).to_ascii_lowercase());
+            } else if let Some(inner) = strip_css_function(token, "local") {
+                local = Some(unquote(inner).to_string());
+            }
+        }
+
+        if let Some(url) = url {
+            if !url.is_empty() {
+                sources.push(FontFaceSource::Url { url, format });
+            }
+        } else if let Some(local) = local {
+            if !local.is_empty() {
+                sources.push(FontFaceSource::Local(local));
+            }
+        }
+    }
+
+    sources
+}
+
+/// Split on `sep`, ignoring separators nested inside parentheses or quotes.
+fn split_top_level(s: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' | '\'' if quote == Some(c) => quote = None,
+            '"' | '\'' if quote.is_none() => quote = Some(c),
+            '(' if quote.is_none() => depth += 1,
+            ')' if quote.is_none() => depth = depth.saturating_sub(1),
+            c if c == sep && depth == 0 && quote.is_none() => {
+                parts.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Strip a `name(...)` wrapper, case-insensitively on the name.
+fn strip_css_function<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let s = s.trim();
+    let prefix_len = name.len() + 1;
+    if s.len() < prefix_len + 1 || !s.ends_with(')') {
+        return None;
+    }
+    if !s[..name.len()].eq_ignore_ascii_case(name) || !s[name.len()..].starts_with('(') {
+        return None;
+    }
+    Some(&s[prefix_len..s.len() - 1])
+}
+
+/// Remove one layer of matching quotes.
+fn unquote(s: &str) -> &str {
+    s.trim().trim_matches(|c| c == '"' || c == '\'').trim()
 }
 
 // ------ Helpers ------
@@ -529,6 +670,7 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
     let mut rules = Vec::new();
     let mut imports = Vec::new();
     let mut media_rules = Vec::new();
+    let mut font_faces = Vec::new();
     let mut pos = 0;
 
     while pos < source.len() {
@@ -578,6 +720,12 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
                             condition,
                             rules: inner_stylesheet.rules,
                         });
+                        font_faces.extend(inner_stylesheet.font_faces);
+                    } else if prelude
+                        .get(..10)
+                        .is_some_and(|p| p.eq_ignore_ascii_case("@font-face"))
+                    {
+                        font_faces.extend(parse_font_face(block_text));
                     }
                     pos += brace_pos + 1 + block_end + 1;
                 } else {
@@ -626,6 +774,7 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
         rules,
         imports,
         media_rules,
+        font_faces,
     }
 }
 
@@ -1253,6 +1402,104 @@ mod tests {
     #[test]
     fn parse_color_invalid() {
         assert!(crate::css::parse_color_value("invalid").is_none());
+    }
+
+    // -- @font-face parsing tests --
+
+    #[test]
+    fn font_face_reads_family_and_sources_in_order() {
+        let ss = parse_stylesheet(
+            r#"@font-face {
+                 font-family: "Inter";
+                 font-weight: 400;
+                 src: url(/f/inter.woff2) format("woff2"),
+                      url(/f/inter.woff) format("woff"),
+                      url(/f/inter.ttf) format("truetype");
+               }"#,
+        );
+
+        assert_eq!(ss.font_faces.len(), 1);
+        let face = &ss.font_faces[0];
+        assert_eq!(face.family, "Inter");
+        assert_eq!(
+            face.sources,
+            vec![
+                FontFaceSource::Url {
+                    url: "/f/inter.woff2".into(),
+                    format: Some("woff2".into())
+                },
+                FontFaceSource::Url {
+                    url: "/f/inter.woff".into(),
+                    format: Some("woff".into())
+                },
+                FontFaceSource::Url {
+                    url: "/f/inter.ttf".into(),
+                    format: Some("truetype".into())
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn font_face_reads_local_sources_and_bare_urls() {
+        let ss = parse_stylesheet(
+            "@font-face { font-family: Helvetica Neue; \
+             src: local('Helvetica Neue'), url('h.otf'); }",
+        );
+        let face = &ss.font_faces[0];
+        assert_eq!(face.family, "Helvetica Neue");
+        assert_eq!(
+            face.sources,
+            vec![
+                FontFaceSource::Local("Helvetica Neue".into()),
+                FontFaceSource::Url {
+                    url: "h.otf".into(),
+                    format: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_font_face_without_a_source_is_dropped() {
+        let ss = parse_stylesheet("@font-face { font-family: Ghost; font-weight: bold; }");
+        assert!(ss.font_faces.is_empty());
+    }
+
+    #[test]
+    fn font_face_does_not_disturb_the_rules_around_it() {
+        let ss = parse_stylesheet(
+            "a { color: red; } \
+             @font-face { font-family: X; src: url(x.ttf); } \
+             b { color: blue; }",
+        );
+        assert_eq!(ss.rules.len(), 2, "both style rules survive");
+        assert_eq!(ss.font_faces.len(), 1);
+    }
+
+    #[test]
+    fn font_face_inside_a_media_block_is_still_collected() {
+        let ss =
+            parse_stylesheet("@media screen { @font-face { font-family: M; src: url(m.ttf); } }");
+        assert_eq!(ss.font_faces.len(), 1);
+        assert_eq!(ss.font_faces[0].family, "M");
+    }
+
+    #[test]
+    fn commas_inside_a_source_do_not_split_the_list() {
+        // `local()` names may contain commas; splitting naively would produce
+        // two broken sources instead of one.
+        let sources = parse_font_face_src("local(\"Foo, Bar\"), url(a.ttf)");
+        assert_eq!(
+            sources,
+            vec![
+                FontFaceSource::Local("Foo, Bar".into()),
+                FontFaceSource::Url {
+                    url: "a.ttf".into(),
+                    format: None
+                },
+            ]
+        );
     }
 
     // -- @import parsing tests --

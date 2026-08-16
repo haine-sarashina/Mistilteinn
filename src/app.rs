@@ -1200,6 +1200,53 @@ impl MistilteinnApp {
         self.tab_manager.set_active_tab_loading(false);
     }
 
+    /// Download and register the fonts a page's `@font-face` rules declare.
+    ///
+    /// Each rule's sources are tried in order — that is what the list is for:
+    /// the first entry the shaper can actually load wins. `local(...)` entries
+    /// need no download, so they end the search only if the system already has
+    /// that family; otherwise the search moves on to the next source.
+    async fn load_web_fonts(
+        font_faces: &[crate::css::parser::FontFaceRule],
+        resolve: &impl Fn(&str) -> String,
+    ) {
+        use crate::css::parser::FontFaceSource;
+        use crate::render::font_data;
+
+        for face in font_faces {
+            for source in &face.sources {
+                let FontFaceSource::Url { url, format } = source else {
+                    // A local() source is only usable if the system already has
+                    // the family, in which case the normal font stack finds it.
+                    continue;
+                };
+                if !font_data::is_supported_format(format.as_deref()) {
+                    log::info!(
+                        "skipping @font-face source for '{}': format {:?} is not supported",
+                        face.family,
+                        format
+                    );
+                    continue;
+                }
+
+                let resolved = resolve(url);
+                let Ok(bytes) = crate::network::fetch_image(&resolved).await else {
+                    log::warn!("failed to fetch web font {resolved}");
+                    continue;
+                };
+
+                match font_data::to_sfnt(bytes) {
+                    Ok(sfnt) => {
+                        log::info!("registered web font '{}' from {resolved}", face.family);
+                        crate::render::text::register_web_font(&face.family, sfnt);
+                        break;
+                    }
+                    Err(e) => log::info!("web font {resolved} unusable: {e}"),
+                }
+            }
+        }
+    }
+
     /// Load a page asynchronously (fetches and composites images).
     pub async fn load_page_async(
         &mut self,
@@ -1247,6 +1294,13 @@ impl MistilteinnApp {
             }
         }
 
+        // Download the page's @font-face files before anything is measured
+        // with them. The previous page's fonts go first — they are registered
+        // process-wide, so leaving them would let one page's fonts leak into
+        // the next.
+        crate::render::text::clear_web_fonts();
+        Self::load_web_fonts(&new_page.stylesheet.font_faces, &resolve).await;
+
         // Fetch all images concurrently with throttling
         use futures::StreamExt;
         let results = futures::stream::iter(resolved_images.into_iter().map(
@@ -1290,6 +1344,13 @@ impl MistilteinnApp {
                     height,
                 },
             );
+        }
+
+        // The first layout measured with system fonts because the web fonts had
+        // not arrived yet. Re-measure now that they have, or every box sized
+        // from text keeps the wrong width.
+        if crate::render::text::web_font_count() > 0 {
+            new_page.recompute_with_hover(&[]);
         }
 
         if let Some(tab) = self.tab_manager.active_tab_mut() {

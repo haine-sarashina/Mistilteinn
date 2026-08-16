@@ -3162,6 +3162,7 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
         rules,
         imports: Vec::new(),
         media_rules: Vec::new(),
+        font_faces: Vec::new(),
     }
 }
 
@@ -3182,6 +3183,8 @@ pub fn merge_stylesheets_with_author(
         rules,
         imports,
         media_rules: author.media_rules.clone(),
+        // The UA sheet declares no web fonts.
+        font_faces: author.font_faces.clone(),
     }
 }
 

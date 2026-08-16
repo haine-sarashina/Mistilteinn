@@ -100,15 +100,40 @@ impl HitTestResult {
     }
 }
 
-/// Cursor kinds for interactive elements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CursorKind {
-    /// Default arrow cursor.
-    Default,
-    /// Pointer (hand) cursor for links.
-    Pointer,
-    /// I-beam cursor for text inputs.
-    IBeam,
+/// Map a computed CSS `cursor` onto a winit cursor icon.
+///
+/// `Auto` and `None` have no icon of their own — the caller resolves `Auto`
+/// from the element's role first, and winit hides the cursor separately, so
+/// both land on the plain arrow here.
+fn cursor_icon_for(cursor: crate::css::Cursor) -> CursorIcon {
+    use crate::css::Cursor as C;
+    match cursor {
+        C::Auto | C::Default | C::None => CursorIcon::Default,
+        C::Pointer => CursorIcon::Pointer,
+        C::Text => CursorIcon::Text,
+        C::Crosshair => CursorIcon::Crosshair,
+        C::Move => CursorIcon::Move,
+        C::Grab => CursorIcon::Grab,
+        C::Grabbing => CursorIcon::Grabbing,
+        C::NotAllowed => CursorIcon::NotAllowed,
+        C::Progress => CursorIcon::Progress,
+        C::Wait => CursorIcon::Wait,
+        C::Help => CursorIcon::Help,
+        C::ColResize => CursorIcon::ColResize,
+        C::RowResize => CursorIcon::RowResize,
+        C::NResize => CursorIcon::NResize,
+        C::EResize => CursorIcon::EResize,
+        C::SResize => CursorIcon::SResize,
+        C::WResize => CursorIcon::WResize,
+        C::NeResize => CursorIcon::NeResize,
+        C::NwResize => CursorIcon::NwResize,
+        C::SeResize => CursorIcon::SeResize,
+        C::SwResize => CursorIcon::SwResize,
+        C::EwResize => CursorIcon::EwResize,
+        C::NsResize => CursorIcon::NsResize,
+        C::ZoomIn => CursorIcon::ZoomIn,
+        C::ZoomOut => CursorIcon::ZoomOut,
+    }
 }
 
 impl MistilteinnApp {
@@ -1782,15 +1807,14 @@ impl MistilteinnApp {
         }
     }
 
-    /// Sets the winit window cursor icon from a CursorKind value.
+    /// Sets the winit window cursor icon from a computed CSS `cursor`.
     #[allow(deprecated)]
-    fn set_winit_cursor(renderer: Option<&Renderer>, kind: CursorKind) {
+    fn set_winit_cursor(renderer: Option<&Renderer>, cursor: crate::css::Cursor) {
         if let Some(r) = renderer {
-            r.window().set_cursor_icon(match kind {
-                CursorKind::Default => CursorIcon::Default,
-                CursorKind::Pointer => CursorIcon::Pointer,
-                CursorKind::IBeam => CursorIcon::Text,
-            });
+            // `cursor: none` hides the pointer rather than picking an icon.
+            r.window()
+                .set_cursor_visible(cursor != crate::css::Cursor::None);
+            r.window().set_cursor_icon(cursor_icon_for(cursor));
         }
     }
 }
@@ -2284,17 +2308,24 @@ impl ApplicationHandler for MistilteinnApp {
                         let content_x = cx - TAB_BAR_WIDTH as f32 + scroll_offset.0;
                         let content_y = cy - ADDRESS_BAR_HEIGHT as f32 + scroll_offset.1;
 
-                        let mut cursor_kind = crate::layout::hit_test_interactive(
-                            &page.layout_root,
-                            content_x,
-                            content_y,
-                        )
-                        .map(|interaction| match interaction {
-                            crate::layout::InteractionType::Link => CursorKind::Pointer,
-                            crate::layout::InteractionType::Input => CursorKind::IBeam,
-                            _ => CursorKind::Default,
-                        })
-                        .unwrap_or(CursorKind::Default);
+                        // An explicit CSS `cursor` wins outright; `auto` falls
+                        // back to what the element under the pointer is.
+                        let mut cursor_kind =
+                            crate::layout::hit_test_cursor(&page.layout_root, content_x, content_y);
+
+                        if cursor_kind == crate::css::Cursor::Auto {
+                            cursor_kind = crate::layout::hit_test_interactive(
+                                &page.layout_root,
+                                content_x,
+                                content_y,
+                            )
+                            .map(|interaction| match interaction {
+                                crate::layout::InteractionType::Link => crate::css::Cursor::Pointer,
+                                crate::layout::InteractionType::Input => crate::css::Cursor::Text,
+                                _ => crate::css::Cursor::Auto,
+                            })
+                            .unwrap_or(crate::css::Cursor::Auto);
+                        }
 
                         // :hover — hit-test for DOM node path (includes ancestors)
                         let dom_path = crate::layout::hit_test_dom_path(
@@ -2303,16 +2334,16 @@ impl ApplicationHandler for MistilteinnApp {
                             content_y,
                         );
 
-                        if cursor_kind == CursorKind::Default {
+                        if cursor_kind == crate::css::Cursor::Auto {
                             for &node_id in dom_path.iter().rev() {
                                 let (inp, href) =
                                     find_link_or_input_at_dom_id(&page.arena, node_id);
                                 if inp.is_some() {
-                                    cursor_kind = CursorKind::IBeam;
+                                    cursor_kind = crate::css::Cursor::Text;
                                     break;
                                 }
                                 if href.is_some() {
-                                    cursor_kind = CursorKind::Pointer;
+                                    cursor_kind = crate::css::Cursor::Pointer;
                                     break;
                                 }
                             }
@@ -2330,7 +2361,7 @@ impl ApplicationHandler for MistilteinnApp {
                 if let Some(kind) = content_cursor {
                     Self::set_winit_cursor(self.renderer.as_ref(), kind);
                 } else {
-                    Self::set_winit_cursor(self.renderer.as_ref(), CursorKind::Default);
+                    Self::set_winit_cursor(self.renderer.as_ref(), crate::css::Cursor::Default);
                 }
 
                 // Recompute :hover styles if the hovered DOM node changed

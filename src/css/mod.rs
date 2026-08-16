@@ -296,6 +296,10 @@ fn inherit_properties(parent: &ComputedValues, mut child: ComputedValues) -> Com
     if child.visibility == Visibility::Visible && parent.visibility != Visibility::Visible {
         child.visibility = parent.visibility;
     }
+    // `cursor` inherits; `Auto` is the initial, so it is also "unset here".
+    if child.cursor == Cursor::Auto {
+        child.cursor = parent.cursor;
+    }
     // CSS custom properties (variables) always inherit
     for (k, v) in &parent.custom_properties {
         if !child.custom_properties.contains_key(k) {
@@ -864,6 +868,94 @@ pub enum ClearType {
     Both,
 }
 
+// ------ Cursor ------
+
+/// The computed `cursor` property.
+///
+/// Only the keywords that map onto a platform cursor are kept; `url(...)`
+/// cursors fall back to whatever keyword follows them in the list, which is
+/// what the fallback syntax is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Cursor {
+    /// Let the element decide — links get a pointer, text gets an I-beam.
+    #[default]
+    Auto,
+    Default,
+    None,
+    Pointer,
+    Text,
+    Crosshair,
+    Move,
+    Grab,
+    Grabbing,
+    NotAllowed,
+    Progress,
+    Wait,
+    Help,
+    ColResize,
+    RowResize,
+    NResize,
+    EResize,
+    SResize,
+    WResize,
+    NeResize,
+    NwResize,
+    SeResize,
+    SwResize,
+    EwResize,
+    NsResize,
+    ZoomIn,
+    ZoomOut,
+}
+
+impl Cursor {
+    /// Parse a single `cursor` keyword.
+    fn parse_keyword(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "default" => Self::Default,
+            "none" => Self::None,
+            "pointer" => Self::Pointer,
+            "text" | "vertical-text" => Self::Text,
+            "crosshair" | "cell" => Self::Crosshair,
+            "move" | "all-scroll" => Self::Move,
+            "grab" => Self::Grab,
+            "grabbing" => Self::Grabbing,
+            "not-allowed" | "no-drop" => Self::NotAllowed,
+            "progress" => Self::Progress,
+            "wait" => Self::Wait,
+            "help" | "context-menu" => Self::Help,
+            "col-resize" => Self::ColResize,
+            "row-resize" => Self::RowResize,
+            "n-resize" => Self::NResize,
+            "e-resize" => Self::EResize,
+            "s-resize" => Self::SResize,
+            "w-resize" => Self::WResize,
+            "ne-resize" => Self::NeResize,
+            "nw-resize" => Self::NwResize,
+            "se-resize" => Self::SeResize,
+            "sw-resize" => Self::SwResize,
+            "ew-resize" => Self::EwResize,
+            "ns-resize" => Self::NsResize,
+            "zoom-in" => Self::ZoomIn,
+            "zoom-out" => Self::ZoomOut,
+            // `copy`, `alias` and friends have no distinct platform cursor
+            // here; treat them as the default arrow rather than dropping the
+            // declaration and inheriting something unrelated.
+            "copy" | "alias" => Self::Default,
+            _ => return None,
+        })
+    }
+
+    /// Parse a `cursor` declaration, which may be a comma-separated fallback
+    /// list ending in a keyword: `cursor: url(grab.cur), grab, pointer`.
+    pub fn parse(val: &str) -> Option<Self> {
+        split_top_level_commas(val)
+            .into_iter()
+            .find_map(|part| Self::parse_keyword(part.trim()))
+    }
+}
+
 // ------ Borders ------
 
 /// The computed `border-style` of one side.
@@ -995,6 +1087,8 @@ pub struct ComputedValues {
     pub text_style: TextStyleFlags,
     pub text_align: TextAlign,
     pub visibility: Visibility,
+    /// `cursor`; inherits, and `Auto` defers to the element's own role.
+    pub cursor: Cursor,
     /// `z-index`; `None` is the initial `auto`.
     pub z_index: Option<i32>,
     // CSS Custom Properties (CSS variables --*)
@@ -1197,6 +1291,7 @@ impl Default for ComputedValues {
             text_style: TextStyleFlags::default(),
             text_align: TextAlign::Left,
             visibility: Visibility::Visible,
+            cursor: Cursor::Auto,
             z_index: None,
             custom_properties: rustc_hash::FxHashMap::default(),
         }
@@ -1734,6 +1829,11 @@ impl ComputedValues {
             "border-style" => {
                 self.border_style =
                     parse_box_four_generic(val, self.border_style, BorderStyle::parse);
+            }
+            "cursor" => {
+                if let Some(c) = Cursor::parse(val) {
+                    self.cursor = c;
+                }
             }
             "border-radius" => {
                 if let Some(r) = parse_length(val) {
@@ -4697,6 +4797,50 @@ mod tests {
             value: value.to_string(),
             important: false,
         })
+    }
+
+    #[test]
+    fn cursor_keywords_parse() {
+        assert_eq!(declare("cursor", "pointer").cursor, Cursor::Pointer);
+        assert_eq!(declare("cursor", "NOT-ALLOWED").cursor, Cursor::NotAllowed);
+        assert_eq!(declare("cursor", "zoom-in").cursor, Cursor::ZoomIn);
+        assert_eq!(declare("cursor", "none").cursor, Cursor::None);
+    }
+
+    #[test]
+    fn cursor_falls_through_url_values_to_the_keyword() {
+        // The fallback list exists precisely because a url() cursor may fail
+        // to load; we never load them, so the keyword always wins.
+        assert_eq!(
+            declare("cursor", "url(grab.cur) 4 12, grab, pointer").cursor,
+            Cursor::Grab
+        );
+    }
+
+    #[test]
+    fn cursor_keeps_its_value_when_a_later_declaration_is_junk() {
+        let cv = declare("cursor", "wait").from_declaration(&Declaration {
+            property: "cursor".to_string(),
+            value: "nonsense-cursor".to_string(),
+            important: false,
+        });
+        assert_eq!(cv.cursor, Cursor::Wait);
+    }
+
+    #[test]
+    fn cursor_inherits_to_descendants() {
+        let html = "<html><body><div id='outer'><span id='inner'>x</span></div></body></html>";
+        let css = "#outer { cursor: pointer; }";
+        let arena = crate::html::parse_html(html);
+        let stylesheet = parser::parse_stylesheet(css);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
+
+        let nodes = arena.nodes.borrow();
+        let inner_id = nodes
+            .iter()
+            .position(|n| n.is_element() && n.get_attr("id") == Some("inner"))
+            .unwrap() as u32;
+        assert_eq!(styles.get(&inner_id).unwrap().cursor, Cursor::Pointer);
     }
 
     #[test]

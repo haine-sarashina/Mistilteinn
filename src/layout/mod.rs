@@ -238,6 +238,8 @@ pub struct LayoutNode {
     pub text_align: crate::css::TextAlign,
     /// `visibility` — hidden nodes still lay out, they are just not painted.
     pub visibility: crate::css::Visibility,
+    /// `cursor` — `Auto` defers to `interaction_type`.
+    pub cursor: crate::css::Cursor,
     /// `z-index`; `None` is `auto`, which sorts as 0 alongside its siblings.
     pub z_index: Option<i32>,
     pub is_line_break: bool,
@@ -295,6 +297,7 @@ impl LayoutNode {
             text_style: crate::css::TextStyleFlags::default(),
             text_align: crate::css::TextAlign::Left,
             visibility: crate::css::Visibility::Visible,
+            cursor: crate::css::Cursor::Auto,
             z_index: None,
             is_line_break: false,
         }
@@ -511,6 +514,7 @@ where
     root_layout.border_radius = root_styles.border_radius;
     root_layout.text_style = root_styles.text_style;
     root_layout.visibility = root_styles.visibility;
+    root_layout.cursor = root_styles.cursor;
     root_layout.z_index = root_styles.z_index;
     root_layout.text_align = root_styles.text_align;
 
@@ -669,6 +673,7 @@ fn build_layout_children<N, F>(
                     layout_node.border_radius = child_styles.border_radius;
                     layout_node.text_style = child_styles.text_style;
                     layout_node.visibility = child_styles.visibility;
+                    layout_node.cursor = child_styles.cursor;
                     layout_node.z_index = child_styles.z_index;
                     layout_node.text_align = child_styles.text_align;
 
@@ -891,6 +896,7 @@ fn build_layout_children<N, F>(
                     layout_node.border_radius = child_styles.border_radius;
                     layout_node.text_style = child_styles.text_style;
                     layout_node.visibility = child_styles.visibility;
+                    layout_node.cursor = child_styles.cursor;
                     layout_node.z_index = child_styles.z_index;
                     layout_node.text_align = child_styles.text_align;
 
@@ -3791,6 +3797,36 @@ pub fn line_box_metrics(line: &LineBox) -> (f32, f32, f32, f32) {
     (line_top, baseline_y, line_bottom, line_height)
 }
 
+/// Hit-test the layout tree for the CSS `cursor` in effect at a position.
+///
+/// Returns the innermost box's `cursor`. Because `cursor` inherits, a value set
+/// on an ancestor has already been pushed down onto that box, so there is no
+/// need to walk back up. `Auto` means the caller should fall back to the
+/// element's role (link, text input, …).
+pub fn hit_test_cursor(root: &LayoutNode, x: f32, y: f32) -> crate::css::Cursor {
+    if !root.rect.contains(x, y) {
+        return crate::css::Cursor::Auto;
+    }
+
+    // Absolutely positioned children paint on top, so they win the hit test.
+    for abs_child in root.absolute_children.iter().rev() {
+        if abs_child.rect.contains(x, y) {
+            return hit_test_cursor(abs_child, x, y);
+        }
+    }
+
+    for child in root.children.iter().rev() {
+        if child.rect.contains(x, y) {
+            let inner = hit_test_cursor(child, x, y);
+            if inner != crate::css::Cursor::Auto {
+                return inner;
+            }
+        }
+    }
+
+    root.cursor
+}
+
 /// Hit-test the layout tree for interactive elements at a given position.
 ///
 /// Walks the tree in depth-first order (children first, since they render on top).
@@ -4936,6 +4972,43 @@ mod tests {
         assert_eq!(texts[0].text, "Hello");
         assert!((texts[0].x - 10.0).abs() < 0.001);
         assert!((texts[0].y - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn hit_test_cursor_returns_the_innermost_declared_cursor() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        root.cursor = crate::css::Cursor::Pointer;
+
+        let mut inner = LayoutNode::new(Rect::new(50.0, 50.0, 50.0, 50.0));
+        inner.cursor = crate::css::Cursor::NotAllowed;
+        root.add_child(inner);
+
+        assert_eq!(
+            hit_test_cursor(&root, 60.0, 60.0),
+            crate::css::Cursor::NotAllowed,
+            "the innermost box wins"
+        );
+        assert_eq!(
+            hit_test_cursor(&root, 10.0, 10.0),
+            crate::css::Cursor::Pointer,
+            "outside the child, the container's cursor applies"
+        );
+        assert_eq!(
+            hit_test_cursor(&root, 500.0, 500.0),
+            crate::css::Cursor::Auto,
+            "off the page there is nothing to defer to"
+        );
+    }
+
+    #[test]
+    fn hit_test_cursor_skips_children_that_left_it_auto() {
+        // `cursor` inherits, so a child at `auto` really did not set one — the
+        // container's value must still show through.
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        root.cursor = crate::css::Cursor::Grab;
+        root.add_child(LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0)));
+
+        assert_eq!(hit_test_cursor(&root, 10.0, 10.0), crate::css::Cursor::Grab);
     }
 
     #[test]

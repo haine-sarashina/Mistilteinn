@@ -1391,8 +1391,10 @@ impl ComputedValues {
                 }
             }
             "font-family" => {
-                // Strip quotes if present
-                self.font_family = val.trim_matches(|c| c == '"' || c == '\'').to_string();
+                let stack = normalize_font_family(val);
+                if !stack.is_empty() {
+                    self.font_family = stack;
+                }
             }
             "flex-direction" => {
                 self.flex_direction = match val {
@@ -2114,6 +2116,101 @@ fn parse_margin_box_four(
         ),
         _ => (fallback_margin, fallback_auto),
     }
+}
+
+/// The family used when an element has no usable `font-family`.
+pub const DEFAULT_FONT_FAMILY: &str = "sans-serif";
+
+/// The CSS generic families, which terminate a fallback chain.
+const GENERIC_FAMILIES: &[&str] = &[
+    "serif",
+    "sans-serif",
+    "monospace",
+    "cursive",
+    "fantasy",
+    "system-ui",
+    "ui-serif",
+    "ui-sans-serif",
+    "ui-monospace",
+    "ui-rounded",
+    "emoji",
+    "math",
+    "fangsong",
+];
+
+/// Normalise a `font-family` declaration into a fallback chain the text stack
+/// can consume.
+///
+/// The value is a *prioritised list*, not one name: `font-family: "Segoe UI",
+/// Roboto, sans-serif` means "try each in turn". Each entry is unquoted
+/// individually — stripping quotes from the whole declaration would leave a
+/// stray `"` glued to the second family and make it unmatchable.
+///
+/// A generic family is appended when the author did not end the list with one,
+/// so a page naming only fonts this machine lacks still resolves to something
+/// rather than to nothing.
+pub fn normalize_font_family(val: &str) -> String {
+    let mut families: Vec<String> = Vec::new();
+    let mut has_generic = false;
+
+    for raw in split_top_level_commas(val) {
+        let name = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        if name.is_empty() || name.eq_ignore_ascii_case("inherit") {
+            continue;
+        }
+        // `-apple-system` and friends are vendor aliases for the platform UI
+        // font; they are unmatchable names here, so let them fall through to
+        // the generic that follows them in the list.
+        if name.starts_with('-') {
+            continue;
+        }
+        if GENERIC_FAMILIES
+            .iter()
+            .any(|g| name.eq_ignore_ascii_case(g))
+        {
+            has_generic = true;
+        }
+        families.push(name.to_string());
+    }
+
+    if families.is_empty() {
+        return String::new();
+    }
+    if !has_generic {
+        families.push(DEFAULT_FONT_FAMILY.to_string());
+    }
+    families.join(", ")
+}
+
+/// Resolve a computed family for the text stack, substituting the default when
+/// the cascade left it unset.
+pub fn font_stack_or_default(family: &str) -> &str {
+    if family.trim().is_empty() {
+        DEFAULT_FONT_FAMILY
+    } else {
+        family
+    }
+}
+
+/// Split a comma-separated list, ignoring commas nested inside `(...)`
+/// (e.g. inside a `local(...)` or `format(...)` argument).
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 /// Parse a box model shorthand (margin/padding) into four values.
@@ -4427,5 +4524,85 @@ mod tests {
         let li4 = styles.get(&li4_id).unwrap();
         assert_eq!(li4.margin[2], 20.0, "li4 is :last-child");
         assert_eq!(li4.font_size, 22.0, "li4 is 4th child (:nth-child(even))");
+    }
+
+    /// Apply one `property: value` pair to a fresh `ComputedValues`.
+    fn declare(property: &str, value: &str) -> ComputedValues {
+        ComputedValues::default().from_declaration(&Declaration {
+            property: property.to_string(),
+            value: value.to_string(),
+            important: false,
+        })
+    }
+
+    #[test]
+    fn font_family_keeps_the_whole_fallback_chain() {
+        let cv = declare("font-family", r#""Segoe UI", Roboto, sans-serif"#);
+        assert_eq!(cv.font_family, "Segoe UI, Roboto, sans-serif");
+    }
+
+    #[test]
+    fn font_family_unquotes_each_entry_not_just_the_ends() {
+        // Trimming quotes from the whole declaration used to leave a stray
+        // quote glued to the last family, making it unmatchable.
+        assert_eq!(
+            normalize_font_family(r#"'Hiragino Kaku Gothic ProN', "Meiryo", serif"#),
+            "Hiragino Kaku Gothic ProN, Meiryo, serif"
+        );
+    }
+
+    #[test]
+    fn font_family_appends_a_generic_when_the_author_omitted_one() {
+        assert_eq!(
+            normalize_font_family("Impact, Charcoal"),
+            "Impact, Charcoal, sans-serif"
+        );
+        // Already generic-terminated lists are left alone.
+        assert_eq!(
+            normalize_font_family("Courier New, monospace"),
+            "Courier New, monospace"
+        );
+    }
+
+    #[test]
+    fn font_family_drops_vendor_prefixed_aliases() {
+        assert_eq!(
+            normalize_font_family("-apple-system, BlinkMacSystemFont, Arial, sans-serif"),
+            "BlinkMacSystemFont, Arial, sans-serif"
+        );
+    }
+
+    #[test]
+    fn font_family_empty_declaration_leaves_the_cascade_alone() {
+        let cv = declare("font-family", "monospace").from_declaration(&Declaration {
+            property: "font-family".to_string(),
+            value: "   ".to_string(),
+            important: false,
+        });
+        assert_eq!(
+            cv.font_family, "monospace",
+            "a junk value must not clear it"
+        );
+        assert_eq!(font_stack_or_default(""), DEFAULT_FONT_FAMILY);
+    }
+
+    #[test]
+    fn font_family_inherits_to_descendants() {
+        let html = "<html><body><div id='outer'><span id='inner'>x</span></div></body></html>";
+        let css = "#outer { font-family: 'Courier New', monospace; }";
+        let arena = crate::html::parse_html(html);
+        let stylesheet = parser::parse_stylesheet(css);
+        let styles = compute_styles_for_tree(&arena, &stylesheet, (1024.0, 768.0));
+
+        let nodes = arena.nodes.borrow();
+        let inner_id = nodes
+            .iter()
+            .position(|n| n.is_element() && n.get_attr("id") == Some("inner"))
+            .unwrap() as u32;
+
+        assert_eq!(
+            styles.get(&inner_id).unwrap().font_family,
+            "Courier New, monospace"
+        );
     }
 }

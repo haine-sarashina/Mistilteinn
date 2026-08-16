@@ -78,6 +78,8 @@ pub enum InlineBox {
         width: f32, // measured width of this run
         color: Option<[u8; 4]>,
         font_size: f32,
+        /// The run's `font-family` fallback chain, in CSS list form.
+        font_family: String,
         dom_node_id: Option<u32>,
         interaction_type: InteractionType,
         text_style: crate::css::TextStyleFlags,
@@ -105,6 +107,7 @@ impl InlineBox {
             width: 0.0,
             color: None,
             font_size,
+            font_family: crate::css::DEFAULT_FONT_FAMILY.to_string(),
             dom_node_id: None,
             interaction_type: InteractionType::None,
             text_style: crate::css::TextStyleFlags::default(),
@@ -1756,7 +1759,7 @@ fn compute_shrink_to_fit_width(
         let (w, _) = text_renderer.measure_styled(
             &transformed,
             node.font_size,
-            "sans-serif",
+            crate::css::font_stack_or_default(&node.font_family),
             node.text_style,
         );
         return w;
@@ -2802,29 +2805,77 @@ fn is_collapsible_whitespace(s: &str) -> bool {
 ///
 /// Dimensions (`width`, `height`, `baseline_offset`) are set to `0.0` here and
 /// filled in during line-breaking (Step A3/A4) when text measurement occurs.
+/// The styling an inline run inherits from the block container it sits in.
+///
+/// Text nodes carry no style of their own, so every property a run needs to be
+/// measured and painted has to travel down from the nearest styled ancestor.
+#[derive(Debug, Clone)]
+struct InlineStyleContext {
+    color: Option<[u8; 4]>,
+    font_size: f32,
+    font_family: String,
+    dom_id: Option<u32>,
+    interaction: InteractionType,
+    text_style: crate::css::TextStyleFlags,
+}
+
+impl InlineStyleContext {
+    /// The context seen by the children of `parent`.
+    fn from_parent(parent: &LayoutNode) -> Self {
+        Self {
+            color: parent.color,
+            font_size: if parent.font_size > 0.0 {
+                parent.font_size
+            } else {
+                16.0
+            },
+            font_family: crate::css::font_stack_or_default(&parent.font_family).to_string(),
+            dom_id: parent.dom_node_id,
+            interaction: parent.interaction_type,
+            text_style: parent.text_style,
+        }
+    }
+
+    /// Fold `child`'s own declarations over the inherited ones.
+    fn inherited_by(&self, child: &LayoutNode) -> Self {
+        Self {
+            color: child.color.or(self.color),
+            font_size: if child.font_size > 0.0 {
+                child.font_size
+            } else {
+                self.font_size
+            },
+            font_family: if child.font_family.trim().is_empty() {
+                self.font_family.clone()
+            } else {
+                child.font_family.clone()
+            },
+            dom_id: child.dom_node_id.or(self.dom_id),
+            interaction: if child.interaction_type != InteractionType::None {
+                child.interaction_type
+            } else {
+                self.interaction
+            },
+            text_style: child.text_style.merged_with(self.text_style),
+        }
+    }
+}
+
 fn collect_inline_boxes_recursive(
     child: &LayoutNode,
     child_idx: usize,
-    inherited_color: Option<[u8; 4]>,
-    inherited_font_size: f32,
-    inherited_dom_id: Option<u32>,
-    inherited_interaction: InteractionType,
-    inherited_style: crate::css::TextStyleFlags,
+    inherited: &InlineStyleContext,
     boxes: &mut Vec<InlineBox>,
 ) {
-    let color = child.color.or(inherited_color);
-    let font_size = if child.font_size > 0.0 {
-        child.font_size
-    } else {
-        inherited_font_size
-    };
-    let dom_id = child.dom_node_id.or(inherited_dom_id);
-    let interaction = if child.interaction_type != InteractionType::None {
-        child.interaction_type
-    } else {
-        inherited_interaction
-    };
-    let text_style = child.text_style.merged_with(inherited_style);
+    let ctx = inherited.inherited_by(child);
+    let InlineStyleContext {
+        color,
+        font_size,
+        ref font_family,
+        dom_id,
+        interaction,
+        text_style,
+    } = ctx;
 
     if child.is_line_break {
         boxes.push(InlineBox::LineBreak);
@@ -2845,6 +2896,7 @@ fn collect_inline_boxes_recursive(
                 width: 0.0,
                 color,
                 font_size,
+                font_family: font_family.clone(),
                 dom_node_id: dom_id,
                 interaction_type: interaction,
                 text_style,
@@ -2864,16 +2916,7 @@ fn collect_inline_boxes_recursive(
     } else if matches!(child.display, DisplayType::Inline) {
         if !child.children.is_empty() {
             for nested in &child.children {
-                collect_inline_boxes_recursive(
-                    nested,
-                    child_idx,
-                    color,
-                    font_size,
-                    dom_id,
-                    interaction,
-                    text_style,
-                    boxes,
-                );
+                collect_inline_boxes_recursive(nested, child_idx, &ctx, boxes);
             }
         } else {
             let w = child.explicit_width.unwrap_or(child.rect.width);
@@ -2893,27 +2936,10 @@ fn collect_inline_boxes_recursive(
 /// Build inline boxes from the children of a block container.
 fn build_inline_boxes(parent: &LayoutNode, children: &[LayoutNode]) -> Vec<InlineBox> {
     let mut boxes = Vec::new();
-    let p_color = parent.color;
-    let p_fs = if parent.font_size > 0.0 {
-        parent.font_size
-    } else {
-        16.0
-    };
-    let p_dom_id = parent.dom_node_id;
-    let p_interaction = parent.interaction_type;
-    let p_style = parent.text_style;
+    let ctx = InlineStyleContext::from_parent(parent);
 
     for (idx, child) in children.iter().enumerate() {
-        collect_inline_boxes_recursive(
-            child,
-            idx,
-            p_color,
-            p_fs,
-            p_dom_id,
-            p_interaction,
-            p_style,
-            &mut boxes,
-        );
+        collect_inline_boxes_recursive(child, idx, &ctx, &mut boxes);
     }
 
     boxes
@@ -2923,27 +2949,10 @@ fn build_inline_boxes(parent: &LayoutNode, children: &[LayoutNode]) -> Vec<Inlin
 /// Like `build_inline_boxes` but indices are relative to the slice start.
 fn build_inline_boxes_from_slice(parent: &LayoutNode, children: &[LayoutNode]) -> Vec<InlineBox> {
     let mut boxes = Vec::new();
-    let p_color = parent.color;
-    let p_fs = if parent.font_size > 0.0 {
-        parent.font_size
-    } else {
-        16.0
-    };
-    let p_dom_id = parent.dom_node_id;
-    let p_interaction = parent.interaction_type;
-    let p_style = parent.text_style;
+    let ctx = InlineStyleContext::from_parent(parent);
 
     for (idx, child) in children.iter().enumerate() {
-        collect_inline_boxes_recursive(
-            child,
-            idx,
-            p_color,
-            p_fs,
-            p_dom_id,
-            p_interaction,
-            p_style,
-            &mut boxes,
-        );
+        collect_inline_boxes_recursive(child, idx, &ctx, &mut boxes);
     }
 
     boxes
@@ -3232,11 +3241,13 @@ pub fn break_into_lines(
                 width: _,
                 color,
                 font_size,
+                font_family,
                 dom_node_id,
                 interaction_type,
                 text_style,
             } => {
                 let tokens = tokenize_text_for_line_breaking(text);
+                let family = crate::css::font_stack_or_default(font_family);
 
                 for token in tokens {
                     match token {
@@ -3245,7 +3256,7 @@ pub fn break_into_lines(
                                 let (sw, _) = text_renderer.measure_styled(
                                     " ",
                                     *font_size,
-                                    "sans-serif",
+                                    family,
                                     *text_style,
                                 );
                                 current_line_boxes.push(InlineBox::Whitespace {
@@ -3256,12 +3267,8 @@ pub fn break_into_lines(
                             }
                         }
                         LineBreakToken::Text(word) => {
-                            let (word_width, _) = text_renderer.measure_styled(
-                                word,
-                                *font_size,
-                                "sans-serif",
-                                *text_style,
-                            );
+                            let (word_width, _) =
+                                text_renderer.measure_styled(word, *font_size, family, *text_style);
 
                             let tentative = current_line_width + word_width;
 
@@ -3291,6 +3298,7 @@ pub fn break_into_lines(
                                 width: word_width,
                                 color: *color,
                                 font_size: *font_size,
+                                font_family: font_family.clone(),
                                 dom_node_id: *dom_node_id,
                                 interaction_type: *interaction_type,
                                 text_style: *text_style,
@@ -3362,7 +3370,9 @@ pub fn break_into_lines(
                     } else {
                         16.0
                     };
-                    let (sw, _) = text_renderer.measure(" ", fs, "sans-serif");
+                    // Standalone whitespace between inline elements belongs to no
+                    // run, so there is no family to inherit here.
+                    let (sw, _) = text_renderer.measure(" ", fs, crate::css::DEFAULT_FONT_FAMILY);
 
                     if current_line_width + sw > available_width {
                         // Flush line; trailing whitespace will be trimmed
@@ -3572,6 +3582,8 @@ pub struct TextInfo {
     pub color: [u8; 4],
     /// Font size in pixels.
     pub font_size: f32,
+    /// The `font-family` fallback chain, in CSS list form.
+    pub font_family: String,
     /// Bold / italic / decoration flags for this run.
     pub text_style: crate::css::TextStyleFlags,
 }
@@ -3612,6 +3624,7 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
                         width,
                         color,
                         font_size,
+                        font_family,
                         text_style,
                         ..
                     } => {
@@ -3626,6 +3639,8 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
                                 text: text.clone(),
                                 color: text_color,
                                 font_size: *font_size,
+                                font_family: crate::css::font_stack_or_default(font_family)
+                                    .to_string(),
                                 text_style: text_style.merged_with(node.text_style),
                             });
                         }
@@ -3672,6 +3687,7 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
                     text: node.text_style.transform.apply(text).into_owned(),
                     color,
                     font_size: node.font_size,
+                    font_family: crate::css::font_stack_or_default(&node.font_family).to_string(),
                     text_style: node.text_style,
                 });
             }
@@ -4901,6 +4917,48 @@ mod tests {
     }
 
     #[test]
+    fn collect_text_nodes_carries_the_font_family() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut styled = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 30.0));
+        styled.text = Some("code()".to_string());
+        styled.font_family = "Courier New, monospace".to_string();
+
+        let mut unstyled = LayoutNode::new(Rect::new(0.0, 40.0, 200.0, 30.0));
+        unstyled.text = Some("prose".to_string());
+
+        root.add_child(styled);
+        root.add_child(unstyled);
+
+        let texts = collect_text_nodes(&root);
+        assert_eq!(texts[0].font_family, "Courier New, monospace");
+        assert_eq!(
+            texts[1].font_family,
+            crate::css::DEFAULT_FONT_FAMILY,
+            "an unset family must resolve rather than reach the rasterizer empty"
+        );
+    }
+
+    #[test]
+    fn inline_runs_inherit_the_containers_font_family() {
+        let mut parent = LayoutNode::new(Rect::new(0.0, 0.0, 400.0, 100.0));
+        parent.font_family = "Meiryo, sans-serif".to_string();
+        parent.font_size = 16.0;
+
+        let mut text_child = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
+        text_child.text = Some("hello".to_string());
+        text_child.display = DisplayType::Inline;
+
+        let boxes = build_inline_boxes(&parent, std::slice::from_ref(&text_child));
+        match &boxes[0] {
+            InlineBox::Text { font_family, .. } => {
+                assert_eq!(font_family, "Meiryo, sans-serif")
+            }
+            other => panic!("expected a text run, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn collect_text_nodes_skips_whitespace_only() {
         let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
 
@@ -5719,6 +5777,7 @@ mod tests {
                     width: 50.0,
                     color: Some([255, 0, 0, 255]), // red text
                     font_size: 16.0,
+                    font_family: crate::css::DEFAULT_FONT_FAMILY.to_string(),
                     dom_node_id: None,
                     interaction_type: InteractionType::None,
                     text_style: crate::css::TextStyleFlags::default(),
@@ -5732,6 +5791,7 @@ mod tests {
                     width: 45.0,
                     color: Some([0, 0, 255, 255]), // blue text
                     font_size: 16.0,
+                    font_family: crate::css::DEFAULT_FONT_FAMILY.to_string(),
                     dom_node_id: None,
                     interaction_type: InteractionType::None,
                     text_style: crate::css::TextStyleFlags::default(),
@@ -5787,6 +5847,7 @@ mod tests {
                 width: 60.0,
                 color: Some([255, 0, 0, 255]), // red foreground CSS color
                 font_size: 16.0,
+                font_family: crate::css::DEFAULT_FONT_FAMILY.to_string(),
                 dom_node_id: None,
                 interaction_type: InteractionType::None,
                 text_style: crate::css::TextStyleFlags::default(),
@@ -6799,6 +6860,7 @@ mod tests {
                     width: 80.0,
                     color: None,
                     font_size: 16.0,
+                    font_family: crate::css::DEFAULT_FONT_FAMILY.to_string(),
                     dom_node_id: None,
                     interaction_type: InteractionType::None,
                     text_style: crate::css::TextStyleFlags::default(),
@@ -6808,6 +6870,7 @@ mod tests {
                     width: 90.0,
                     color: Some([0, 0, 255, 255]),
                     font_size: 16.0,
+                    font_family: crate::css::DEFAULT_FONT_FAMILY.to_string(),
                     dom_node_id: Some(42),
                     interaction_type: InteractionType::Link,
                     text_style: crate::css::TextStyleFlags {

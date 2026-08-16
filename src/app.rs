@@ -742,7 +742,7 @@ impl MistilteinnApp {
             text_renderer.rasterize_to_bitmap_styled(
                 &text_info.text,
                 text_info.font_size,
-                "sans-serif",
+                &text_info.font_family,
                 color_f32,
                 text_x,
                 text_y,

@@ -403,6 +403,18 @@ impl DomArena {
         }
     }
 
+    /// Remove an attribute from a node.
+    ///
+    /// Distinct from setting it to the empty string: for a boolean attribute
+    /// such as `selected` or `checked`, presence alone is what counts, so
+    /// `selected=""` is still selected.
+    pub fn remove_attribute(&self, node_id: u32, name: &str) {
+        let mut nodes = self.nodes.borrow_mut();
+        if let Some(node) = nodes.get_mut(node_id as usize) {
+            node.attrs.remove(&LocalName::from(name));
+        }
+    }
+
     /// Get an attribute on a node.
     pub fn get_attribute(&self, node_id: u32, name: &str) -> Option<String> {
         let nodes = self.nodes.borrow();

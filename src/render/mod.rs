@@ -827,6 +827,41 @@ pub fn composite_image_scaled(
     }
 }
 
+/// Draw the drop arrow of a `<select>`, inside the padding the UA style
+/// reserves on its right edge.
+pub fn draw_select_arrow(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) {
+    if width < 16.0 || height < 8.0 {
+        return;
+    }
+    let color = [96, 96, 96, 255];
+    // A solid triangle, drawn as shrinking horizontal runs from a 9px base.
+    let half_base = 4.0;
+    let cx = x + width - 12.0;
+    let cy = y + height / 2.0 - 2.0;
+
+    for row in 0..=(half_base as i32) {
+        let run = half_base - row as f32;
+        draw_solid_rect(
+            dest,
+            dest_width,
+            dest_height,
+            cx - run,
+            cy + row as f32,
+            run * 2.0 + 1.0,
+            1.0,
+            color,
+        );
+    }
+}
+
 /// Resolve `background-size` to the pixel size one tile is drawn at.
 ///
 /// Returns `None` when the result would be degenerate (a zero-sized image or

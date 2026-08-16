@@ -150,6 +150,8 @@ pub enum InteractionType {
     Link,
     /// An input element (<input>, <textarea>, <button>) — shows I-beam cursor.
     Input,
+    /// A `<select>` — keeps the arrow cursor, and opens a list when clicked.
+    Select,
 }
 
 /// A node in the layout tree.
@@ -793,37 +795,12 @@ fn build_layout_children<N, F>(
                     layout_node.interaction_type = match tag.as_str() {
                         "a" => InteractionType::Link,
                         "input" | "textarea" | "button" => InteractionType::Input,
+                        "select" => InteractionType::Select,
                         _ => InteractionType::None,
                     };
 
                     // Handle <input> / <textarea> / <button> text and default sizing
-                    if tag == "input" || tag == "textarea" {
-                        let val = node
-                            .get_attr("value")
-                            .or_else(|| node.get_attr("placeholder"));
-                        if let Some(t) = val {
-                            if !t.is_empty() {
-                                layout_node.text = Some(t);
-                            }
-                        }
-                        if layout_node.explicit_width.is_none() {
-                            let default_w = if tag == "textarea" { 240.0 } else { 160.0 };
-                            layout_node.explicit_width = Some(default_w);
-                            layout_node.rect.width = default_w;
-                        }
-                        if layout_node.explicit_height.is_none() {
-                            let default_h = if tag == "textarea" { 36.0 } else { 24.0 };
-                            layout_node.explicit_height = Some(default_h);
-                            layout_node.rect.height = default_h;
-                        }
-                    } else if tag == "button" {
-                        if layout_node.explicit_height.is_none() {
-                            layout_node.explicit_height = Some(24.0);
-                            layout_node.rect.height = 24.0;
-                        }
-                    } else if tag == "br" {
-                        layout_node.is_line_break = true;
-                    }
+                    apply_form_control_defaults(&tag, &node, &mut layout_node, get_node);
 
                     // Track DOM node ID for hit-testing / :hover
                     layout_node.dom_node_id = Some(child_id);
@@ -1020,35 +997,10 @@ fn build_layout_children<N, F>(
                     layout_node.interaction_type = match tag.as_str() {
                         "a" => InteractionType::Link,
                         "input" | "textarea" | "button" => InteractionType::Input,
+                        "select" => InteractionType::Select,
                         _ => InteractionType::None,
                     };
-                    if tag == "input" || tag == "textarea" {
-                        let val = node
-                            .get_attr("value")
-                            .or_else(|| node.get_attr("placeholder"));
-                        if let Some(t) = val {
-                            if !t.is_empty() {
-                                layout_node.text = Some(t);
-                            }
-                        }
-                        if layout_node.explicit_width.is_none() {
-                            let default_w = if tag == "textarea" { 240.0 } else { 160.0 };
-                            layout_node.explicit_width = Some(default_w);
-                            layout_node.rect.width = default_w;
-                        }
-                        if layout_node.explicit_height.is_none() {
-                            let default_h = if tag == "textarea" { 36.0 } else { 24.0 };
-                            layout_node.explicit_height = Some(default_h);
-                            layout_node.rect.height = default_h;
-                        }
-                    } else if tag == "button" {
-                        if layout_node.explicit_height.is_none() {
-                            layout_node.explicit_height = Some(24.0);
-                            layout_node.rect.height = 24.0;
-                        }
-                    } else if tag == "br" {
-                        layout_node.is_line_break = true;
-                    }
+                    apply_form_control_defaults(&tag, &node, &mut layout_node, get_node);
 
                     // Track DOM node ID for hit-testing / :hover
                     layout_node.dom_node_id = Some(child_id);
@@ -3120,6 +3072,169 @@ fn position_inline_children_in_lines(
                 children[idx].rect.height = ph;
             }
         }
+    }
+}
+
+/// Every `<select>` box in the tree, for drawing its drop arrow.
+pub fn collect_select_boxes(node: &LayoutNode) -> Vec<Rect> {
+    let mut out = Vec::new();
+    collect_select_boxes_inner(node, &mut out);
+    out
+}
+
+fn collect_select_boxes_inner(node: &LayoutNode, out: &mut Vec<Rect>) {
+    if matches!(node.display, DisplayType::None) {
+        return;
+    }
+    if node.interaction_type == InteractionType::Select
+        && node.visibility.is_painted()
+        && node.rect.width > 0.0
+        && node.rect.height > 0.0
+    {
+        out.push(node.rect);
+    }
+    for child in node.children.iter().chain(node.absolute_children.iter()) {
+        collect_select_boxes_inner(child, out);
+    }
+}
+
+/// The `<option>` elements of a `<select>`, as (dom id, label, selected).
+///
+/// Options nested in an `<optgroup>` are included; the group label itself is
+/// not selectable and is left out.
+pub fn select_options<N, F>(select: &N, get_node: F) -> Vec<(u32, String, bool)>
+where
+    N: LayoutDomNode,
+    F: Copy + Fn(u32) -> Option<N>,
+{
+    let mut options = Vec::new();
+    collect_select_options(select, get_node, &mut options, 0);
+    options
+}
+
+fn collect_select_options<N, F>(
+    node: &N,
+    get_node: F,
+    out: &mut Vec<(u32, String, bool)>,
+    depth: usize,
+) where
+    N: LayoutDomNode,
+    F: Copy + Fn(u32) -> Option<N>,
+{
+    // `<select>` nesting is at most select > optgroup > option; the guard is
+    // only here so malformed markup cannot recurse forever.
+    if depth > 4 {
+        return;
+    }
+    for child_id in node.children_ids() {
+        let Some(child) = get_node(child_id) else {
+            continue;
+        };
+        match child.tag_name().to_lowercase().as_str() {
+            "option" => {
+                // An option's label is its child text node — `text_content`
+                // answers for text nodes only, so the element itself has none.
+                let label = child
+                    .get_attr("label")
+                    .unwrap_or_else(|| descendant_text(&child, get_node, 0));
+                let selected = child.get_attr("selected").is_some();
+                out.push((child_id, label.trim().to_string(), selected));
+            }
+            "optgroup" => collect_select_options(&child, get_node, out, depth + 1),
+            _ => {}
+        }
+    }
+}
+
+/// Concatenate the text of a node's descendants.
+fn descendant_text<N, F>(node: &N, get_node: F, depth: usize) -> String
+where
+    N: LayoutDomNode,
+    F: Copy + Fn(u32) -> Option<N>,
+{
+    if depth > 8 {
+        return String::new();
+    }
+    let mut text = node.text_content().unwrap_or_default().to_string();
+    for child_id in node.children_ids() {
+        if let Some(child) = get_node(child_id) {
+            text.push_str(&descendant_text(&child, get_node, depth + 1));
+        }
+    }
+    text
+}
+
+/// The label a closed `<select>` shows.
+///
+/// The explicitly selected option, or the first one — which is what a browser
+/// shows for a `<select>` with no `selected` attribute anywhere.
+pub fn selected_option_label(options: &[(u32, String, bool)]) -> Option<String> {
+    options
+        .iter()
+        .find(|(_, _, selected)| *selected)
+        .or_else(|| options.first())
+        .map(|(_, label, _)| label.clone())
+}
+
+/// Apply the intrinsic text and default size of a form control.
+///
+/// Shared by both layout-building paths so the controls cannot drift apart
+/// between them.
+fn apply_form_control_defaults<N, F>(tag: &str, node: &N, layout_node: &mut LayoutNode, get_node: F)
+where
+    N: LayoutDomNode,
+    F: Copy + Fn(u32) -> Option<N>,
+{
+    match tag {
+        "input" | "textarea" => {
+            let val = node
+                .get_attr("value")
+                .or_else(|| node.get_attr("placeholder"));
+            if let Some(t) = val {
+                if !t.is_empty() {
+                    layout_node.text = Some(t);
+                }
+            }
+            if layout_node.explicit_width.is_none() {
+                let default_w = if tag == "textarea" { 240.0 } else { 160.0 };
+                layout_node.explicit_width = Some(default_w);
+                layout_node.rect.width = default_w;
+            }
+            if layout_node.explicit_height.is_none() {
+                let default_h = if tag == "textarea" { 36.0 } else { 24.0 };
+                layout_node.explicit_height = Some(default_h);
+                layout_node.rect.height = default_h;
+            }
+        }
+        "select" => {
+            // The control shows one option; the rest are data. `<option>` is
+            // `display: none` in the UA sheet, so nothing else paints them.
+            let options = select_options(node, get_node);
+            if let Some(label) = selected_option_label(&options) {
+                if !label.is_empty() {
+                    layout_node.text = Some(label);
+                }
+            }
+            if layout_node.explicit_height.is_none() {
+                layout_node.explicit_height = Some(24.0);
+                layout_node.rect.height = 24.0;
+            }
+            // A browser sizes a select to its widest option so the box does not
+            // resize as the choice changes. We size to the selected label —
+            // shrink-to-fit measures that — with a floor so a short or empty
+            // option still looks like a control.
+            if layout_node.explicit_width.is_none() {
+                layout_node.min_width = Some(layout_node.min_width.unwrap_or(0.0).max(64.0));
+            }
+        }
+        "button" => {
+            if layout_node.explicit_height.is_none() {
+                layout_node.explicit_height = Some(24.0);
+                layout_node.rect.height = 24.0;
+            }
+        }
+        "br" => layout_node.is_line_break = true,
+        _ => {}
     }
 }
 

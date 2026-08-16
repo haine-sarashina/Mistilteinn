@@ -199,6 +199,30 @@ impl Page {
         self.recompute_with_hover(&[]);
     }
 
+    /// The options of a `<select>`, as (dom id, label, selected).
+    pub fn select_options(&self, select_id: u32) -> Vec<(u32, String, bool)> {
+        let get_node = |id: u32| self.arena.get(DomHandle(NodeId::from_raw(id)));
+        match get_node(select_id) {
+            Some(node) => crate::layout::select_options(&node, get_node),
+            None => Vec::new(),
+        }
+    }
+
+    /// Choose an option of a `<select>` and relayout.
+    ///
+    /// `selected` is an attribute rather than a separate piece of state, so the
+    /// change survives the layout rebuild the same way a typed input value does.
+    pub fn select_option_and_recompute(&mut self, select_id: u32, option_id: u32) {
+        for (id, _, _) in self.select_options(select_id) {
+            if id == option_id {
+                self.arena.set_attribute(id, "selected", "selected");
+            } else {
+                self.arena.remove_attribute(id, "selected");
+            }
+        }
+        self.recompute_with_hover(&[]);
+    }
+
     /// Estimate the memory footprint of this page's data structures.
     ///
     /// Pass the composite buffer size (in bytes) so the profiler can include it.
@@ -406,6 +430,95 @@ mod tests {
         assert_eq!(deco.background_size, css::BackgroundSize::Cover);
         assert_eq!(deco.background_repeat, css::BackgroundRepeat::NoRepeat);
         assert_eq!(deco.background_color, Some([238, 238, 238, 255]));
+    }
+
+    /// A page with one `<select>` and the given option markup.
+    fn select_page(options: &str) -> Page {
+        Page::new(
+            &format!("<html><body><select id='s'>{options}</select></body></html>"),
+            "",
+            800.0,
+            600.0,
+        )
+    }
+
+    fn select_id(page: &Page) -> u32 {
+        page.arena
+            .find_by_id("s")
+            .expect("the select is in the DOM")
+    }
+
+    #[test]
+    fn a_select_shows_only_its_selected_option() {
+        // Without the UA `option { display: none }` every label pours into the
+        // page as flow content.
+        let page =
+            select_page("<option>Red</option><option selected>Green</option><option>Blue</option>");
+
+        let texts: Vec<String> = crate::layout::collect_text_nodes(&page.layout_root)
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        assert_eq!(texts, vec!["Green".to_string()]);
+    }
+
+    #[test]
+    fn a_select_with_no_selected_attribute_shows_the_first_option() {
+        let page = select_page("<option>First</option><option>Second</option>");
+        let texts: Vec<String> = crate::layout::collect_text_nodes(&page.layout_root)
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        assert_eq!(texts, vec!["First".to_string()]);
+    }
+
+    #[test]
+    fn select_options_are_listed_with_their_state() {
+        let page = select_page("<option>A</option><option selected>B</option>");
+        let options = page.select_options(select_id(&page));
+
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].1, "A");
+        assert!(!options[0].2);
+        assert_eq!(options[1].1, "B");
+        assert!(options[1].2, "the marked option reports as selected");
+    }
+
+    #[test]
+    fn options_inside_an_optgroup_are_found() {
+        let page = select_page(
+            "<optgroup label='Warm'><option>Red</option></optgroup>\
+             <optgroup label='Cool'><option>Blue</option></optgroup>",
+        );
+        let labels: Vec<String> = page
+            .select_options(select_id(&page))
+            .into_iter()
+            .map(|(_, label, _)| label)
+            .collect();
+        assert_eq!(labels, vec!["Red".to_string(), "Blue".to_string()]);
+    }
+
+    #[test]
+    fn choosing_an_option_moves_the_selection_and_relayouts() {
+        let mut page = select_page("<option>A</option><option selected>B</option>");
+        let sid = select_id(&page);
+        let first = page.select_options(sid)[0].0;
+
+        page.select_option_and_recompute(sid, first);
+
+        let options = page.select_options(sid);
+        assert!(options[0].2, "the clicked option is now selected");
+        assert!(!options[1].2, "the previous selection was cleared");
+
+        let texts: Vec<String> = crate::layout::collect_text_nodes(&page.layout_root)
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["A".to_string()],
+            "the control shows the new label"
+        );
     }
 
     #[test]

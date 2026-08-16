@@ -54,6 +54,8 @@ pub struct MistilteinnApp {
     address_cursor: usize,
     /// The DOM node ID of the focused page <input> / <textarea>, if any.
     focused_page_input: Option<u32>,
+    /// The DOM node ID of the `<select>` whose option list is open, if any.
+    open_select: Option<u32>,
     /// Whether the user is actively dragging the scrollbar thumb.
     is_dragging_scrollbar: bool,
     /// The cursor Y position when scrollbar dragging started.
@@ -97,6 +99,55 @@ impl HitTestResult {
             HitTestResult::TabButton(id) => Some(id),
             _ => None,
         }
+    }
+}
+
+/// Height of one row in an open `<select>` list.
+const SELECT_OPTION_HEIGHT: f32 = 20.0;
+
+/// The most rows an open `<select>` shows before it stops growing.
+const SELECT_MAX_VISIBLE_OPTIONS: usize = 12;
+
+/// Where an open `<select>`'s option list is drawn, in screen coordinates.
+///
+/// The list hangs below the control and is at least as wide as it. A long list
+/// is capped rather than running off the window; the options past the cap are
+/// simply not reachable yet, which is better than drawing over the whole page.
+fn select_popup_geometry(
+    select_x: f32,
+    select_y: f32,
+    select_width: f32,
+    select_height: f32,
+    option_count: usize,
+) -> crate::layout::Rect {
+    let visible = option_count.min(SELECT_MAX_VISIBLE_OPTIONS);
+    crate::layout::Rect::new(
+        select_x,
+        select_y + select_height,
+        select_width.max(64.0),
+        visible as f32 * SELECT_OPTION_HEIGHT + 2.0,
+    )
+}
+
+/// Which option row a click at `y` lands on, if any.
+fn select_option_at(
+    popup: &crate::layout::Rect,
+    x: f32,
+    y: f32,
+    option_count: usize,
+) -> Option<usize> {
+    if x < popup.x || x > popup.right() || y < popup.y || y > popup.bottom() {
+        return None;
+    }
+    let index = ((y - popup.y - 1.0) / SELECT_OPTION_HEIGHT).floor();
+    if index < 0.0 {
+        return None;
+    }
+    let index = index as usize;
+    if index < option_count.min(SELECT_MAX_VISIBLE_OPTIONS) {
+        Some(index)
+    } else {
+        None
     }
 }
 
@@ -871,6 +922,93 @@ impl MistilteinnApp {
             }
         }
 
+        // Draw the drop arrow on every <select>, and the option list of the one
+        // that is open. Both go on top of the page, which is where a dropdown
+        // belongs regardless of what the page's own stacking order says.
+        let to_screen = |x: f32, y: f32| {
+            (
+                x - scroll_offset.0 + TAB_BAR_WIDTH as f32,
+                y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32,
+            )
+        };
+        for select in crate::layout::collect_select_boxes(&page.layout_root) {
+            let (sx, sy) = to_screen(select.x, select.y);
+            crate::render::draw_select_arrow(
+                &mut composite_buffer,
+                win_w,
+                win_h,
+                sx,
+                sy,
+                select.width,
+                select.height,
+            );
+        }
+
+        if let Some(open_id) = self.open_select {
+            if let Some(rect) = find_layout_rect_by_dom_id(&page.layout_root, open_id) {
+                let options = page.select_options(open_id);
+                let (sx, sy) = to_screen(rect.x, rect.y);
+                let popup = select_popup_geometry(sx, sy, rect.width, rect.height, options.len());
+
+                crate::render::draw_solid_rect(
+                    &mut composite_buffer,
+                    win_w,
+                    win_h,
+                    popup.x,
+                    popup.y,
+                    popup.width,
+                    popup.height,
+                    [255, 255, 255, 255],
+                );
+                crate::render::draw_rect_borders(
+                    &mut composite_buffer,
+                    win_w,
+                    win_h,
+                    popup.x,
+                    popup.y,
+                    popup.width,
+                    popup.height,
+                    [1.0; 4],
+                    [[118, 118, 118, 255]; 4],
+                    [crate::css::BorderStyle::Solid; 4],
+                );
+
+                for (i, (_, label, selected)) in options.iter().enumerate() {
+                    let row_y = popup.y + 1.0 + i as f32 * SELECT_OPTION_HEIGHT;
+                    if *selected {
+                        crate::render::draw_solid_rect(
+                            &mut composite_buffer,
+                            win_w,
+                            win_h,
+                            popup.x + 1.0,
+                            row_y,
+                            popup.width - 2.0,
+                            SELECT_OPTION_HEIGHT,
+                            [0, 120, 215, 255],
+                        );
+                    }
+                    let color = if *selected {
+                        [1.0, 1.0, 1.0, 1.0]
+                    } else {
+                        [0.0, 0.0, 0.0, 1.0]
+                    };
+                    text_renderer.rasterize_to_bitmap_styled(
+                        label,
+                        13.0,
+                        crate::css::DEFAULT_FONT_FAMILY,
+                        color,
+                        popup.x + 8.0,
+                        row_y + 3.0,
+                        popup.width - 16.0,
+                        crate::css::TextStyleFlags::default(),
+                        &mut composite_buffer,
+                        win_w,
+                        win_h,
+                    );
+                }
+            }
+        }
+
         // CRITICAL CLIPPING: Clear any page content (text/images) that overflowed into
         // the left tab bar (x < TAB_BAR_WIDTH) or top address bar (y < ADDRESS_BAR_HEIGHT)
         for py in 0..win_h {
@@ -1470,6 +1608,28 @@ fn find_link_or_input_at_dom_id(
     (clicked_input, clicked_href)
 }
 
+/// Walk up from `dom_id` looking for an enclosing `<select>`.
+///
+/// The hit test lands on whichever box holds the label text, which is the
+/// select itself for a closed control — but going up costs nothing and covers
+/// markup that wraps the label.
+fn find_select_at_dom_id(arena: &crate::html::DomArena, dom_id: u32) -> Option<u32> {
+    let mut curr = Some(crate::html::NodeId::from_raw(dom_id));
+    while let Some(nid) = curr {
+        let node = arena.get(crate::html::DomHandle(nid))?;
+        let tag = node
+            .tag_name()
+            .map(|t| t.to_string())
+            .unwrap_or_default()
+            .to_lowercase();
+        if tag == "select" {
+            return Some(nid.index() as u32);
+        }
+        curr = node.parent;
+    }
+    None
+}
+
 /// Recursively finds the first `<input>` or `<textarea>` in a DOM subtree.
 fn find_first_input_in_subtree(
     arena: &crate::html::DomArena,
@@ -1905,6 +2065,51 @@ impl MistilteinnApp {
         }
     }
 
+    /// Handle a click while a `<select>`'s option list is open.
+    ///
+    /// Returns whether the click was consumed. An open list swallows the next
+    /// click wherever it lands: inside it to choose, outside it to dismiss —
+    /// which is what a dropdown does everywhere else.
+    fn handle_open_select_click(&mut self, cx: f32, cy: f32) -> bool {
+        let Some(open_id) = self.open_select else {
+            return false;
+        };
+        self.open_select = None;
+
+        // Resolve what was hit before borrowing the page mutably.
+        let scroll = self
+            .tab_manager
+            .get_active_tab_scroll()
+            .unwrap_or((0.0, 0.0));
+        let hit = self.tab_manager.get_active_tab_page().and_then(|page| {
+            let rect = find_layout_rect_by_dom_id(&page.layout_root, open_id)?;
+            let options = page.select_options(open_id);
+            let popup = select_popup_geometry(
+                rect.x - scroll.0 + TAB_BAR_WIDTH as f32,
+                rect.y - scroll.1 + ADDRESS_BAR_HEIGHT as f32,
+                rect.width,
+                rect.height,
+                options.len(),
+            );
+            let index = select_option_at(&popup, cx, cy, options.len())?;
+            options.get(index).map(|(id, _, _)| *id)
+        });
+
+        if let Some(option_id) = hit {
+            if let Some(tab) = self.tab_manager.active_tab_mut() {
+                if let Some(ref mut page) = tab.page {
+                    page.select_option_and_recompute(open_id, option_id);
+                }
+            }
+        }
+
+        self.recompose();
+        if let Some(ref renderer) = self.renderer {
+            renderer.window().request_redraw();
+        }
+        true
+    }
+
     /// Sets the winit window cursor icon from a computed CSS `cursor`.
     #[allow(deprecated)]
     fn set_winit_cursor(renderer: Option<&Renderer>, cursor: crate::css::Cursor) {
@@ -2172,6 +2377,12 @@ impl ApplicationHandler for MistilteinnApp {
                                         self.is_address_focused = false;
                                     }
 
+                                    // An open <select> list takes the click first — it
+                                    // paints above the page, so it must hit-test above it.
+                                    if self.handle_open_select_click(cx, cy) {
+                                        return;
+                                    }
+
                                     // Check page content area for input focus or link click
                                     if self.is_in_content_area(cx, cy) {
                                         let mut link_to_navigate: Option<String> = None;
@@ -2190,6 +2401,13 @@ impl ApplicationHandler for MistilteinnApp {
                                                     content_x,
                                                     content_y,
                                                 );
+
+                                                // A <select> swallows the click: it opens
+                                                // its list rather than focusing anything.
+                                                let clicked_select =
+                                                    dom_path.iter().rev().find_map(|&node_id| {
+                                                        find_select_at_dom_id(&page.arena, node_id)
+                                                    });
 
                                                 let mut clicked_input = None;
                                                 let mut clicked_href: Option<String> = None;
@@ -2211,7 +2429,10 @@ impl ApplicationHandler for MistilteinnApp {
                                                         break;
                                                     }
                                                 }
-                                                if clicked_input.is_none() {
+                                                if clicked_select.is_some() {
+                                                    clicked_input = None;
+                                                    clicked_href = None;
+                                                } else if clicked_input.is_none() {
                                                     clicked_input = find_input_layout_at_pos(
                                                         &page.layout_root,
                                                         content_x,
@@ -2219,6 +2440,7 @@ impl ApplicationHandler for MistilteinnApp {
                                                     );
                                                 }
                                                 self.focused_page_input = clicked_input;
+                                                self.open_select = clicked_select;
 
                                                 if let Some(href) = clicked_href {
                                                     let href_trimmed = href.trim();
@@ -2420,6 +2642,11 @@ impl ApplicationHandler for MistilteinnApp {
                             .map(|interaction| match interaction {
                                 crate::layout::InteractionType::Link => crate::css::Cursor::Pointer,
                                 crate::layout::InteractionType::Input => crate::css::Cursor::Text,
+                                // A select is not a text field; browsers keep
+                                // the arrow over it.
+                                crate::layout::InteractionType::Select => {
+                                    crate::css::Cursor::Default
+                                }
                                 _ => crate::css::Cursor::Auto,
                             })
                             .unwrap_or(crate::css::Cursor::Auto);
@@ -2751,6 +2978,7 @@ pub fn run(start_url: Option<String>) {
         is_address_focused: false,
         address_cursor: 0,
         focused_page_input: None,
+        open_select: None,
         is_dragging_scrollbar: false,
         scrollbar_drag_start_y: 0.0,
         scrollbar_drag_start_scroll_y: 0.0,
@@ -2780,6 +3008,7 @@ mod tests {
             is_address_focused: false,
             address_cursor: 0,
             focused_page_input: None,
+            open_select: None,
             is_dragging_scrollbar: false,
             scrollbar_drag_start_y: 0.0,
             scrollbar_drag_start_scroll_y: 0.0,
@@ -2806,6 +3035,7 @@ mod tests {
             is_address_focused: false,
             address_cursor: 0,
             focused_page_input: None,
+            open_select: None,
             is_dragging_scrollbar: false,
             scrollbar_drag_start_y: 0.0,
             scrollbar_drag_start_scroll_y: 0.0,
@@ -2859,6 +3089,51 @@ mod tests {
         assert!(y.is_some(), "Element with id='target' should be found");
         assert_eq!(
             find_element_y_by_id(&page.layout_root, &page.arena, "nonexistent"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_select_list_hangs_below_the_control() {
+        let popup = select_popup_geometry(100.0, 50.0, 120.0, 24.0, 3);
+        assert_eq!(popup.x, 100.0);
+        assert_eq!(popup.y, 74.0, "directly under the control");
+        assert_eq!(popup.width, 120.0, "at least as wide as the control");
+        assert_eq!(popup.height, 3.0 * SELECT_OPTION_HEIGHT + 2.0);
+    }
+
+    #[test]
+    fn a_long_select_list_stops_growing() {
+        // A hundred options must not paint over the whole window.
+        let popup = select_popup_geometry(0.0, 0.0, 100.0, 24.0, 100);
+        assert_eq!(
+            popup.height,
+            SELECT_MAX_VISIBLE_OPTIONS as f32 * SELECT_OPTION_HEIGHT + 2.0
+        );
+    }
+
+    #[test]
+    fn clicks_map_to_the_option_row_under_them() {
+        let popup = select_popup_geometry(100.0, 50.0, 120.0, 24.0, 3);
+
+        assert_eq!(select_option_at(&popup, 110.0, popup.y + 2.0, 3), Some(0));
+        assert_eq!(
+            select_option_at(&popup, 110.0, popup.y + 1.0 + SELECT_OPTION_HEIGHT + 2.0, 3),
+            Some(1)
+        );
+        assert_eq!(
+            select_option_at(&popup, 110.0, popup.y + popup.height - 2.0, 3),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn clicks_outside_the_list_select_nothing() {
+        let popup = select_popup_geometry(100.0, 50.0, 120.0, 24.0, 3);
+        assert_eq!(select_option_at(&popup, 50.0, popup.y + 2.0, 3), None);
+        assert_eq!(select_option_at(&popup, 110.0, popup.y - 5.0, 3), None);
+        assert_eq!(
+            select_option_at(&popup, 110.0, popup.y + popup.height + 5.0, 3),
             None
         );
     }

@@ -3138,6 +3138,16 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
             "textarea",
             "display: inline-block; padding: 4px 8px; border: 1px solid #767676; border-radius: 2px; background-color: #ffffff",
         ),
+        // The extra right padding is room for the drop arrow the renderer draws.
+        (
+            "select",
+            "display: inline-block; padding: 4px 22px 4px 8px; border: 1px solid #767676; border-radius: 2px; background-color: #ffffff; color: #000000",
+        ),
+        // Options are the select's data, not flow content. Without this every
+        // option's text pours into the page around the control.
+        ("option", "display: none"),
+        ("optgroup", "display: none"),
+        ("label", "display: inline"),
         ("head", "display: none"),
         ("script", "display: none"),
         ("style", "display: none"),

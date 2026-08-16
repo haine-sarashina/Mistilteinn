@@ -3580,6 +3580,173 @@ pub struct VisualDecoration {
     pub border_radius: f32,
 }
 
+// ------ Paint order ------
+
+/// One thing to paint, in the order CSS says to paint it.
+#[derive(Clone, Debug)]
+pub enum PaintItem {
+    /// The background colour, background image and borders of a single box.
+    Decoration(VisualDecoration),
+    Text(TextInfo),
+    Image(ImageInfo),
+}
+
+/// Whether this box starts a new stacking context.
+///
+/// Only the positioned-with-a-z-index case is modelled; `opacity`, `transform`,
+/// `filter` and friends also do so in a real browser, but none of them are
+/// implemented here yet.
+fn establishes_stacking_context(node: &LayoutNode) -> bool {
+    node.position != PositionType::Static && node.z_index.is_some()
+}
+
+/// Whether this box takes part in the positioned layers rather than the
+/// in-flow ones.
+fn is_positioned(node: &LayoutNode) -> bool {
+    node.position != PositionType::Static
+}
+
+/// The boxes a stacking context walk descends into: normal flow first, then
+/// the absolutely positioned boxes lifted out of it.
+fn child_boxes(node: &LayoutNode) -> impl Iterator<Item = &LayoutNode> {
+    node.children.iter().chain(node.absolute_children.iter())
+}
+
+/// The seven layers of CSS 2.1 Appendix E, gathered before being flattened.
+#[derive(Default)]
+struct StackingLayers<'a> {
+    /// Layer 2: child stacking contexts with a negative z-index.
+    negative: Vec<&'a LayoutNode>,
+    /// Layer 3: backgrounds and borders of in-flow, non-inline descendants.
+    block_backgrounds: Vec<PaintItem>,
+    /// Layer 4: non-positioned floats, each painted as a unit.
+    floats: Vec<PaintItem>,
+    /// Layer 5: in-flow inline content — text, replaced elements, inline boxes.
+    inline_content: Vec<PaintItem>,
+    /// Layer 6: positioned descendants that left z-index at `auto`.
+    auto_positioned: Vec<&'a LayoutNode>,
+    /// Layer 7: child stacking contexts with a positive z-index.
+    positive: Vec<&'a LayoutNode>,
+}
+
+/// Build the page's paint order.
+///
+/// Implements the CSS 2.1 Appendix E algorithm. Within each stacking context
+/// boxes are painted in seven layers: the context's own background and border,
+/// then negative-z children, block backgrounds, floats, inline content,
+/// positioned boxes with `z-index: auto`, and finally positive-z children.
+///
+/// This is what makes a `z-index` local to its context — a child of a
+/// positioned ancestor cannot paint above that ancestor's sibling, however
+/// large its z-index. It is also what puts a positioned box's background above
+/// earlier text instead of below all of it.
+///
+/// One simplification: a positioned box that left `z-index` at `auto` does not
+/// strictly establish a stacking context, so a descendant's z-index should be
+/// able to escape it. We paint its subtree as a unit instead. The difference
+/// only shows when such a descendant needs to sort against boxes outside the
+/// ancestor, which is rare in practice.
+pub fn build_display_list(root: &LayoutNode) -> Vec<PaintItem> {
+    let mut out = Vec::new();
+    paint_stacking_context(root, &mut out);
+    out
+}
+
+fn paint_stacking_context(root: &LayoutNode, out: &mut Vec<PaintItem>) {
+    if matches!(root.display, DisplayType::None) {
+        return;
+    }
+
+    // Layer 1: the context root's own background and borders.
+    out.extend(collect_own_decoration(root).map(PaintItem::Decoration));
+
+    let mut layers = StackingLayers::default();
+    // The root's own content belongs to the in-flow content of this context.
+    layers
+        .inline_content
+        .extend(collect_own_text(root).into_iter().map(PaintItem::Text));
+    layers
+        .inline_content
+        .extend(collect_own_image(root).map(PaintItem::Image));
+
+    for child in child_boxes(root) {
+        collect_into_layers(child, &mut layers);
+    }
+
+    // Lowest z-index first, document order breaking ties — `sort_by_key` is
+    // stable, so equal keys keep the order they were collected in.
+    layers.negative.sort_by_key(|n| n.z_index.unwrap_or(0));
+    layers.positive.sort_by_key(|n| n.z_index.unwrap_or(0));
+
+    for node in layers.negative {
+        paint_stacking_context(node, out);
+    }
+    out.extend(layers.block_backgrounds);
+    out.extend(layers.floats);
+    out.extend(layers.inline_content);
+    for node in layers.auto_positioned {
+        paint_stacking_context(node, out);
+    }
+    for node in layers.positive {
+        paint_stacking_context(node, out);
+    }
+}
+
+/// Sort a non-root box of the current stacking context into its layer, and
+/// recurse into the parts of its subtree that belong to the same context.
+fn collect_into_layers<'a>(node: &'a LayoutNode, layers: &mut StackingLayers<'a>) {
+    if matches!(node.display, DisplayType::None) {
+        return;
+    }
+
+    if is_positioned(node) {
+        let z = if establishes_stacking_context(node) {
+            node.z_index.unwrap_or(0)
+        } else {
+            0
+        };
+        if z < 0 {
+            layers.negative.push(node);
+        } else if z > 0 {
+            layers.positive.push(node);
+        } else {
+            layers.auto_positioned.push(node);
+        }
+        return;
+    }
+
+    // A float paints its background and its content together, above the block
+    // backgrounds but below the in-flow inline content that wraps around it.
+    if node.float != FloatType::None {
+        let mut float_items = Vec::new();
+        paint_stacking_context(node, &mut float_items);
+        layers.floats.extend(float_items);
+        return;
+    }
+
+    let is_inline_level = matches!(
+        node.display,
+        DisplayType::Inline | DisplayType::InlineBlock | DisplayType::InlineFlex
+    );
+    let decoration = collect_own_decoration(node).map(PaintItem::Decoration);
+    if is_inline_level {
+        layers.inline_content.extend(decoration);
+    } else {
+        layers.block_backgrounds.extend(decoration);
+    }
+
+    layers
+        .inline_content
+        .extend(collect_own_text(node).into_iter().map(PaintItem::Text));
+    layers
+        .inline_content
+        .extend(collect_own_image(node).map(PaintItem::Image));
+
+    for child in child_boxes(node) {
+        collect_into_layers(child, layers);
+    }
+}
+
 /// Collect all background and border decorations from the layout tree.
 pub fn collect_decorations(node: &LayoutNode) -> Vec<VisualDecoration> {
     let mut decorations = Vec::new();
@@ -3587,31 +3754,38 @@ pub fn collect_decorations(node: &LayoutNode) -> Vec<VisualDecoration> {
     decorations
 }
 
-fn collect_decorations_internal(node: &LayoutNode, out: &mut Vec<VisualDecoration>) {
+/// This box's own background and borders, if it paints any.
+pub fn collect_own_decoration(node: &LayoutNode) -> Option<VisualDecoration> {
     let has_bg = node.background_color.is_some() || node.background_image.is_some();
     // `node.border` is already the *used* width, so a side with no style is 0.
     let has_border = (0..4).any(|i| node.border[i] > 0.0 && node.border_style[i].is_visible());
-    if (has_bg || has_border)
-        && node.visibility.is_painted()
-        && node.rect.width >= 2.0
-        && node.rect.height >= 2.0
+    if !(has_bg || has_border)
+        || !node.visibility.is_painted()
+        || node.rect.width < 2.0
+        || node.rect.height < 2.0
     {
-        out.push(VisualDecoration {
-            x: node.rect.x,
-            y: node.rect.y,
-            width: node.rect.width,
-            height: node.rect.height,
-            background_color: node.background_color,
-            background_image: node.background_image.clone(),
-            background_size: node.background_size,
-            background_position: node.background_position,
-            background_repeat: node.background_repeat,
-            border_width: node.border,
-            border_color: node.border_color,
-            border_style: node.border_style,
-            border_radius: node.border_radius,
-        });
+        return None;
     }
+
+    Some(VisualDecoration {
+        x: node.rect.x,
+        y: node.rect.y,
+        width: node.rect.width,
+        height: node.rect.height,
+        background_color: node.background_color,
+        background_image: node.background_image.clone(),
+        background_size: node.background_size,
+        background_position: node.background_position,
+        background_repeat: node.background_repeat,
+        border_width: node.border,
+        border_color: node.border_color,
+        border_style: node.border_style,
+        border_radius: node.border_radius,
+    })
+}
+
+fn collect_decorations_internal(node: &LayoutNode, out: &mut Vec<VisualDecoration>) {
+    out.extend(collect_own_decoration(node));
 
     for child in &node.children {
         collect_decorations_internal(child, out);
@@ -3652,6 +3826,39 @@ pub struct TextInfo {
 /// When `line_boxes` is None, falls back to the recursive tree walk for
 /// block-level text nodes.
 pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
+    let mut texts = collect_own_text(node);
+
+    for child in text_recursion_children(node) {
+        texts.extend(collect_text_nodes(child));
+    }
+
+    // Also collect from absolutely positioned children
+    for abs_child in &node.absolute_children {
+        texts.extend(collect_text_nodes(abs_child));
+    }
+
+    texts
+}
+
+/// The children whose text this node's own line boxes have *not* already
+/// accounted for.
+///
+/// A node with line boxes has flattened its inline descendants into runs, so
+/// recursing into those children again would emit every word twice.
+fn text_recursion_children(node: &LayoutNode) -> impl Iterator<Item = &LayoutNode> {
+    let has_line_boxes = node.line_boxes.is_some();
+    node.children.iter().filter(move |child| {
+        !has_line_boxes
+            || (!matches!(
+                child.display,
+                DisplayType::Inline | DisplayType::InlineBlock
+            ) && child.text.is_none())
+    })
+}
+
+/// The text belonging to this box itself — the runs in its own line boxes, or
+/// its own block-level text — without descending into child boxes.
+pub fn collect_own_text(node: &LayoutNode) -> Vec<TextInfo> {
     let mut texts = Vec::new();
 
     // `visibility: hidden` still occupies its layout box, so the subtree keeps
@@ -3712,49 +3919,27 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
                 }
             }
         }
-        // If this node has line_boxes, its direct inline text children are already extracted!
-        // Only recurse into non-inline children (blocks, tables, etc.)
-        for child in &node.children {
-            if !matches!(
-                child.display,
-                DisplayType::Inline | DisplayType::InlineBlock
-            ) && child.text.is_none()
-            {
-                texts.extend(collect_text_nodes(child));
-            }
-        }
-    } else {
-        if let Some(ref text) = node.text {
-            // Fallback: no inline layout was computed, use the block-level approach.
-            if paint_own_text
-                && !text.trim().is_empty()
-                && node.rect.width > 0.0
-                && node.rect.height > 0.0
-            {
-                // Use CSS `color` (foreground) as text color, default to black
-                let color = node.color.unwrap_or([0, 0, 0, 255]);
+    } else if let Some(ref text) = node.text {
+        // Fallback: no inline layout was computed, use the block-level approach.
+        if paint_own_text
+            && !text.trim().is_empty()
+            && node.rect.width > 0.0
+            && node.rect.height > 0.0
+        {
+            // Use CSS `color` (foreground) as text color, default to black
+            let color = node.color.unwrap_or([0, 0, 0, 255]);
 
-                texts.push(TextInfo {
-                    x: node.rect.x,
-                    y: node.rect.y,
-                    width: node.rect.width,
-                    text: node.text_style.transform.apply(text).into_owned(),
-                    color,
-                    font_size: node.font_size,
-                    font_family: crate::css::font_stack_or_default(&node.font_family).to_string(),
-                    text_style: node.text_style,
-                });
-            }
+            texts.push(TextInfo {
+                x: node.rect.x,
+                y: node.rect.y,
+                width: node.rect.width,
+                text: node.text_style.transform.apply(text).into_owned(),
+                color,
+                font_size: node.font_size,
+                font_family: crate::css::font_stack_or_default(&node.font_family).to_string(),
+                text_style: node.text_style,
+            });
         }
-
-        for child in &node.children {
-            texts.extend(collect_text_nodes(child));
-        }
-    }
-
-    // Also collect from absolutely positioned children
-    for abs_child in &node.absolute_children {
-        texts.extend(collect_text_nodes(abs_child));
     }
 
     texts
@@ -3785,22 +3970,26 @@ pub fn collect_image_nodes(node: &LayoutNode) -> Vec<ImageInfo> {
     images
 }
 
+/// The image this box replaces, if it is a replaced element that paints one.
+pub fn collect_own_image(node: &LayoutNode) -> Option<ImageInfo> {
+    if matches!(node.display, DisplayType::None) || !node.visibility.is_painted() {
+        return None;
+    }
+    node.image_src.as_ref().map(|src| ImageInfo {
+        x: node.rect.x,
+        y: node.rect.y,
+        width: node.rect.width,
+        height: node.rect.height,
+        src: src.clone(),
+    })
+}
+
 fn collect_image_nodes_inner(node: &LayoutNode, images: &mut Vec<ImageInfo>) {
     if matches!(node.display, DisplayType::None) {
         return;
     }
 
-    if let Some(src) = &node.image_src
-        && node.visibility.is_painted()
-    {
-        images.push(ImageInfo {
-            x: node.rect.x,
-            y: node.rect.y,
-            width: node.rect.width,
-            height: node.rect.height,
-            src: src.clone(),
-        });
-    }
+    images.extend(collect_own_image(node));
 
     for child in &node.children {
         collect_image_nodes_inner(child, images);
@@ -5147,6 +5336,162 @@ mod tests {
             .map(|c| c.text.as_deref().unwrap())
             .collect();
         assert_eq!(order, vec!["auto", "first", "second"]);
+    }
+
+    /// The text of each paint item, in paint order, for readable assertions.
+    fn paint_order(root: &LayoutNode) -> Vec<String> {
+        build_display_list(root)
+            .into_iter()
+            .filter_map(|item| match item {
+                PaintItem::Text(t) => Some(t.text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A block with text, laid out at the given rect.
+    fn text_block(text: &str, y: f32) -> LayoutNode {
+        let mut n = LayoutNode::new(Rect::new(0.0, y, 100.0, 50.0));
+        n.text = Some(text.to_string());
+        n
+    }
+
+    #[test]
+    fn positioned_boxes_paint_above_in_flow_text() {
+        // The old three-pass painter drew every background before any text, so
+        // an overlay's background landed underneath the text it should cover.
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(text_block("flow text", 0.0));
+
+        let mut overlay = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 100.0));
+        overlay.position = PositionType::Absolute;
+        overlay.background_color = Some([255, 255, 255, 255]);
+        root.add_child(overlay);
+        extract_absolute_children(&mut root);
+
+        let list = build_display_list(&root);
+        let text_at = list
+            .iter()
+            .position(|i| matches!(i, PaintItem::Text(t) if t.text == "flow text"))
+            .unwrap();
+        let overlay_at = list
+            .iter()
+            .position(|i| matches!(i, PaintItem::Decoration(_)))
+            .unwrap();
+        assert!(
+            overlay_at > text_at,
+            "the positioned overlay must paint after the in-flow text"
+        );
+    }
+
+    #[test]
+    fn z_index_is_local_to_its_stacking_context() {
+        // A child of a low-z stacking context cannot escape above a sibling
+        // context with a higher z-index, however large its own z-index.
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut low = abs_child(Some(1), "low-context");
+        let mut escapee = abs_child(Some(999), "trapped-child");
+        escapee.text = Some("trapped-child".to_string());
+        low.add_child(escapee);
+
+        let high = abs_child(Some(2), "high-context");
+
+        root.add_child(low);
+        root.add_child(high);
+        extract_absolute_children(&mut root);
+        for child in &mut root.absolute_children {
+            extract_absolute_children(child);
+        }
+
+        let order = paint_order(&root);
+        assert_eq!(
+            order,
+            vec!["low-context", "trapped-child", "high-context"],
+            "z-index: 999 is confined to its parent context"
+        );
+    }
+
+    #[test]
+    fn negative_z_index_paints_below_the_block_backgrounds() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(text_block("in flow", 0.0));
+        root.add_child(abs_child(Some(-1), "behind"));
+        root.add_child(abs_child(Some(1), "in front"));
+        extract_absolute_children(&mut root);
+
+        assert_eq!(
+            paint_order(&root),
+            vec!["behind", "in flow", "in front"],
+            "negative z-index sits below in-flow content, positive above"
+        );
+    }
+
+    #[test]
+    fn floats_paint_between_block_backgrounds_and_inline_content() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+
+        let mut floated = text_block("floated", 0.0);
+        floated.float = FloatType::Left;
+
+        // A block whose background must sit below the float.
+        let mut block = LayoutNode::new(Rect::new(0.0, 0.0, 400.0, 200.0));
+        block.background_color = Some([200, 200, 200, 255]);
+        block.add_child(text_block("wrapping text", 60.0));
+
+        root.add_child(block);
+        root.add_child(floated);
+
+        let list = build_display_list(&root);
+        let block_bg = list
+            .iter()
+            .position(|i| matches!(i, PaintItem::Decoration(_)))
+            .unwrap();
+        let float_text = list
+            .iter()
+            .position(|i| matches!(i, PaintItem::Text(t) if t.text == "floated"))
+            .unwrap();
+        let flow_text = list
+            .iter()
+            .position(|i| matches!(i, PaintItem::Text(t) if t.text == "wrapping text"))
+            .unwrap();
+
+        assert!(block_bg < float_text, "float paints over block backgrounds");
+        assert!(float_text < flow_text, "but under in-flow inline content");
+    }
+
+    #[test]
+    fn display_none_subtrees_never_reach_the_display_list() {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        let mut hidden = text_block("gone", 0.0);
+        hidden.display = DisplayType::None;
+        hidden.add_child(text_block("also gone", 10.0));
+        root.add_child(hidden);
+        root.add_child(text_block("kept", 60.0));
+
+        assert_eq!(paint_order(&root), vec!["kept"]);
+    }
+
+    #[test]
+    fn every_text_run_is_painted_exactly_once() {
+        // The display list walk and the old recursive collector must agree on
+        // what there is to paint — only on the order.
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        let mut container = LayoutNode::new(Rect::new(0.0, 0.0, 400.0, 300.0));
+        container.add_child(text_block("one", 0.0));
+        container.add_child(text_block("two", 50.0));
+        root.add_child(container);
+        root.add_child(abs_child(Some(3), "three"));
+        extract_absolute_children(&mut root);
+
+        let mut from_list = paint_order(&root);
+        let mut from_collector: Vec<String> = collect_text_nodes(&root)
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        from_list.sort();
+        from_collector.sort();
+        assert_eq!(from_list, from_collector);
     }
 
     #[test]

@@ -170,6 +170,11 @@ pub struct LayoutNode {
     pub text: Option<String>,
     /// Background color as RGBA (None = transparent/no background).
     pub background_color: Option<[u8; 4]>,
+    /// `background-image` URL, still relative to the document base.
+    pub background_image: Option<String>,
+    pub background_size: crate::css::BackgroundSize,
+    pub background_position: crate::css::BackgroundPosition,
+    pub background_repeat: crate::css::BackgroundRepeat,
     /// Foreground text color as RGBA (None = not explicitly set, defaults to black).
     pub color: Option<[u8; 4]>,
     /// Flex container properties
@@ -257,6 +262,10 @@ impl LayoutNode {
             children: Vec::new(),
             text: None,
             background_color: None,
+            background_image: None,
+            background_size: crate::css::BackgroundSize::Auto,
+            background_position: crate::css::BackgroundPosition::default(),
+            background_repeat: crate::css::BackgroundRepeat::Repeat,
             color: None,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
@@ -627,6 +636,10 @@ fn build_layout_children<N, F>(
                     layout_node.padding = child_styles.padding;
                     layout_node.margin = child_styles.margin;
                     layout_node.background_color = child_styles.background_color;
+                    layout_node.background_image = child_styles.background_image.clone();
+                    layout_node.background_size = child_styles.background_size;
+                    layout_node.background_position = child_styles.background_position;
+                    layout_node.background_repeat = child_styles.background_repeat;
                     layout_node.color = child_styles.color;
                     layout_node.font_size = child_styles.font_size;
                     layout_node.font_family = child_styles.font_family.clone();
@@ -873,6 +886,10 @@ fn build_layout_children<N, F>(
                     layout_node.padding = child_styles.padding;
                     layout_node.margin = child_styles.margin;
                     layout_node.background_color = child_styles.background_color;
+                    layout_node.background_image = child_styles.background_image.clone();
+                    layout_node.background_size = child_styles.background_size;
+                    layout_node.background_position = child_styles.background_position;
+                    layout_node.background_repeat = child_styles.background_repeat;
                     layout_node.color = child_styles.color;
                     layout_node.font_size = child_styles.font_size;
                     layout_node.font_family = child_styles.font_family.clone();
@@ -3550,6 +3567,11 @@ pub struct VisualDecoration {
     pub width: f32,
     pub height: f32,
     pub background_color: Option<[u8; 4]>,
+    /// `background-image` URL, still relative to the document base.
+    pub background_image: Option<String>,
+    pub background_size: crate::css::BackgroundSize,
+    pub background_position: crate::css::BackgroundPosition,
+    pub background_repeat: crate::css::BackgroundRepeat,
     pub border_width: [f32; 4],
     /// Per-side border colour: [top, right, bottom, left].
     pub border_color: [[u8; 4]; 4],
@@ -3566,7 +3588,7 @@ pub fn collect_decorations(node: &LayoutNode) -> Vec<VisualDecoration> {
 }
 
 fn collect_decorations_internal(node: &LayoutNode, out: &mut Vec<VisualDecoration>) {
-    let has_bg = node.background_color.is_some();
+    let has_bg = node.background_color.is_some() || node.background_image.is_some();
     // `node.border` is already the *used* width, so a side with no style is 0.
     let has_border = (0..4).any(|i| node.border[i] > 0.0 && node.border_style[i].is_visible());
     if (has_bg || has_border)
@@ -3580,6 +3602,10 @@ fn collect_decorations_internal(node: &LayoutNode, out: &mut Vec<VisualDecoratio
             width: node.rect.width,
             height: node.rect.height,
             background_color: node.background_color,
+            background_image: node.background_image.clone(),
+            background_size: node.background_size,
+            background_position: node.background_position,
+            background_repeat: node.background_repeat,
             border_width: node.border,
             border_color: node.border_color,
             border_style: node.border_style,

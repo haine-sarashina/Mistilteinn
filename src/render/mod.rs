@@ -8,7 +8,9 @@
 /// 3. For each frame: clear → draw rectangles → draw text → present
 pub mod text;
 
-use crate::css::BorderStyle;
+use crate::css::{
+    BackgroundLength, BackgroundPosition, BackgroundRepeat, BackgroundSize, BorderStyle,
+};
 
 /// Maximum number of rectangles the GPU render pipeline can handle in a single frame.
 pub const MAX_RECTS: usize = 2048;
@@ -824,6 +826,221 @@ pub fn composite_image_scaled(
     }
 }
 
+/// Resolve `background-size` to the pixel size one tile is drawn at.
+///
+/// Returns `None` when the result would be degenerate (a zero-sized image or
+/// box), which the caller treats as "nothing to paint".
+pub fn background_tile_size(
+    size: BackgroundSize,
+    img_w: f32,
+    img_h: f32,
+    box_w: f32,
+    box_h: f32,
+) -> Option<(f32, f32)> {
+    if img_w <= 0.0 || img_h <= 0.0 || box_w <= 0.0 || box_h <= 0.0 {
+        return None;
+    }
+    let aspect = img_w / img_h;
+
+    let (w, h) = match size {
+        BackgroundSize::Auto => (img_w, img_h),
+        // Cover scales until neither axis leaves a gap; contain until both fit.
+        BackgroundSize::Cover => {
+            let scale = (box_w / img_w).max(box_h / img_h);
+            (img_w * scale, img_h * scale)
+        }
+        BackgroundSize::Contain => {
+            let scale = (box_w / img_w).min(box_h / img_h);
+            (img_w * scale, img_h * scale)
+        }
+        BackgroundSize::Explicit(sw, sh) => {
+            let resolve = |v: BackgroundLength, basis: f32| match v {
+                BackgroundLength::Auto => None,
+                BackgroundLength::Pixels(px) => Some(px),
+                BackgroundLength::Percent(p) => Some(basis * p),
+            };
+            match (resolve(sw, box_w), resolve(sh, box_h)) {
+                (Some(w), Some(h)) => (w, h),
+                // One axis `auto` keeps the image's aspect ratio.
+                (Some(w), None) => (w, w / aspect),
+                (None, Some(h)) => (h * aspect, h),
+                (None, None) => (img_w, img_h),
+            }
+        }
+    };
+
+    if w <= 0.0 || h <= 0.0 {
+        None
+    } else {
+        Some((w, h))
+    }
+}
+
+/// Resolve one axis of `background-position` to a pixel offset from the box's
+/// leading edge.
+///
+/// A percentage aligns *the same point* of the image and the box — 100% puts
+/// the image's right edge on the box's right edge — which is why the basis is
+/// the leftover space rather than the box width.
+pub fn background_position_offset(value: BackgroundLength, box_size: f32, tile_size: f32) -> f32 {
+    match value {
+        BackgroundLength::Auto => 0.0,
+        BackgroundLength::Pixels(px) => px,
+        BackgroundLength::Percent(p) => (box_size - tile_size) * p,
+    }
+}
+
+/// Paint a CSS background image into `dest`, honouring size, position and
+/// repeat, and clipped to the element's box.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_background_image(
+    src_rgba: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    box_x: f32,
+    box_y: f32,
+    box_w: f32,
+    box_h: f32,
+    size: BackgroundSize,
+    position: BackgroundPosition,
+    repeat: BackgroundRepeat,
+) {
+    let Some((tile_w, tile_h)) =
+        background_tile_size(size, src_width as f32, src_height as f32, box_w, box_h)
+    else {
+        return;
+    };
+
+    let origin_x = box_x + background_position_offset(position.x, box_w, tile_w);
+    let origin_y = box_y + background_position_offset(position.y, box_h, tile_h);
+    let (repeat_x, repeat_y) = repeat.axes();
+
+    // Step back to the first tile that is still visible, so a positioned
+    // repeating background fills the box on the near side too.
+    let first = |origin: f32, box_start: f32, tile: f32, repeats: bool| -> f32 {
+        if !repeats || tile <= 0.0 || origin <= box_start {
+            origin
+        } else {
+            origin - ((origin - box_start) / tile).ceil() * tile
+        }
+    };
+    let start_x = first(origin_x, box_x, tile_w, repeat_x);
+    let start_y = first(origin_y, box_y, tile_h, repeat_y);
+
+    // A tile smaller than a pixel would loop forever.
+    if (repeat_x && tile_w < 1.0) || (repeat_y && tile_h < 1.0) {
+        return;
+    }
+
+    let mut y = start_y;
+    loop {
+        let mut x = start_x;
+        loop {
+            composite_image_clipped(
+                src_rgba,
+                src_width,
+                src_height,
+                dest,
+                dest_width,
+                dest_height,
+                x,
+                y,
+                tile_w,
+                tile_h,
+                box_x,
+                box_y,
+                box_w,
+                box_h,
+            );
+            if !repeat_x {
+                break;
+            }
+            x += tile_w;
+            if x >= box_x + box_w {
+                break;
+            }
+        }
+        if !repeat_y {
+            break;
+        }
+        y += tile_h;
+        if y >= box_y + box_h {
+            break;
+        }
+    }
+}
+
+/// Composite a scaled image, discarding anything outside the clip rectangle.
+///
+/// A background tile is positioned relative to the box but must never paint
+/// past its edges, so scaling and clipping have to happen together — the
+/// source pixel is chosen from the tile's full extent even when only part of
+/// that tile lands inside the box.
+#[allow(clippy::too_many_arguments)]
+fn composite_image_clipped(
+    src_rgba: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    tile_x: f32,
+    tile_y: f32,
+    tile_w: f32,
+    tile_h: f32,
+    clip_x: f32,
+    clip_y: f32,
+    clip_w: f32,
+    clip_h: f32,
+) {
+    if src_width == 0 || src_height == 0 || tile_w <= 0.0 || tile_h <= 0.0 {
+        return;
+    }
+
+    let x_start = tile_x.max(clip_x).max(0.0).floor() as i64;
+    let y_start = tile_y.max(clip_y).max(0.0).floor() as i64;
+    let x_end = (tile_x + tile_w)
+        .min(clip_x + clip_w)
+        .min(dest_width as f32)
+        .ceil() as i64;
+    let y_end = (tile_y + tile_h)
+        .min(clip_y + clip_h)
+        .min(dest_height as f32)
+        .ceil() as i64;
+
+    for dy in y_start..y_end {
+        let v = (dy as f32 + 0.5 - tile_y) / tile_h;
+        if !(0.0..1.0).contains(&v) {
+            continue;
+        }
+        let sy = ((v * src_height as f32) as usize).min(src_height as usize - 1);
+
+        for dx in x_start..x_end {
+            let u = (dx as f32 + 0.5 - tile_x) / tile_w;
+            if !(0.0..1.0).contains(&u) {
+                continue;
+            }
+            let sx = ((u * src_width as f32) as usize).min(src_width as usize - 1);
+
+            let src_idx = (sy * src_width as usize + sx) * 4;
+            let dst_idx = (dy as usize * dest_width as usize + dx as usize) * 4;
+            if src_idx + 3 >= src_rgba.len() || dst_idx + 3 >= dest.len() {
+                continue;
+            }
+            let color = [
+                src_rgba[src_idx],
+                src_rgba[src_idx + 1],
+                src_rgba[src_idx + 2],
+                src_rgba[src_idx + 3],
+            ];
+            blend_pixel(dest, dst_idx, color, 1.0);
+        }
+    }
+}
+
 /// Helper to blend an RGBA pixel into destination buffer.
 #[inline]
 fn blend_pixel(dest: &mut [u8], dst_idx: usize, color: [u8; 4], alpha_factor: f32) {
@@ -1299,6 +1516,199 @@ mod tests {
     /// Whether the top-edge pixel at `x` was painted.
     fn top_edge_painted(dest: &[u8], stride: usize, x: usize) -> bool {
         dest[x * 4 + 3] != 0
+    }
+
+    #[test]
+    fn background_size_cover_fills_the_box_contain_fits_inside_it() {
+        // A 100x50 image in a 200x200 box.
+        let cover = background_tile_size(BackgroundSize::Cover, 100.0, 50.0, 200.0, 200.0).unwrap();
+        assert_eq!(cover, (400.0, 200.0), "cover leaves no gap on either axis");
+
+        let contain =
+            background_tile_size(BackgroundSize::Contain, 100.0, 50.0, 200.0, 200.0).unwrap();
+        assert_eq!(contain, (200.0, 100.0), "contain fits entirely inside");
+    }
+
+    #[test]
+    fn background_size_auto_axis_keeps_the_aspect_ratio() {
+        let size = BackgroundSize::Explicit(BackgroundLength::Pixels(50.0), BackgroundLength::Auto);
+        let (w, h) = background_tile_size(size, 100.0, 50.0, 200.0, 200.0).unwrap();
+        assert_eq!((w, h), (50.0, 25.0));
+
+        // Percentages resolve against the box, not the image.
+        let pct = BackgroundSize::Explicit(
+            BackgroundLength::Percent(0.5),
+            BackgroundLength::Percent(0.25),
+        );
+        assert_eq!(
+            background_tile_size(pct, 100.0, 50.0, 200.0, 400.0).unwrap(),
+            (100.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn background_position_percent_aligns_matching_edges() {
+        // 100% must put the image's right edge on the box's right edge, so the
+        // basis is the leftover space rather than the box width.
+        assert_eq!(
+            background_position_offset(BackgroundLength::Percent(1.0), 200.0, 50.0),
+            150.0
+        );
+        assert_eq!(
+            background_position_offset(BackgroundLength::Percent(0.5), 200.0, 50.0),
+            75.0
+        );
+        assert_eq!(
+            background_position_offset(BackgroundLength::Pixels(12.0), 200.0, 50.0),
+            12.0
+        );
+    }
+
+    /// A 2x2 fully opaque image: red, green / blue, white.
+    fn tiny_image() -> Vec<u8> {
+        vec![
+            255, 0, 0, 255, // (0,0) red
+            0, 255, 0, 255, // (1,0) green
+            0, 0, 255, 255, // (0,1) blue
+            255, 255, 255, 255, // (1,1) white
+        ]
+    }
+
+    #[test]
+    fn no_repeat_background_paints_one_tile_only() {
+        let mut dest = vec![0u8; 10 * 10 * 4];
+        draw_background_image(
+            &tiny_image(),
+            2,
+            2,
+            &mut dest,
+            10,
+            10,
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            BackgroundSize::Auto,
+            BackgroundPosition::default(),
+            BackgroundRepeat::NoRepeat,
+        );
+
+        let alpha = |x: usize, y: usize| dest[(y * 10 + x) * 4 + 3];
+        assert_ne!(alpha(0, 0), 0, "the single tile is painted at the origin");
+        assert_ne!(alpha(1, 1), 0);
+        assert_eq!(alpha(3, 3), 0, "nothing repeats past the 2x2 tile");
+    }
+
+    #[test]
+    fn repeat_background_tiles_across_the_whole_box() {
+        let mut dest = vec![0u8; 8 * 8 * 4];
+        draw_background_image(
+            &tiny_image(),
+            2,
+            2,
+            &mut dest,
+            8,
+            8,
+            0.0,
+            0.0,
+            8.0,
+            8.0,
+            BackgroundSize::Auto,
+            BackgroundPosition::default(),
+            BackgroundRepeat::Repeat,
+        );
+
+        assert!(
+            dest.chunks(4).all(|px| px[3] != 0),
+            "every pixel of the box is covered"
+        );
+        // The pattern repeats with a period of 2px.
+        let px = |x: usize, y: usize| dest[(y * 8 + x) * 4..(y * 8 + x) * 4 + 4].to_vec();
+        assert_eq!(px(0, 0), px(2, 0));
+        assert_eq!(px(1, 1), px(7, 7));
+    }
+
+    #[test]
+    fn repeat_x_leaves_the_vertical_axis_alone() {
+        let mut dest = vec![0u8; 8 * 8 * 4];
+        draw_background_image(
+            &tiny_image(),
+            2,
+            2,
+            &mut dest,
+            8,
+            8,
+            0.0,
+            0.0,
+            8.0,
+            8.0,
+            BackgroundSize::Auto,
+            BackgroundPosition::default(),
+            BackgroundRepeat::RepeatX,
+        );
+
+        let alpha = |x: usize, y: usize| dest[(y * 8 + x) * 4 + 3];
+        assert_ne!(alpha(6, 0), 0, "tiles run along x");
+        assert_eq!(alpha(0, 4), 0, "but not down y");
+    }
+
+    #[test]
+    fn background_never_paints_outside_its_box() {
+        let mut dest = vec![0u8; 20 * 20 * 4];
+        // A 10x10 box at (5,5) with a tile larger than the box.
+        draw_background_image(
+            &tiny_image(),
+            2,
+            2,
+            &mut dest,
+            20,
+            20,
+            5.0,
+            5.0,
+            10.0,
+            10.0,
+            BackgroundSize::Explicit(
+                BackgroundLength::Pixels(30.0),
+                BackgroundLength::Pixels(30.0),
+            ),
+            BackgroundPosition::default(),
+            BackgroundRepeat::Repeat,
+        );
+
+        let alpha = |x: usize, y: usize| dest[(y * 20 + x) * 4 + 3];
+        assert_ne!(alpha(6, 6), 0, "inside the box");
+        assert_eq!(alpha(4, 6), 0, "left of the box stays clear");
+        assert_eq!(alpha(15, 6), 0, "right of the box stays clear");
+        assert_eq!(alpha(6, 16), 0, "below the box stays clear");
+    }
+
+    #[test]
+    fn positioned_repeat_still_covers_the_near_edge() {
+        // With the origin pushed 3px in, the tiles must also step back to fill
+        // the space before it.
+        let mut dest = vec![0u8; 12 * 4 * 4];
+        draw_background_image(
+            &tiny_image(),
+            2,
+            2,
+            &mut dest,
+            12,
+            4,
+            0.0,
+            0.0,
+            12.0,
+            4.0,
+            BackgroundSize::Auto,
+            BackgroundPosition {
+                x: BackgroundLength::Pixels(3.0),
+                y: BackgroundLength::Pixels(0.0),
+            },
+            BackgroundRepeat::Repeat,
+        );
+
+        let alpha = |x: usize, y: usize| dest[(y * 12 + x) * 4 + 3];
+        assert_ne!(alpha(0, 0), 0, "the gap before the origin is filled");
+        assert_ne!(alpha(11, 0), 0, "and the far edge too");
     }
 
     #[test]

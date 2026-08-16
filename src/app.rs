@@ -703,6 +703,7 @@ impl MistilteinnApp {
         let mut composite_buffer = vec![0u8; (win_w * win_h * 4) as usize];
 
         // Render background colors and borders first (beneath text and images)
+        let page_base_url = page.base_url();
         for deco in &decorations {
             let dx = deco.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
             let dy = deco.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
@@ -730,6 +731,36 @@ impl MistilteinnApp {
                         deco.width,
                         deco.height,
                         bg,
+                    );
+                }
+            }
+
+            // The image paints over the background colour and under the border.
+            if let Some(ref src) = deco.background_image {
+                let resolved = if page_base_url.is_empty() {
+                    src.clone()
+                } else {
+                    crate::network::resolve_url(&page_base_url, src)
+                };
+                if let Some(cached) = page
+                    .image_cache
+                    .get(&resolved)
+                    .or_else(|| page.image_cache.get(src))
+                {
+                    crate::render::draw_background_image(
+                        &cached.rgba,
+                        cached.width,
+                        cached.height,
+                        &mut composite_buffer,
+                        win_w,
+                        win_h,
+                        dx,
+                        dy,
+                        deco.width,
+                        deco.height,
+                        deco.background_size,
+                        deco.background_position,
+                        deco.background_repeat,
                     );
                 }
             }
@@ -1198,17 +1229,33 @@ impl MistilteinnApp {
         // Resolve against <base href> when the document declares one; it is
         // only knowable now that the HTML has been parsed.
         let effective_base = new_page.base_url();
-        let resolved_images: Vec<(String, f32, f32)> = image_nodes
+        let resolve = |src: &str| -> String {
+            if effective_base.is_empty() {
+                src.to_string()
+            } else {
+                crate::network::resolve_url(&effective_base, src)
+            }
+        };
+
+        let mut resolved_images: Vec<(String, f32, f32)> = image_nodes
             .iter()
-            .map(|img| {
-                let resolved = if !effective_base.is_empty() {
-                    crate::network::resolve_url(&effective_base, &img.src)
-                } else {
-                    img.src.clone()
-                };
-                (resolved, img.width, img.height)
-            })
+            .map(|img| (resolve(&img.src), img.width, img.height))
             .collect();
+
+        // CSS background images go through the same fetch and cache as <img>.
+        // The requested size is the box they fill, which is what an SVG needs
+        // to rasterize at a sensible resolution.
+        for deco in crate::layout::collect_decorations(&new_page.layout_root) {
+            if let Some(ref src) = deco.background_image {
+                let url = resolve(src);
+                if !resolved_images
+                    .iter()
+                    .any(|(existing, _, _)| existing == &url)
+                {
+                    resolved_images.push((url, deco.width, deco.height));
+                }
+            }
+        }
 
         // Fetch all images concurrently with throttling
         use futures::StreamExt;

@@ -868,6 +868,219 @@ pub enum ClearType {
     Both,
 }
 
+// ------ Backgrounds ------
+
+/// A `background-size` component, or a `background-position` coordinate.
+///
+/// Percentages cannot be resolved during the cascade — they depend on the box
+/// and, for `background-position`, on the image — so they are kept symbolic
+/// until paint time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BackgroundLength {
+    /// `auto` for a size, or the corresponding edge keyword for a position.
+    Auto,
+    Pixels(f32),
+    /// A fraction, where `1.0` is 100%.
+    Percent(f32),
+}
+
+impl BackgroundLength {
+    fn parse(s: &str, ctx: LengthContext) -> Option<Self> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("auto") {
+            return Some(Self::Auto);
+        }
+        if let Some(pct) = s.strip_suffix('%') {
+            return pct
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .map(|p| Self::Percent(p / 100.0));
+        }
+        parse_length_ctx(s, ctx).map(Self::Pixels)
+    }
+}
+
+/// The computed `background-size`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum BackgroundSize {
+    /// Draw at the image's own pixel size.
+    #[default]
+    Auto,
+    /// Scale, preserving aspect ratio, until the box is fully covered.
+    Cover,
+    /// Scale, preserving aspect ratio, until the image fits inside the box.
+    Contain,
+    /// Explicit width and height; `Auto` on one axis keeps the aspect ratio.
+    Explicit(BackgroundLength, BackgroundLength),
+}
+
+/// The computed `background-repeat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackgroundRepeat {
+    #[default]
+    Repeat,
+    RepeatX,
+    RepeatY,
+    NoRepeat,
+}
+
+impl BackgroundRepeat {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "repeat" => Self::Repeat,
+            "repeat-x" => Self::RepeatX,
+            "repeat-y" => Self::RepeatY,
+            "no-repeat" => Self::NoRepeat,
+            // `space` and `round` change tile spacing rather than whether the
+            // image tiles; plain repeat is the closest of the four.
+            "space" | "round" => Self::Repeat,
+            _ => return None,
+        })
+    }
+
+    /// Whether tiles are laid out along each axis: (horizontal, vertical).
+    pub fn axes(self) -> (bool, bool) {
+        match self {
+            Self::Repeat => (true, true),
+            Self::RepeatX => (true, false),
+            Self::RepeatY => (false, true),
+            Self::NoRepeat => (false, false),
+        }
+    }
+}
+
+/// The computed `background-position`, as an (x, y) pair.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BackgroundPosition {
+    pub x: BackgroundLength,
+    pub y: BackgroundLength,
+}
+
+impl Default for BackgroundPosition {
+    fn default() -> Self {
+        // The CSS initial value is `0% 0%`.
+        Self {
+            x: BackgroundLength::Percent(0.0),
+            y: BackgroundLength::Percent(0.0),
+        }
+    }
+}
+
+impl BackgroundPosition {
+    /// Parse a one- or two-value `background-position`.
+    ///
+    /// Keywords are turned into percentages straight away: `left` is `0%`,
+    /// `center` `50%`, `right` `100%` — which is exactly how CSS defines them,
+    /// and lets paint time treat every case the same way.
+    pub fn parse(val: &str, ctx: LengthContext) -> Option<Self> {
+        let parts: Vec<&str> = split_components(val);
+        if parts.is_empty() || parts.len() > 4 {
+            return None;
+        }
+
+        let keyword = |s: &str| -> Option<(Option<bool>, BackgroundLength)> {
+            // Returns (is_horizontal_axis, value); `None` axis means either.
+            Some(match s.to_ascii_lowercase().as_str() {
+                "left" => (Some(true), BackgroundLength::Percent(0.0)),
+                "right" => (Some(true), BackgroundLength::Percent(1.0)),
+                "top" => (Some(false), BackgroundLength::Percent(0.0)),
+                "bottom" => (Some(false), BackgroundLength::Percent(1.0)),
+                "center" => (None, BackgroundLength::Percent(0.5)),
+                _ => return None,
+            })
+        };
+
+        let mut x = None;
+        let mut y = None;
+        for part in &parts {
+            if let Some((axis, value)) = keyword(part) {
+                match axis {
+                    Some(true) => x = Some(value),
+                    Some(false) => y = Some(value),
+                    None => {
+                        if x.is_none() {
+                            x = Some(value)
+                        } else {
+                            y = Some(value)
+                        }
+                    }
+                }
+            } else if let Some(value) = BackgroundLength::parse(part, ctx) {
+                if x.is_none() {
+                    x = Some(value);
+                } else if y.is_none() {
+                    y = Some(value);
+                }
+            } else {
+                // An offset after an edge keyword (`right 20px`) — not supported.
+                return None;
+            }
+        }
+
+        Some(Self {
+            x: x?,
+            // A single value sets the horizontal position; the vertical
+            // defaults to center, per CSS.
+            y: y.unwrap_or(BackgroundLength::Percent(0.5)),
+        })
+    }
+}
+
+/// Parse a `background-size` value.
+fn parse_background_size(val: &str, ctx: LengthContext) -> Option<BackgroundSize> {
+    let val = val.trim();
+    if val.eq_ignore_ascii_case("cover") {
+        return Some(BackgroundSize::Cover);
+    }
+    if val.eq_ignore_ascii_case("contain") {
+        return Some(BackgroundSize::Contain);
+    }
+    let parts = split_components(val);
+    match parts.as_slice() {
+        [w] => BackgroundLength::parse(w, ctx)
+            .map(|w| BackgroundSize::Explicit(w, BackgroundLength::Auto)),
+        [w, h] => {
+            let w = BackgroundLength::parse(w, ctx)?;
+            let h = BackgroundLength::parse(h, ctx)?;
+            Some(BackgroundSize::Explicit(w, h))
+        }
+        _ => None,
+    }
+}
+
+/// Split `s` at the first `sep` that is not inside parentheses.
+fn split_outside_parens(s: &str, sep: char) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            c if c == sep && depth == 0 => return Some((&s[..i], &s[i + c.len_utf8()..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract the URL from a `url(...)` token, or `None` if it is not one.
+///
+/// Gradients (`linear-gradient(...)` and friends) are deliberately not handled;
+/// they are a separate image type with no bitmap to fetch.
+fn parse_url_token(s: &str) -> Option<String> {
+    let s = s.trim();
+    if !s.to_ascii_lowercase().starts_with("url(") || !s.ends_with(')') {
+        return None;
+    }
+    let inner = &s[4..s.len() - 1];
+    let url = inner.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url.to_string())
+    }
+}
+
 // ------ Cursor ------
 
 /// The computed `cursor` property.
@@ -1026,6 +1239,12 @@ pub struct ComputedValues {
     pub padding: [f32; 4],
     /// Background color as RGBA (None = transparent)
     pub background_color: Option<[u8; 4]>,
+    /// `background-image` URL, unresolved. `None` means `none` — gradients are
+    /// not bitmaps and are skipped rather than stored here.
+    pub background_image: Option<String>,
+    pub background_size: BackgroundSize,
+    pub background_position: BackgroundPosition,
+    pub background_repeat: BackgroundRepeat,
     /// Text color as RGBA (None = not set)
     pub color: Option<[u8; 4]>,
     pub font_size: f32,
@@ -1250,6 +1469,10 @@ impl Default for ComputedValues {
             margin_auto: [false; 4],
             padding: [0.0; 4],
             background_color: None,
+            background_image: None,
+            background_size: BackgroundSize::Auto,
+            background_position: BackgroundPosition::default(),
+            background_repeat: BackgroundRepeat::Repeat,
             color: None,
             font_size: 16.0,
             font_family: String::new(),
@@ -1416,6 +1639,66 @@ impl ComputedValues {
         (0..4).any(|i| self.border_style[i].is_visible() && self.border_width[i] > 0.0)
     }
 
+    /// Apply a `background` shorthand.
+    ///
+    /// The shorthand resets every background property it can carry, so an
+    /// omitted component goes back to its initial value — this is what makes
+    /// `background: #fff` clear an image inherited from a less specific rule.
+    ///
+    /// Only the first layer of a comma-separated list is painted; later layers
+    /// sit behind it and are far less common than the single-layer form.
+    fn apply_background_shorthand(&mut self, val: &str, ctx: LengthContext) {
+        self.background_image = None;
+        self.background_size = BackgroundSize::Auto;
+        self.background_position = BackgroundPosition::default();
+        self.background_repeat = BackgroundRepeat::Repeat;
+
+        let layer = split_top_level_commas(val)
+            .into_iter()
+            .next()
+            .unwrap_or(val)
+            .trim();
+
+        // `background-position / background-size` is the one ordered pair in
+        // the shorthand, so split it off before scanning the rest.
+        let (before_slash, after_slash) = match split_outside_parens(layer, '/') {
+            Some((a, b)) => (a, Some(b)),
+            None => (layer, None),
+        };
+
+        if let Some(size_part) = after_slash {
+            if let Some(size) = parse_background_size(size_part, ctx) {
+                self.background_size = size;
+            }
+        }
+
+        let mut position_tokens: Vec<&str> = Vec::new();
+        for token in split_components(before_slash) {
+            if let Some(url) = parse_url_token(token) {
+                self.background_image = Some(url);
+            } else if let Some(repeat) = BackgroundRepeat::parse(token) {
+                self.background_repeat = repeat;
+            } else if matches!(
+                token.to_ascii_lowercase().as_str(),
+                "scroll" | "fixed" | "local" | "border-box" | "padding-box" | "content-box"
+            ) {
+                // attachment / origin / clip — parsed so they are not mistaken
+                // for a colour, but not yet acted on.
+            } else if let Some(color) = parse_color_value(token) {
+                let (r, g, b, a) = color.to_rgba();
+                self.background_color = Some([r, g, b, a]);
+            } else {
+                position_tokens.push(token);
+            }
+        }
+
+        if !position_tokens.is_empty() {
+            if let Some(pos) = BackgroundPosition::parse(&position_tokens.join(" "), ctx) {
+                self.background_position = pos;
+            }
+        }
+    }
+
     /// Parse a single [`Declaration`] and apply it to a clone of `self`.
     ///
     /// Returns a new `ComputedValues` with the declaration applied on top
@@ -1554,11 +1837,50 @@ impl ComputedValues {
                     self.padding[3] = v;
                 }
             }
-            "background-color" | "background" => {
+            "background-color" => {
                 if let Some(color) = parse_color_value(val) {
                     let (r, g, b, a) = color.to_rgba();
                     self.background_color = Some([r, g, b, a]);
                 }
+            }
+            "background" => self.apply_background_shorthand(val, ctx),
+            "background-image" => {
+                // `none` and gradients both leave us with nothing to paint.
+                self.background_image = if val.eq_ignore_ascii_case("none") {
+                    None
+                } else {
+                    split_top_level_commas(val)
+                        .into_iter()
+                        .find_map(parse_url_token)
+                };
+            }
+            "background-size" => {
+                if let Some(size) = parse_background_size(val, ctx) {
+                    self.background_size = size;
+                }
+            }
+            "background-position" => {
+                if let Some(pos) = BackgroundPosition::parse(val, ctx) {
+                    self.background_position = pos;
+                }
+            }
+            "background-repeat" => {
+                // The two-value form (`repeat no-repeat`) names each axis.
+                let parts = split_components(val);
+                self.background_repeat = match parts.as_slice() {
+                    [one] => BackgroundRepeat::parse(one).unwrap_or(self.background_repeat),
+                    [h, v] => {
+                        let h_repeats = !h.eq_ignore_ascii_case("no-repeat");
+                        let v_repeats = !v.eq_ignore_ascii_case("no-repeat");
+                        match (h_repeats, v_repeats) {
+                            (true, true) => BackgroundRepeat::Repeat,
+                            (true, false) => BackgroundRepeat::RepeatX,
+                            (false, true) => BackgroundRepeat::RepeatY,
+                            (false, false) => BackgroundRepeat::NoRepeat,
+                        }
+                    }
+                    _ => self.background_repeat,
+                };
             }
             "color" => {
                 if let Some(color) = parse_color_value(val) {
@@ -4797,6 +5119,120 @@ mod tests {
             value: value.to_string(),
             important: false,
         })
+    }
+
+    #[test]
+    fn background_image_url_is_extracted() {
+        assert_eq!(
+            declare("background-image", "url('images/hero.png')").background_image,
+            Some("images/hero.png".to_string())
+        );
+        assert_eq!(
+            declare("background-image", "URL(\"a.png\")").background_image,
+            Some("a.png".to_string())
+        );
+        assert_eq!(declare("background-image", "none").background_image, None);
+    }
+
+    #[test]
+    fn gradients_are_not_treated_as_fetchable_images() {
+        assert_eq!(
+            declare("background-image", "linear-gradient(red, blue)").background_image,
+            None
+        );
+    }
+
+    #[test]
+    fn background_shorthand_reads_every_component() {
+        let cv = declare(
+            "background",
+            "#ffffff url(bg.png) no-repeat center top / cover",
+        );
+        assert_eq!(cv.background_color, Some([255, 255, 255, 255]));
+        assert_eq!(cv.background_image, Some("bg.png".to_string()));
+        assert_eq!(cv.background_repeat, BackgroundRepeat::NoRepeat);
+        assert_eq!(cv.background_size, BackgroundSize::Cover);
+        assert_eq!(
+            cv.background_position,
+            BackgroundPosition {
+                x: BackgroundLength::Percent(0.5),
+                y: BackgroundLength::Percent(0.0)
+            }
+        );
+    }
+
+    #[test]
+    fn background_shorthand_resets_an_image_from_an_earlier_rule() {
+        let cv = declare("background-image", "url(old.png)").from_declaration(&Declaration {
+            property: "background".to_string(),
+            value: "#000".to_string(),
+            important: false,
+        });
+        assert_eq!(cv.background_image, None);
+        assert_eq!(cv.background_color, Some([0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn background_position_keywords_become_percentages() {
+        let ctx = LengthContext::default();
+        assert_eq!(
+            BackgroundPosition::parse("right bottom", ctx).unwrap(),
+            BackgroundPosition {
+                x: BackgroundLength::Percent(1.0),
+                y: BackgroundLength::Percent(1.0)
+            }
+        );
+        // A single value sets x; y defaults to center.
+        assert_eq!(
+            BackgroundPosition::parse("left", ctx).unwrap(),
+            BackgroundPosition {
+                x: BackgroundLength::Percent(0.0),
+                y: BackgroundLength::Percent(0.5)
+            }
+        );
+        // Keywords may arrive in either order because each names its own axis.
+        assert_eq!(
+            BackgroundPosition::parse("top center", ctx).unwrap(),
+            BackgroundPosition {
+                x: BackgroundLength::Percent(0.5),
+                y: BackgroundLength::Percent(0.0)
+            }
+        );
+    }
+
+    #[test]
+    fn background_size_forms_parse() {
+        let ctx = LengthContext::default();
+        assert_eq!(
+            parse_background_size("cover", ctx),
+            Some(BackgroundSize::Cover)
+        );
+        assert_eq!(
+            parse_background_size("50% auto", ctx),
+            Some(BackgroundSize::Explicit(
+                BackgroundLength::Percent(0.5),
+                BackgroundLength::Auto
+            ))
+        );
+        assert_eq!(
+            parse_background_size("32px", ctx),
+            Some(BackgroundSize::Explicit(
+                BackgroundLength::Pixels(32.0),
+                BackgroundLength::Auto
+            ))
+        );
+    }
+
+    #[test]
+    fn background_repeat_two_value_form_names_each_axis() {
+        assert_eq!(
+            declare("background-repeat", "repeat no-repeat").background_repeat,
+            BackgroundRepeat::RepeatX
+        );
+        assert_eq!(
+            declare("background-repeat", "no-repeat repeat").background_repeat,
+            BackgroundRepeat::RepeatY
+        );
     }
 
     #[test]

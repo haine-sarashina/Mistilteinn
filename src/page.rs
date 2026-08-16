@@ -388,6 +388,27 @@ mod tests {
     }
 
     #[test]
+    fn background_image_reaches_the_decoration_list() {
+        let page = Page::new(
+            "<html><body><div class='hero'>x</div></body></html>",
+            ".hero { display: block; width: 300px; height: 200px; \
+             background: #eee url(hero.png) no-repeat center / cover; }",
+            800.0,
+            600.0,
+        );
+
+        let deco = crate::layout::collect_decorations(&page.layout_root)
+            .into_iter()
+            .find(|d| d.background_image.is_some())
+            .expect("the hero div should carry a background image");
+
+        assert_eq!(deco.background_image.as_deref(), Some("hero.png"));
+        assert_eq!(deco.background_size, css::BackgroundSize::Cover);
+        assert_eq!(deco.background_repeat, css::BackgroundRepeat::NoRepeat);
+        assert_eq!(deco.background_color, Some([238, 238, 238, 255]));
+    }
+
+    #[test]
     fn page_has_empty_image_cache() {
         let page = Page::new("<html><body></body></html>", "", 800.0, 600.0);
         assert!(page.image_cache.is_empty());

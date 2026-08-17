@@ -302,6 +302,33 @@ impl Selector {
         }
     }
 
+    /// The pseudo-element this selector targets, if it ends in one.
+    ///
+    /// `p::before` selects a box that belongs to a `p` but is not the `p`
+    /// itself, so it is matched in two parts: this says which box, and
+    /// [`Selector::without_pseudo_element`] gives the selector that finds the
+    /// element it hangs off.
+    pub fn pseudo_element(&self) -> Option<&str> {
+        match self.complex.last() {
+            Some((_, SimpleSelector::PseudoElement(name))) => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// This selector with its trailing pseudo-element removed.
+    pub fn without_pseudo_element(&self) -> Selector {
+        let mut complex = self.complex.clone();
+        if matches!(complex.last(), Some((_, SimpleSelector::PseudoElement(_)))) {
+            complex.pop();
+        }
+        // `::before` on its own means `*::before`: the element part is empty,
+        // so it has to match every element rather than none.
+        if complex.is_empty() {
+            complex.push((Combinator::Descendant, SimpleSelector::Universal));
+        }
+        Selector { complex }
+    }
+
     /// Recursively evaluate a complex selector against the DOM structure.
     pub fn full_matches(
         &self,

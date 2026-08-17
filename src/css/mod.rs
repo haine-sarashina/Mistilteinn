@@ -749,7 +749,119 @@ where
         }
     }
 
+    // Phase 3: the boxes `::before` and `::after` generate.
+    //
+    // These are done last because a generated box inherits from the element it
+    // hangs off, and that element's own style is only final after Phase 2.
+    // They are stored in the same map under a key derived from their element,
+    // so everything that carries styles around keeps carrying one map.
+    for &node_id in &element_ids {
+        for kind in PseudoKind::all() {
+            let mut matched: Vec<(&Declaration, (u32, u32, u32))> = Vec::new();
+
+            for rule in &active_rules {
+                for selector in &rule.selectors {
+                    if !selector
+                        .pseudo_element()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(kind.name()))
+                    {
+                        continue;
+                    }
+                    let element_part = selector.without_pseudo_element();
+                    let simple_match = |id: u32, sel: &parser::SimpleSelector| -> bool {
+                        matches_for(
+                            id,
+                            sel,
+                            arena,
+                            &node_classes,
+                            &node_ids,
+                            &first_children,
+                            &last_children,
+                            &only_children,
+                            &child_indices,
+                            &is_hovered,
+                        )
+                    };
+                    let get_parent = |id: u32| -> Option<u32> {
+                        arena
+                            .get(crate::html::DomHandle(crate::html::NodeId::from_raw(id)))
+                            .and_then(|n| n.parent_id())
+                    };
+                    if element_part.full_matches(node_id, &get_parent, &simple_match) {
+                        let spec = selector.specificity();
+                        matched.extend(rule.declarations.iter().map(|decl| (decl, spec)));
+                    }
+                }
+            }
+            if matched.is_empty() {
+                continue;
+            }
+
+            // Normal declarations first, then `!important`, each in ascending
+            // specificity — the same order the element cascade uses.
+            matched.sort_by_key(|(decl, spec)| (decl.important, *spec));
+
+            let origin = result.get(&node_id).cloned().unwrap_or_default();
+            let mut computed =
+                inherit_properties(&origin, initial_values(zoom), length_ctx.font_size);
+            // A generated box is inline unless the page says otherwise.
+            computed.display = DisplayType::Inline;
+            for (decl, _) in matched {
+                computed = computed.from_declaration_with_ctx(decl, length_ctx);
+            }
+
+            if computed.content.generates_box() {
+                result.insert(pseudo_style_key(node_id, kind), computed);
+            }
+        }
+    }
+
     result
+}
+
+/// Match one simple selector against one element.
+///
+/// The element cascade builds this as a closure over its own bookkeeping; the
+/// pseudo-element pass needs the same test, so the part that does not depend on
+/// hover or sibling position lives here.
+#[allow(clippy::too_many_arguments)]
+fn matches_for(
+    id: u32,
+    sel: &parser::SimpleSelector,
+    arena: &crate::html::DomArena,
+    node_classes: &rustc_hash::FxHashMap<u32, Vec<String>>,
+    node_ids: &rustc_hash::FxHashMap<u32, String>,
+    first_children: &std::collections::HashSet<u32>,
+    last_children: &std::collections::HashSet<u32>,
+    only_children: &std::collections::HashSet<u32>,
+    child_indices: &rustc_hash::FxHashMap<u32, usize>,
+    is_hovered: &impl Fn(u32) -> bool,
+) -> bool {
+    let Some(node) = arena.get(crate::html::DomHandle(crate::html::NodeId::from_raw(id))) else {
+        return false;
+    };
+    let Some(tag) = node.tag_name() else {
+        return false;
+    };
+    parser::Selector::simple_matches_with_context(
+        sel,
+        tag,
+        |c| {
+            node_classes
+                .get(&id)
+                .is_some_and(|classes| classes.iter().any(|cls| cls == c))
+        },
+        |i| node_ids.get(&id).is_some_and(|id_str| id_str == i),
+        |name, op, val| match node.get_attr(name) {
+            Some(attr_val) => parser::evaluate_attr_operator(attr_val, op, val),
+            None => false,
+        },
+        || first_children.contains(&id),
+        || last_children.contains(&id),
+        || only_children.contains(&id),
+        || *child_indices.get(&id).unwrap_or(&1),
+        || is_hovered(id),
+    )
 }
 
 // ------ Display Type ------
@@ -1364,8 +1476,191 @@ pub struct ComputedValues {
     pub cursor: Cursor,
     /// `z-index`; `None` is the initial `auto`.
     pub z_index: Option<i32>,
+    /// `content` — what a `::before` or `::after` puts on the page. Empty on
+    /// an ordinary element, which generates nothing.
+    pub content: Content,
     // CSS Custom Properties (CSS variables --*)
     pub custom_properties: rustc_hash::FxHashMap<String, String>,
+}
+
+/// The `content` property: what a generated box puts on the page.
+///
+/// Only the parts this engine can produce are modelled — literal strings and
+/// `attr()`. Counters, `url()` images and quotes are recognised as content we
+/// cannot build and leave the box empty, which is better than printing the
+/// source text of the function.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Content {
+    parts: Vec<ContentPart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContentPart {
+    Text(String),
+    /// `attr(href)` — the value of that attribute on the originating element.
+    Attr(String),
+}
+
+/// Which generated box a style belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PseudoKind {
+    Before,
+    After,
+}
+
+impl PseudoKind {
+    /// The name as it is written in a selector.
+    pub fn name(self) -> &'static str {
+        match self {
+            PseudoKind::Before => "before",
+            PseudoKind::After => "after",
+        }
+    }
+
+    /// The two kinds, in the order they are attached to their element.
+    pub fn all() -> [PseudoKind; 2] {
+        [PseudoKind::Before, PseudoKind::After]
+    }
+}
+
+/// Where pseudo-element styles live in the style map.
+///
+/// A pseudo-element has no DOM node, so it has no id of its own. Its style is
+/// keyed off the element it belongs to, above any id the arena can hand out —
+/// which keeps one map, and so keeps every function that carries styles around
+/// unchanged.
+pub const PSEUDO_STYLE_BASE: u32 = 1 << 28;
+
+/// The style-map key for one element's generated box.
+pub fn pseudo_style_key(node_id: u32, kind: PseudoKind) -> u32 {
+    let slot = match kind {
+        PseudoKind::Before => 0,
+        PseudoKind::After => 1,
+    };
+    PSEUDO_STYLE_BASE + node_id * 2 + slot
+}
+
+impl Content {
+    /// Parse a `content` value.
+    pub fn parse(value: &str) -> Self {
+        let value = value.trim();
+        if value.is_empty()
+            || value.eq_ignore_ascii_case("none")
+            || value.eq_ignore_ascii_case("normal")
+        {
+            return Self::default();
+        }
+
+        let mut parts = Vec::new();
+        let chars: Vec<char> = value.chars().collect();
+        let mut i = 0usize;
+
+        while i < chars.len() {
+            match chars[i] {
+                c if c.is_whitespace() => i += 1,
+                quote @ ('"' | '\'') => {
+                    i += 1;
+                    let mut text = String::new();
+                    while i < chars.len() && chars[i] != quote {
+                        if chars[i] == '\\' {
+                            i += 1;
+                            text.push_str(&read_escape(&chars, &mut i));
+                            continue;
+                        }
+                        text.push(chars[i]);
+                        i += 1;
+                    }
+                    i += 1; // closing quote
+                    parts.push(ContentPart::Text(text));
+                }
+                _ => {
+                    // A function or keyword: read to the end of the token, and
+                    // keep only `attr()`.
+                    let start = i;
+                    let mut depth = 0usize;
+                    while i < chars.len() {
+                        match chars[i] {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth = depth.saturating_sub(1);
+                                if depth == 0 {
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                            c if c.is_whitespace() && depth == 0 => break,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    let token: String = chars[start..i].iter().collect();
+                    let lower = token.to_ascii_lowercase();
+                    if let Some(rest) = lower.strip_prefix("attr(") {
+                        if let Some(name) = rest.strip_suffix(')') {
+                            let name = name.trim().trim_matches(['"', '\'']);
+                            if !name.is_empty() {
+                                parts.push(ContentPart::Attr(name.to_string()));
+                            }
+                        }
+                    }
+                    // Anything else — counters, url(), open-quote — is content
+                    // this engine cannot build, and is left out.
+                }
+            }
+        }
+
+        Self { parts }
+    }
+
+    /// Whether this generates a box at all.
+    ///
+    /// `content: ""` does generate one — an empty box that CSS often sizes and
+    /// colours to draw a shape — so an empty list and an empty string are not
+    /// the same thing.
+    pub fn generates_box(&self) -> bool {
+        !self.parts.is_empty()
+    }
+
+    /// The text this puts on the page, resolving `attr()` through `attribute`.
+    pub fn resolve(&self, attribute: &impl Fn(&str) -> Option<String>) -> String {
+        self.parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text(text) => text.clone(),
+                ContentPart::Attr(name) => attribute(name).unwrap_or_default(),
+            })
+            .collect()
+    }
+}
+
+/// Read one CSS escape sequence, having consumed the backslash.
+///
+/// `\f101` is how icon fonts are addressed, so a hex escape has to become the
+/// character it names rather than the letters that spell it.
+fn read_escape(chars: &[char], i: &mut usize) -> String {
+    let mut hex = String::new();
+    while *i < chars.len() && hex.len() < 6 && chars[*i].is_ascii_hexdigit() {
+        hex.push(chars[*i]);
+        *i += 1;
+    }
+    if hex.is_empty() {
+        // An escaped literal, such as `\"`.
+        if *i < chars.len() {
+            let escaped = chars[*i];
+            *i += 1;
+            return escaped.to_string();
+        }
+        return String::new();
+    }
+    // One whitespace character after the digits ends the escape and is consumed.
+    if *i < chars.len() && chars[*i].is_whitespace() {
+        *i += 1;
+    }
+    u32::from_str_radix(&hex, 16)
+        .ok()
+        .and_then(char::from_u32)
+        .map(|c| c.to_string())
+        .unwrap_or_default()
 }
 
 /// How `text-transform` rewrites a run's text before it is measured and drawn.
@@ -1617,6 +1912,7 @@ impl Default for ComputedValues {
             visibility: Visibility::Visible,
             cursor: Cursor::Auto,
             z_index: None,
+            content: Content::default(),
             custom_properties: rustc_hash::FxHashMap::default(),
         }
     }
@@ -2281,6 +2577,9 @@ impl ComputedValues {
                 self.text_style.underline = lower.contains("underline");
                 self.text_style.line_through = lower.contains("line-through");
                 self.text_style.overline = lower.contains("overline");
+            }
+            "content" => {
+                self.content = Content::parse(val);
             }
             "z-index" => {
                 // `auto` (and anything unparseable) leaves the element in

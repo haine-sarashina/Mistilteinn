@@ -4473,10 +4473,13 @@ mod tests {
         assert_eq!(metrics.thumb.x, metrics.track.x + 2.0);
         assert_eq!(metrics.thumb.y, metrics.track.y);
         assert!(metrics.thumb.height >= SCROLLBAR_MIN_THUMB_HEIGHT);
-        assert_eq!(
-            metrics.max_scroll,
-            2000.0 - (800.0 - ADDRESS_BAR_HEIGHT as f32)
-        );
+
+        // The range is the content past the window. The content is measured
+        // from what is painted, not from the root box, so it also covers the
+        // body's own margins around that 2000px div.
+        let (content, viewport) = app.scroll_extents(1280, 800).unwrap();
+        assert!(content.1 >= 2000.0);
+        assert_eq!(metrics.max_scroll, content.1 - viewport.1);
     }
 
     #[test]

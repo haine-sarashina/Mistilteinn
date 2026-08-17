@@ -947,6 +947,135 @@ mod tests {
         assert_eq!(greeting(&page), "before");
     }
 
+    /// Every text run of a page, in paint order.
+    ///
+    /// CJK is broken into one run per character by line breaking, so the runs
+    /// are joined: what these tests are about is which text is on the page and
+    /// in what order, not how it was split for measuring.
+    fn texts(page: &Page) -> String {
+        crate::layout::collect_text_nodes(&page.layout_root)
+            .into_iter()
+            .map(|run| run.text)
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// A page whose `p` has generated content on both sides.
+    fn generated(css: &str) -> Page {
+        Page::new(
+            "<html><body><p data-label='ラベル'>本文</p></body></html>",
+            &format!("body {{ margin: 0 }} p {{ margin: 0 }} {css}"),
+            800.0,
+            600.0,
+        )
+    }
+
+    #[test]
+    fn before_and_after_put_their_text_around_the_element() {
+        let page = generated("p::before { content: '[' } p::after { content: ']' }");
+        assert_eq!(texts(&page), "[本文]");
+    }
+
+    #[test]
+    fn an_element_with_no_rule_generates_nothing() {
+        let page = generated("");
+        assert_eq!(texts(&page), "本文");
+    }
+
+    #[test]
+    fn content_none_generates_no_box() {
+        // `content` is what decides whether the box exists at all, so a rule
+        // that styles a pseudo-element without content must not produce one.
+        let page = generated("p::before { content: none; color: red }");
+        assert_eq!(texts(&page), "本文");
+
+        let page = generated("p::before { color: red }");
+        assert_eq!(texts(&page), "本文");
+    }
+
+    #[test]
+    fn attr_reads_the_attribute_off_the_originating_element() {
+        let page = generated("p::before { content: attr(data-label) }");
+        assert_eq!(texts(&page), "ラベル本文");
+    }
+
+    #[test]
+    fn a_hex_escape_becomes_the_character_it_names() {
+        // Icon fonts are addressed this way; printing the digits instead would
+        // put "f101" on the page.
+        let page = generated("p::before { content: '\\2192 ' }");
+        assert!(texts(&page).starts_with('→'), "got {:?}", texts(&page));
+    }
+
+    #[test]
+    fn a_generated_box_inherits_from_the_element_it_belongs_to() {
+        let page = generated("p { font-size: 30px } p::before { content: 'x' }");
+        let run = crate::layout::collect_text_nodes(&page.layout_root)
+            .into_iter()
+            .find(|r| r.text == "x")
+            .expect("the generated box is laid out");
+        assert_eq!(run.font_size, 30.0, "inherited from the p");
+    }
+
+    #[test]
+    fn a_generated_box_can_be_styled_apart_from_its_element() {
+        let page = generated("p { color: black } p::before { content: 'x'; color: red }");
+        let run = crate::layout::collect_text_nodes(&page.layout_root)
+            .into_iter()
+            .find(|r| r.text == "x")
+            .unwrap();
+        assert_eq!(run.color, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn an_empty_content_string_still_generates_a_box_to_paint() {
+        // The empty-string box is how pages draw a shape: no text, but a size
+        // and a background.
+        let page = generated(
+            "p::before { content: ''; display: block; width: 40px; height: 10px; \
+             background-color: blue }",
+        );
+        let painted = crate::layout::collect_decorations(&page.layout_root)
+            .into_iter()
+            .find(|d| d.background_color == Some([0, 0, 255, 255]))
+            .expect("the generated box paints its background");
+        assert_eq!((painted.width, painted.height), (40.0, 10.0));
+    }
+
+    #[test]
+    fn generated_content_applies_to_every_element_a_selector_reaches() {
+        let page = Page::new(
+            "<html><body><ul><li>あ</li><li>い</li></ul></body></html>",
+            "li::before { content: '・' }",
+            800.0,
+            600.0,
+        );
+        assert_eq!(texts(&page).matches('・').count(), 2);
+    }
+
+    #[test]
+    fn a_structural_pseudo_class_still_narrows_which_elements_generate() {
+        // `li:first-child::before` must not decorate every item.
+        let page = Page::new(
+            "<html><body><ul><li>あ</li><li>い</li></ul></body></html>",
+            "li:first-child::before { content: '★' }",
+            800.0,
+            600.0,
+        );
+        assert_eq!(texts(&page).matches('★').count(), 1);
+    }
+
+    #[test]
+    fn a_more_specific_rule_wins_for_a_generated_box_too() {
+        let page = Page::new(
+            "<html><body><p class='x'>本文</p></body></html>",
+            "p::before { content: 'A' } p.x::before { content: 'B' }",
+            800.0,
+            600.0,
+        );
+        assert!(texts(&page).starts_with('B'), "got {:?}", texts(&page));
+    }
+
     /// A page with one image, whose decoded size is already known.
     fn page_with_decoded_image(markup: &str, css: &str, natural: (u32, u32)) -> Page {
         let mut page = Page::new(
@@ -1099,12 +1228,35 @@ mod tests {
             600.0,
         );
         assert_eq!(rect_of(&page, "box").width, 100.0);
-
-        let base_height = rect_of(&page, "box").height;
+        assert_eq!(rect_of(&page, "box").height, 40.0);
 
         page.set_zoom(2.0);
         assert_eq!(rect_of(&page, "box").width, 200.0);
-        assert_eq!(rect_of(&page, "box").height, base_height * 2.0);
+        assert_eq!(rect_of(&page, "box").height, 80.0);
+    }
+
+    #[test]
+    fn a_declared_height_is_the_height_of_a_block_box() {
+        // Block height came from content alone, so `height` did nothing at
+        // all: an empty spacer collapsed to nothing.
+        let page = Page::new(
+            "<html><body><div id='spacer'></div></body></html>",
+            "body { margin: 0 } #spacer { height: 40px }",
+            800.0,
+            600.0,
+        );
+        assert_eq!(rect_of(&page, "spacer").height, 40.0);
+    }
+
+    #[test]
+    fn a_border_box_height_covers_its_own_padding() {
+        let page = Page::new(
+            "<html><body><div id='b'></div></body></html>",
+            "body { margin: 0 } #b { box-sizing: border-box; height: 50px; padding: 10px }",
+            800.0,
+            600.0,
+        );
+        assert_eq!(rect_of(&page, "b").height, 50.0);
     }
 
     #[test]

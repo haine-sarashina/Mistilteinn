@@ -807,6 +807,7 @@ fn build_layout_children<N, F>(
                                 depth + 1,
                             );
                         }
+                        attach_generated_content(&mut layout_node, child_id, styles, &node);
                     }
 
                     let is_empty_whitespace = layout_node
@@ -972,6 +973,7 @@ fn build_layout_children<N, F>(
                                 depth + 1,
                             );
                         }
+                        attach_generated_content(&mut layout_node, child_id, styles, &node);
                     }
 
                     let is_empty_whitespace = layout_node
@@ -1808,6 +1810,27 @@ fn compute_block_height_inner(
     if depth > MAX_LAYOUT_DEPTH {
         return 0.0;
     }
+
+    // A declared height is the height. This path only ever measured content, so
+    // `height: 40px` on a block box did nothing at all and an empty spacer
+    // collapsed to nothing, while the width beside it has always been honoured.
+    //
+    // Known gap: a box whose content is inline still takes its height from the
+    // line boxes it ends up with, which are measured further down and write
+    // over this. So a declared height sizes a box its content does not fill,
+    // but does not yet cut one whose text overflows it.
+    if let Some(height) = node.explicit_height {
+        return match node.box_sizing {
+            // The caller adds padding and border on top of what this returns,
+            // so a border-box height has to give them back.
+            crate::css::BoxSizing::BorderBox => {
+                (height - node.padding[0] - node.padding[2] - node.border[0] - node.border[2])
+                    .max(0.0)
+            }
+            crate::css::BoxSizing::ContentBox => height,
+        };
+    }
+
     let mut height = 0.0;
     for child in &node.children {
         if is_block_child(child) {
@@ -3895,6 +3918,94 @@ pub fn break_into_lines(
     }
 
     line_boxes
+}
+
+/// Attach the boxes `::before` and `::after` generate to their element.
+///
+/// The pseudo-element's style was computed alongside its element's and stored
+/// under a key derived from it, so no extra map has to be carried around to
+/// find it here.
+///
+/// An element whose own text was flattened onto it — the shortcut for a box
+/// with nothing but text in it — has that text moved into a child first.
+/// Generated content is a sibling of the element's content, and there has to
+/// be something for it to be a sibling of.
+fn attach_generated_content<N: LayoutDomNode>(
+    parent: &mut LayoutNode,
+    dom_id: u32,
+    styles: &FxHashMap<u32, ComputedValues>,
+    node: &N,
+) {
+    let generated: Vec<(crate::css::PseudoKind, LayoutNode)> = crate::css::PseudoKind::all()
+        .into_iter()
+        .filter_map(|kind| {
+            let style = styles.get(&crate::css::pseudo_style_key(dom_id, kind))?;
+            let text = style.content.resolve(&|name| node.get_attr(name));
+            Some((kind, generated_box(style, text)))
+        })
+        .collect();
+
+    if generated.is_empty() {
+        return;
+    }
+
+    if let Some(own_text) = parent.text.take() {
+        let mut text_box =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Inline);
+        text_box.text = Some(own_text);
+        text_box.color = parent.color;
+        text_box.font_size = parent.font_size;
+        text_box.font_family = parent.font_family.clone();
+        text_box.text_style = parent.text_style;
+        text_box.dom_node_id = parent.dom_node_id;
+        parent.children.insert(0, text_box);
+    }
+
+    for (kind, box_node) in generated {
+        match kind {
+            crate::css::PseudoKind::Before => parent.children.insert(0, box_node),
+            crate::css::PseudoKind::After => parent.children.push(box_node),
+        }
+    }
+}
+
+/// Build the box for one `::before` or `::after`.
+fn generated_box(style: &ComputedValues, text: String) -> LayoutNode {
+    let mut node = LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), style.display);
+    // `content: ""` generates a box with no text, which pages use as a shape:
+    // it needs its background and size, not a text run.
+    node.text = (!text.is_empty()).then_some(text);
+    node.color = style.color;
+    node.font_size = style.font_size;
+    node.font_family = style.font_family.clone();
+    node.text_style = style.text_style;
+    node.padding = style.padding;
+    node.margin = style.margin;
+    node.border = style.used_border_width();
+    node.border_color = resolved_border_colors(style);
+    node.border_style = style.border_style;
+    node.border_radius = style.border_radius;
+    node.background_color = style.background_color;
+    node.background_image = style.background_image.clone();
+    node.background_size = style.background_size;
+    node.background_position = style.background_position;
+    node.background_repeat = style.background_repeat;
+    node.explicit_width = style.explicit_width;
+    node.explicit_height = style.explicit_height;
+    if let Some(width) = style.width {
+        node.explicit_width = Some(width);
+        node.rect.width = width;
+    }
+    if let Some(height) = style.height {
+        node.explicit_height = Some(height);
+        node.rect.height = height;
+    }
+    node.visibility = style.visibility;
+    node.text_align = style.text_align;
+    node.direction = style.direction;
+    node.position = style.position;
+    node.z_index = style.z_index;
+    node
 }
 
 /// Copy an `<img>`'s source and declared size onto its layout box.

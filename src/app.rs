@@ -2227,10 +2227,11 @@ impl MistilteinnApp {
             );
         }
 
-        // The first layout measured with system fonts because the web fonts had
-        // not arrived yet. Re-measure now that they have, or every box sized
-        // from text keeps the wrong width.
-        if crate::render::text::web_font_count() > 0 {
+        // The first layout ran before any of this page's assets existed: text
+        // was measured with system fonts rather than the page's own, and every
+        // image was an empty box because nothing knew how big the picture was.
+        // Both are known now, so lay the page out again.
+        if crate::render::text::web_font_count() > 0 || !new_page.image_cache.is_empty() {
             new_page.recompute_with_hover(&[]);
         }
 

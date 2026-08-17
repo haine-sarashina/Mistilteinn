@@ -717,43 +717,7 @@ fn build_layout_children<N, F>(
 
                     // Extract image src and dimensions from <img> and <svg> tags
                     if node.tag_name() == "img" {
-                        layout_node.image_src = node.get_attr("src").or_else(|| {
-                            node.get_attr("srcset").and_then(|ss| {
-                                ss.split(',').next().and_then(|first| {
-                                    first
-                                        .trim()
-                                        .split_whitespace()
-                                        .next()
-                                        .map(|s| s.to_string())
-                                })
-                            })
-                        });
-                        let attr_w = node
-                            .get_attr("width")
-                            .and_then(|w| w.trim().trim_end_matches("px").parse::<f32>().ok());
-                        let attr_h = node
-                            .get_attr("height")
-                            .and_then(|h| h.trim().trim_end_matches("px").parse::<f32>().ok());
-                        if let Some(w) = attr_w {
-                            layout_node.rect.width = w;
-                            if layout_node.explicit_width.is_none() {
-                                layout_node.explicit_width = Some(w);
-                            }
-                        }
-                        if let Some(h) = attr_h {
-                            layout_node.rect.height = h;
-                            if layout_node.explicit_height.is_none() {
-                                layout_node.explicit_height = Some(h);
-                            }
-                        }
-                        if let Some(w) = child_styles.width {
-                            layout_node.rect.width = w;
-                            layout_node.explicit_width = Some(w);
-                        }
-                        if let Some(h) = child_styles.height {
-                            layout_node.rect.height = h;
-                            layout_node.explicit_height = Some(h);
-                        }
+                        apply_img_attributes(&mut layout_node, &node, &child_styles);
                     } else if node.tag_name() == "svg" {
                         let attr_w = child_styles.width.or_else(|| {
                             node.get_attr("width")
@@ -920,43 +884,7 @@ fn build_layout_children<N, F>(
 
                     // Extract image src and dimensions from <img> and <svg> tags
                     if node.tag_name() == "img" {
-                        layout_node.image_src = node.get_attr("src").or_else(|| {
-                            node.get_attr("srcset").and_then(|ss| {
-                                ss.split(',').next().and_then(|first| {
-                                    first
-                                        .trim()
-                                        .split_whitespace()
-                                        .next()
-                                        .map(|s| s.to_string())
-                                })
-                            })
-                        });
-                        let attr_w = node
-                            .get_attr("width")
-                            .and_then(|w| w.trim().trim_end_matches("px").parse::<f32>().ok());
-                        let attr_h = node
-                            .get_attr("height")
-                            .and_then(|h| h.trim().trim_end_matches("px").parse::<f32>().ok());
-                        if let Some(w) = attr_w {
-                            layout_node.rect.width = w;
-                            if layout_node.explicit_width.is_none() {
-                                layout_node.explicit_width = Some(w);
-                            }
-                        }
-                        if let Some(h) = attr_h {
-                            layout_node.rect.height = h;
-                            if layout_node.explicit_height.is_none() {
-                                layout_node.explicit_height = Some(h);
-                            }
-                        }
-                        if let Some(w) = child_styles.width {
-                            layout_node.rect.width = w;
-                            layout_node.explicit_width = Some(w);
-                        }
-                        if let Some(h) = child_styles.height {
-                            layout_node.rect.height = h;
-                            layout_node.explicit_height = Some(h);
-                        }
+                        apply_img_attributes(&mut layout_node, &node, &child_styles);
                     } else if node.tag_name() == "svg" {
                         let attr_w = child_styles.width.or_else(|| {
                             node.get_attr("width")
@@ -3967,6 +3895,106 @@ pub fn break_into_lines(
     }
 
     line_boxes
+}
+
+/// Copy an `<img>`'s source and declared size onto its layout box.
+///
+/// The presentational `width`/`height` attributes are a floor that CSS
+/// overrides, which is the order the two appear in below. The chosen source
+/// comes from `srcset` when there is one — taking the first candidate meant
+/// taking whichever the author listed first, regardless of how big the image is
+/// drawn.
+fn apply_img_attributes<N: LayoutDomNode>(
+    layout_node: &mut LayoutNode,
+    node: &N,
+    child_styles: &ComputedValues,
+) {
+    let attr_px = |name: &str| {
+        node.get_attr(name)
+            .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
+    };
+    // The slot to pick a source for: whatever the markup or the CSS says the
+    // image will be drawn at. Zero means "not known yet", and the selection
+    // falls back to density candidates.
+    let slot_width = child_styles
+        .width
+        .or_else(|| attr_px("width"))
+        .unwrap_or(0.0);
+
+    layout_node.image_src = node.get_attr("src").or_else(|| {
+        node.get_attr("srcset").and_then(|attribute| {
+            let candidates = crate::html::srcset::parse(&attribute);
+            crate::html::srcset::select(&candidates, slot_width, 1.0).map(str::to_string)
+        })
+    });
+
+    if let Some(w) = attr_px("width") {
+        layout_node.rect.width = w;
+        if layout_node.explicit_width.is_none() {
+            layout_node.explicit_width = Some(w);
+        }
+    }
+    if let Some(h) = attr_px("height") {
+        layout_node.rect.height = h;
+        if layout_node.explicit_height.is_none() {
+            layout_node.explicit_height = Some(h);
+        }
+    }
+    if let Some(w) = child_styles.width {
+        layout_node.rect.width = w;
+        layout_node.explicit_width = Some(w);
+    }
+    if let Some(h) = child_styles.height {
+        layout_node.rect.height = h;
+        layout_node.explicit_height = Some(h);
+    }
+}
+
+/// Give every image the size of the picture it holds.
+///
+/// An `<img>` with no width or height in its markup or its CSS was laid out as
+/// an empty box: it reserved no space, so whatever followed was placed on top
+/// of it, and the painter — finding a box too small to be real — fell back to
+/// drawing the picture at its natural size over the text below. The image was
+/// visible, but the page was laid out as though it were not there.
+///
+/// The natural size is only knowable once the image has been decoded, which is
+/// after the first layout, so this runs as its own pass and the page is laid
+/// out again. Where one dimension is given, the other is derived from it so the
+/// aspect ratio holds, which is what a browser does and what stops a
+/// `width: 100%` image from being square.
+pub fn apply_intrinsic_image_sizes(
+    node: &mut LayoutNode,
+    natural_size: &impl Fn(&str) -> Option<(f32, f32)>,
+) {
+    if let Some(src) = node.image_src.clone() {
+        if let Some((natural_w, natural_h)) = natural_size(&src) {
+            if natural_w > 0.0 && natural_h > 0.0 {
+                let (width, height) = match (node.explicit_width, node.explicit_height) {
+                    (Some(w), Some(h)) => (Some(w), Some(h)),
+                    (Some(w), None) => (Some(w), Some(w * natural_h / natural_w)),
+                    (None, Some(h)) => (Some(h * natural_w / natural_h), Some(h)),
+                    (None, None) => (Some(natural_w), Some(natural_h)),
+                };
+                if let Some(w) = width {
+                    node.explicit_width = Some(w);
+                    node.rect.width = w;
+                }
+                if let Some(h) = height {
+                    node.explicit_height = Some(h);
+                    node.rect.height = h;
+                }
+            }
+        }
+    }
+
+    for child in node
+        .children
+        .iter_mut()
+        .chain(node.absolute_children.iter_mut())
+    {
+        apply_intrinsic_image_sizes(child, natural_size);
+    }
 }
 
 /// The size of the area the page can be scrolled over.

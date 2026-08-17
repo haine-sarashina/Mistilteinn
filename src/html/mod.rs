@@ -1,4 +1,5 @@
 pub mod parser;
+pub mod srcset;
 
 /// Parse HTML source into a \[DomArena\].
 ///

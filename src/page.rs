@@ -263,6 +263,24 @@ impl Page {
         self.layout_root =
             crate::layout::build_layout_tree(0, &self.styles, get_node, self.view_width);
 
+        // An image knows how big it is only once it has been decoded, which is
+        // after the first layout. Applying that here means the second layout —
+        // the one that runs when the images arrive — places everything around
+        // the space they actually take.
+        let base_url = self.base_url();
+        let cache = &self.image_cache;
+        crate::layout::apply_intrinsic_image_sizes(&mut self.layout_root, &|src| {
+            let resolved = if base_url.is_empty() {
+                src.to_string()
+            } else {
+                crate::network::resolve_url(&base_url, src)
+            };
+            cache
+                .get(&resolved)
+                .or_else(|| cache.get(src))
+                .map(|image| (image.width as f32, image.height as f32))
+        });
+
         // Re-extract absolute children and recompute layout
         crate::layout::extract_absolute_children(&mut self.layout_root);
         let mut text_renderer = crate::render::text::TextRenderer::new();
@@ -927,6 +945,149 @@ mod tests {
         let wrong_nonce = with_nonce.replace("r4nd0m'>", "guessed'>");
         let page = Page::new_with_csp(&wrong_nonce, "", 800.0, 600.0, &policy);
         assert_eq!(greeting(&page), "before");
+    }
+
+    /// A page with one image, whose decoded size is already known.
+    fn page_with_decoded_image(markup: &str, css: &str, natural: (u32, u32)) -> Page {
+        let mut page = Page::new(
+            &format!("<html><body>{markup}</body></html>"),
+            css,
+            800.0,
+            600.0,
+        );
+        page.image_cache.insert(
+            "photo.png".to_string(),
+            CachedImage {
+                rgba: vec![0; (natural.0 * natural.1 * 4) as usize],
+                width: natural.0,
+                height: natural.1,
+            },
+        );
+        page.recompute_with_hover(&[]);
+        page
+    }
+
+    /// The rect of the one image in the page.
+    fn image_rect(page: &Page) -> Rect {
+        fn find(node: &crate::layout::LayoutNode) -> Option<Rect> {
+            if node.image_src.is_some() {
+                return Some(node.rect);
+            }
+            node.children
+                .iter()
+                .chain(node.absolute_children.iter())
+                .find_map(find)
+        }
+        find(&page.layout_root).expect("the image is in the layout tree")
+    }
+
+    #[test]
+    fn an_image_with_no_declared_size_takes_the_size_of_its_picture() {
+        // Without this the box is empty: the image reserves no space, whatever
+        // follows is placed on top of it, and the painter draws the picture at
+        // its natural size over that content.
+        let page = page_with_decoded_image("<img src='photo.png'>", "", (320, 240));
+        let rect = image_rect(&page);
+        assert_eq!((rect.width, rect.height), (320.0, 240.0));
+    }
+
+    #[test]
+    fn a_declared_width_derives_the_height_from_the_aspect_ratio() {
+        let page = page_with_decoded_image("<img src='photo.png' width='160'>", "", (320, 240));
+        let rect = image_rect(&page);
+        assert_eq!(rect.width, 160.0);
+        assert_eq!(rect.height, 120.0, "half the width is half the height");
+    }
+
+    #[test]
+    fn a_declared_height_derives_the_width() {
+        let page = page_with_decoded_image("<img src='photo.png' height='120'>", "", (320, 240));
+        let rect = image_rect(&page);
+        assert_eq!(rect.width, 160.0);
+        assert_eq!(rect.height, 120.0);
+    }
+
+    #[test]
+    fn a_size_declared_in_both_directions_is_left_alone() {
+        // The page asked for a distortion; that is the page's business.
+        let page = page_with_decoded_image(
+            "<img src='photo.png'>",
+            "img { width: 100px; height: 300px }",
+            (320, 240),
+        );
+        let rect = image_rect(&page);
+        assert_eq!((rect.width, rect.height), (100.0, 300.0));
+    }
+
+    #[test]
+    fn content_after_an_image_clears_the_space_it_takes() {
+        // The symptom the sizing fixes: a paragraph after an unsized image was
+        // laid out as though the image were not there.
+        let mut page = Page::new(
+            "<html><body><img src='photo.png'><p id='after'>下の段落</p></body></html>",
+            "body { margin: 0 } p { margin: 0 }",
+            800.0,
+            600.0,
+        );
+        page.image_cache.insert(
+            "photo.png".to_string(),
+            CachedImage {
+                rgba: vec![0; 200 * 150 * 4],
+                width: 200,
+                height: 150,
+            },
+        );
+        page.recompute_with_hover(&[]);
+
+        let image = image_rect(&page);
+        let after = rect_of(&page, "after");
+        assert!(image.height >= 150.0);
+        assert!(
+            after.y >= image.y + image.height - 1.0,
+            "the paragraph should start below the image: image bottom {}, paragraph y {}",
+            image.y + image.height,
+            after.y
+        );
+    }
+
+    #[test]
+    fn an_image_that_has_not_arrived_yet_is_left_as_it_was() {
+        // Nothing is known about its size, so nothing is invented for it: the
+        // box keeps the empty-inline floor it had before, and the painter's own
+        // fallback covers the gap until the picture arrives.
+        let page = Page::new(
+            "<html><body><img src='missing.png'></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        assert!(image_rect(&page).width < 4.0);
+    }
+
+    #[test]
+    fn a_srcset_image_is_chosen_by_the_width_it_is_drawn_at() {
+        let page = Page::new(
+            "<html><body>\
+             <img srcset='small.png 400w, large.png 1600w' width='1000'>\
+             </body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        fn find_src(node: &crate::layout::LayoutNode) -> Option<String> {
+            if let Some(src) = &node.image_src {
+                return Some(src.clone());
+            }
+            node.children
+                .iter()
+                .chain(node.absolute_children.iter())
+                .find_map(find_src)
+        }
+        assert_eq!(
+            find_src(&page.layout_root).as_deref(),
+            Some("large.png"),
+            "a 1000px slot needs more than a 400px source"
+        );
     }
 
     #[test]

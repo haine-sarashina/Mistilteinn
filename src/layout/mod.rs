@@ -4066,6 +4066,45 @@ pub enum PaintItem {
     Image(ImageInfo),
 }
 
+/// One thing to paint, together with the clip in force where it is painted.
+#[derive(Clone, Debug)]
+pub struct DisplayItem {
+    pub item: PaintItem,
+    /// The intersection of every `overflow` clip between the root and this
+    /// item, in layout coordinates. `None` means nothing clips it.
+    pub clip: Option<Rect>,
+}
+
+/// The rectangle an `overflow` value other than `visible` clips its descendants
+/// to — the padding box, so a scroll container's own padding still shows
+/// content, but its border and margin never do.
+fn overflow_clip_rect(node: &LayoutNode) -> Rect {
+    Rect::new(
+        node.rect.x + node.margin[3] + node.border[3],
+        node.rect.y + node.margin[0] + node.border[0],
+        (node.rect.width - node.margin[3] - node.margin[1] - node.border[3] - node.border[1])
+            .max(0.0),
+        (node.rect.height - node.margin[0] - node.margin[2] - node.border[0] - node.border[2])
+            .max(0.0),
+    )
+}
+
+/// The clip a node's descendants inherit.
+fn descendant_clip(node: &LayoutNode, inherited: Option<Rect>) -> Option<Rect> {
+    if node.overflow == Overflow::Visible {
+        return inherited;
+    }
+    let own = overflow_clip_rect(node);
+    match inherited {
+        // Two clippers both apply, so only their overlap survives. An empty
+        // overlap means nothing inside can be seen at all.
+        Some(outer) => outer
+            .intersect(&own)
+            .or(Some(Rect::new(0.0, 0.0, 0.0, 0.0))),
+        None => Some(own),
+    }
+}
+
 /// Whether this box starts a new stacking context.
 ///
 /// Only the positioned-with-a-z-index case is modelled; `opacity`, `transform`,
@@ -4090,18 +4129,19 @@ fn child_boxes(node: &LayoutNode) -> impl Iterator<Item = &LayoutNode> {
 /// The seven layers of CSS 2.1 Appendix E, gathered before being flattened.
 #[derive(Default)]
 struct StackingLayers<'a> {
-    /// Layer 2: child stacking contexts with a negative z-index.
-    negative: Vec<&'a LayoutNode>,
+    /// Layer 2: child stacking contexts with a negative z-index, each with the
+    /// clip it inherited from where it sits in the tree.
+    negative: Vec<(&'a LayoutNode, Option<Rect>)>,
     /// Layer 3: backgrounds and borders of in-flow, non-inline descendants.
-    block_backgrounds: Vec<PaintItem>,
+    block_backgrounds: Vec<DisplayItem>,
     /// Layer 4: non-positioned floats, each painted as a unit.
-    floats: Vec<PaintItem>,
+    floats: Vec<DisplayItem>,
     /// Layer 5: in-flow inline content — text, replaced elements, inline boxes.
-    inline_content: Vec<PaintItem>,
+    inline_content: Vec<DisplayItem>,
     /// Layer 6: positioned descendants that left z-index at `auto`.
-    auto_positioned: Vec<&'a LayoutNode>,
+    auto_positioned: Vec<(&'a LayoutNode, Option<Rect>)>,
     /// Layer 7: child stacking contexts with a positive z-index.
-    positive: Vec<&'a LayoutNode>,
+    positive: Vec<(&'a LayoutNode, Option<Rect>)>,
 }
 
 /// Build the page's paint order.
@@ -4121,49 +4161,67 @@ struct StackingLayers<'a> {
 /// able to escape it. We paint its subtree as a unit instead. The difference
 /// only shows when such a descendant needs to sort against boxes outside the
 /// ancestor, which is rare in practice.
-pub fn build_display_list(root: &LayoutNode) -> Vec<PaintItem> {
+pub fn build_display_list(root: &LayoutNode) -> Vec<DisplayItem> {
     let mut out = Vec::new();
-    paint_stacking_context(root, &mut out);
+    paint_stacking_context(root, None, &mut out);
     out
 }
 
-fn paint_stacking_context(root: &LayoutNode, out: &mut Vec<PaintItem>) {
+fn paint_stacking_context(root: &LayoutNode, clip: Option<Rect>, out: &mut Vec<DisplayItem>) {
     if matches!(root.display, DisplayType::None) {
         return;
     }
 
-    // Layer 1: the context root's own background and borders.
-    out.extend(collect_own_decoration(root).map(PaintItem::Decoration));
+    // Layer 1: the context root's own background and borders. Its own overflow
+    // does not clip these — a scroll container still paints its own background
+    // and border — but an ancestor's clip does.
+    out.extend(
+        collect_own_decoration(root)
+            .map(PaintItem::Decoration)
+            .map(|item| DisplayItem { item, clip }),
+    );
+
+    let inner = descendant_clip(root, clip);
 
     let mut layers = StackingLayers::default();
     // The root's own content belongs to the in-flow content of this context.
-    layers
-        .inline_content
-        .extend(collect_own_text(root).into_iter().map(PaintItem::Text));
-    layers
-        .inline_content
-        .extend(collect_own_image(root).map(PaintItem::Image));
+    layers.inline_content.extend(
+        collect_own_text(root)
+            .into_iter()
+            .map(PaintItem::Text)
+            .map(|item| DisplayItem { item, clip: inner }),
+    );
+    layers.inline_content.extend(
+        collect_own_image(root)
+            .map(PaintItem::Image)
+            .map(|item| DisplayItem { item, clip: inner }),
+    );
 
     for child in child_boxes(root) {
-        collect_into_layers(child, text_flattened_into_parent(root, child), &mut layers);
+        collect_into_layers(
+            child,
+            text_flattened_into_parent(root, child),
+            inner,
+            &mut layers,
+        );
     }
 
     // Lowest z-index first, document order breaking ties — `sort_by_key` is
     // stable, so equal keys keep the order they were collected in.
-    layers.negative.sort_by_key(|n| n.z_index.unwrap_or(0));
-    layers.positive.sort_by_key(|n| n.z_index.unwrap_or(0));
+    layers.negative.sort_by_key(|(n, _)| n.z_index.unwrap_or(0));
+    layers.positive.sort_by_key(|(n, _)| n.z_index.unwrap_or(0));
 
-    for node in layers.negative {
-        paint_stacking_context(node, out);
+    for (node, node_clip) in layers.negative {
+        paint_stacking_context(node, node_clip, out);
     }
     out.extend(layers.block_backgrounds);
     out.extend(layers.floats);
     out.extend(layers.inline_content);
-    for node in layers.auto_positioned {
-        paint_stacking_context(node, out);
+    for (node, node_clip) in layers.auto_positioned {
+        paint_stacking_context(node, node_clip, out);
     }
-    for node in layers.positive {
-        paint_stacking_context(node, out);
+    for (node, node_clip) in layers.positive {
+        paint_stacking_context(node, node_clip, out);
     }
 }
 
@@ -4177,6 +4235,7 @@ fn paint_stacking_context(root: &LayoutNode, out: &mut Vec<PaintItem>) {
 fn collect_into_layers<'a>(
     node: &'a LayoutNode,
     text_already_painted: bool,
+    clip: Option<Rect>,
     layers: &mut StackingLayers<'a>,
 ) {
     if matches!(node.display, DisplayType::None) {
@@ -4184,17 +4243,18 @@ fn collect_into_layers<'a>(
     }
 
     if is_positioned(node) {
+        // Painted later in its own layer; the clip it inherited travels with it.
         let z = if establishes_stacking_context(node) {
             node.z_index.unwrap_or(0)
         } else {
             0
         };
         if z < 0 {
-            layers.negative.push(node);
+            layers.negative.push((node, clip));
         } else if z > 0 {
-            layers.positive.push(node);
+            layers.positive.push((node, clip));
         } else {
-            layers.auto_positioned.push(node);
+            layers.auto_positioned.push((node, clip));
         }
         return;
     }
@@ -4203,7 +4263,7 @@ fn collect_into_layers<'a>(
     // backgrounds but below the in-flow inline content that wraps around it.
     if node.float != FloatType::None {
         let mut float_items = Vec::new();
-        paint_stacking_context(node, &mut float_items);
+        paint_stacking_context(node, clip, &mut float_items);
         layers.floats.extend(float_items);
         return;
     }
@@ -4212,23 +4272,33 @@ fn collect_into_layers<'a>(
         node.display,
         DisplayType::Inline | DisplayType::InlineBlock | DisplayType::InlineFlex
     );
-    let decoration = collect_own_decoration(node).map(PaintItem::Decoration);
+    let decoration = collect_own_decoration(node)
+        .map(PaintItem::Decoration)
+        .map(|item| DisplayItem { item, clip });
     if is_inline_level {
         layers.inline_content.extend(decoration);
     } else {
         layers.block_backgrounds.extend(decoration);
     }
 
+    // This box's own overflow clips its content as well as its descendants'.
+    let inner = descendant_clip(node, clip);
+
     // A box with its own line boxes owns those runs outright — it is a block
     // container, so no ancestor's line boxes can have contained them.
     if !text_already_painted || node.line_boxes.is_some() {
-        layers
-            .inline_content
-            .extend(collect_own_text(node).into_iter().map(PaintItem::Text));
+        layers.inline_content.extend(
+            collect_own_text(node)
+                .into_iter()
+                .map(PaintItem::Text)
+                .map(|item| DisplayItem { item, clip: inner }),
+        );
     }
-    layers
-        .inline_content
-        .extend(collect_own_image(node).map(PaintItem::Image));
+    layers.inline_content.extend(
+        collect_own_image(node)
+            .map(PaintItem::Image)
+            .map(|item| DisplayItem { item, clip: inner }),
+    );
 
     for child in child_boxes(node) {
         // Suppression is inherited: inline layout flattens a whole inline
@@ -4238,7 +4308,7 @@ fn collect_into_layers<'a>(
         } else {
             text_already_painted
         };
-        collect_into_layers(child, child_flattened, layers);
+        collect_into_layers(child, child_flattened, inner, layers);
     }
 }
 
@@ -5845,7 +5915,7 @@ mod tests {
     fn paint_order(root: &LayoutNode) -> Vec<String> {
         build_display_list(root)
             .into_iter()
-            .filter_map(|item| match item {
+            .filter_map(|entry| match entry.item {
                 PaintItem::Text(t) => Some(t.text),
                 _ => None,
             })
@@ -5857,6 +5927,109 @@ mod tests {
         let mut n = LayoutNode::new(Rect::new(0.0, y, 100.0, 50.0));
         n.text = Some(text.to_string());
         n
+    }
+
+    /// A block with `overflow: hidden` containing one text child.
+    fn clipper_with_text(overflow: Overflow) -> LayoutNode {
+        let mut clipper = LayoutNode::new(Rect::new(10.0, 10.0, 100.0, 50.0));
+        clipper.overflow = overflow;
+        clipper.add_child(text_block("inside", 10.0));
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(clipper);
+        root
+    }
+
+    /// The clip of the first text item in the list.
+    fn first_text_clip(root: &LayoutNode) -> Option<Rect> {
+        build_display_list(root)
+            .into_iter()
+            .find_map(|entry| match entry.item {
+                PaintItem::Text(_) => Some(entry.clip),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    #[test]
+    fn overflow_hidden_clips_its_content() {
+        let root = clipper_with_text(Overflow::Hidden);
+        let clip = first_text_clip(&root).expect("the content should be clipped");
+        assert_eq!(
+            (clip.x, clip.y, clip.width, clip.height),
+            (10.0, 10.0, 100.0, 50.0)
+        );
+    }
+
+    #[test]
+    fn overflow_visible_clips_nothing() {
+        let root = clipper_with_text(Overflow::Visible);
+        assert!(
+            first_text_clip(&root).is_none(),
+            "visible overflow must not introduce a clip"
+        );
+    }
+
+    #[test]
+    fn nested_clips_intersect() {
+        // Both clippers apply, so only the overlap survives.
+        let mut inner = LayoutNode::new(Rect::new(50.0, 0.0, 200.0, 200.0));
+        inner.overflow = Overflow::Hidden;
+        inner.add_child(text_block("deep", 0.0));
+
+        let mut outer = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        outer.overflow = Overflow::Hidden;
+        outer.add_child(inner);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(outer);
+
+        let clip = first_text_clip(&root).expect("clipped by both");
+        assert_eq!(
+            (clip.x, clip.width),
+            (50.0, 50.0),
+            "the overlap of 0..100 and 50..250 is 50..100"
+        );
+    }
+
+    #[test]
+    fn a_clipper_is_not_clipped_by_its_own_overflow() {
+        // A scroll container paints its own background and border in full; only
+        // what is inside it gets cut.
+        let mut clipper = LayoutNode::new(Rect::new(10.0, 10.0, 100.0, 50.0));
+        clipper.overflow = Overflow::Hidden;
+        clipper.background_color = Some([1, 2, 3, 255]);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(clipper);
+
+        let own = build_display_list(&root)
+            .into_iter()
+            .find(|entry| {
+                matches!(&entry.item, PaintItem::Decoration(d)
+                if d.background_color == Some([1, 2, 3, 255]))
+            })
+            .expect("the clipper paints its own background");
+        assert!(own.clip.is_none());
+    }
+
+    #[test]
+    fn a_clip_travels_with_a_positioned_descendant() {
+        // A positioned box is painted in a later layer, but the clip it sat
+        // under still applies to it.
+        let mut abs = abs_child(Some(5), "overlay");
+        abs.rect = Rect::new(0.0, 0.0, 400.0, 400.0);
+
+        let mut clipper = LayoutNode::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        clipper.overflow = Overflow::Hidden;
+        clipper.add_child(abs);
+        extract_absolute_children(&mut clipper);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(clipper);
+
+        let clip = first_text_clip(&root).expect("the overlay is clipped too");
+        assert_eq!(clip.width, 100.0);
     }
 
     #[test]
@@ -5875,11 +6048,11 @@ mod tests {
         let list = build_display_list(&root);
         let text_at = list
             .iter()
-            .position(|i| matches!(i, PaintItem::Text(t) if t.text == "flow text"))
+            .position(|i| matches!(&i.item, PaintItem::Text(t) if t.text == "flow text"))
             .unwrap();
         let overlay_at = list
             .iter()
-            .position(|i| matches!(i, PaintItem::Decoration(_)))
+            .position(|i| matches!(&i.item, PaintItem::Decoration(_)))
             .unwrap();
         assert!(
             overlay_at > text_at,
@@ -5948,15 +6121,15 @@ mod tests {
         let list = build_display_list(&root);
         let block_bg = list
             .iter()
-            .position(|i| matches!(i, PaintItem::Decoration(_)))
+            .position(|i| matches!(&i.item, PaintItem::Decoration(_)))
             .unwrap();
         let float_text = list
             .iter()
-            .position(|i| matches!(i, PaintItem::Text(t) if t.text == "floated"))
+            .position(|i| matches!(&i.item, PaintItem::Text(t) if t.text == "floated"))
             .unwrap();
         let flow_text = list
             .iter()
-            .position(|i| matches!(i, PaintItem::Text(t) if t.text == "wrapping text"))
+            .position(|i| matches!(&i.item, PaintItem::Text(t) if t.text == "wrapping text"))
             .unwrap();
 
         assert!(block_bg < float_text, "float paints over block backgrounds");
@@ -6196,13 +6369,14 @@ mod tests {
 
         let list = build_display_list(&root);
         assert!(
-            list.iter().any(|i| matches!(i, PaintItem::Decoration(d)
+            list.iter()
+                .any(|i| matches!(&i.item, PaintItem::Decoration(d)
                 if d.background_color == Some([255, 255, 0, 255]))),
             "the inline background is still painted"
         );
         assert!(
             list.iter()
-                .any(|i| matches!(i, PaintItem::Image(im) if im.src == "icon.png")),
+                .any(|i| matches!(&i.item, PaintItem::Image(im) if im.src == "icon.png")),
             "the inline image is still painted"
         );
     }

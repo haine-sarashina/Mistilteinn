@@ -12,6 +12,7 @@ pub mod text;
 use crate::css::{
     BackgroundLength, BackgroundPosition, BackgroundRepeat, BackgroundSize, BorderStyle,
 };
+use crate::layout::Rect;
 
 /// Maximum number of rectangles the GPU render pipeline can handle in a single frame.
 pub const MAX_RECTS: usize = 2048;
@@ -827,6 +828,129 @@ pub fn composite_image_scaled(
     }
 }
 
+/// The parts of `bounds` that `clip` does not cover, as up to four rectangles.
+///
+/// Empty when `bounds` lies entirely inside `clip`.
+fn outside_clip(bounds: Rect, clip: Rect) -> Vec<Rect> {
+    let mut parts = Vec::new();
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return parts;
+    }
+    if clip.intersect(&bounds).is_none() {
+        parts.push(bounds);
+        return parts;
+    }
+
+    let top = clip.y.max(bounds.y);
+    let bottom = clip.bottom().min(bounds.bottom());
+
+    // Full-width strips above and below the clip.
+    if bounds.y < top {
+        parts.push(Rect::new(bounds.x, bounds.y, bounds.width, top - bounds.y));
+    }
+    if bounds.bottom() > bottom {
+        parts.push(Rect::new(
+            bounds.x,
+            bottom,
+            bounds.width,
+            bounds.bottom() - bottom,
+        ));
+    }
+    // Side strips, limited to the rows the clip spans.
+    let band_height = (bottom - top).max(0.0);
+    if band_height > 0.0 {
+        if bounds.x < clip.x {
+            parts.push(Rect::new(
+                bounds.x,
+                top,
+                (clip.x - bounds.x).min(bounds.width),
+                band_height,
+            ));
+        }
+        if bounds.right() > clip.right() {
+            let x = clip.right().max(bounds.x);
+            parts.push(Rect::new(x, top, bounds.right() - x, band_height));
+        }
+    }
+    parts
+}
+
+/// Copy a rectangle of pixels out of the buffer.
+fn save_region(buffer: &[u8], buf_width: u32, buf_height: u32, rect: Rect) -> Vec<u8> {
+    let (x0, y0, x1, y1) = clamp_rect(rect, buf_width, buf_height);
+    let mut saved = Vec::with_capacity(((x1 - x0) * (y1 - y0) * 4) as usize);
+    for y in y0..y1 {
+        let row = (y * buf_width + x0) as usize * 4;
+        let len = ((x1 - x0) * 4) as usize;
+        saved.extend_from_slice(&buffer[row..row + len]);
+    }
+    saved
+}
+
+/// Put a saved rectangle of pixels back.
+fn restore_region(buffer: &mut [u8], buf_width: u32, buf_height: u32, rect: Rect, saved: &[u8]) {
+    let (x0, y0, x1, y1) = clamp_rect(rect, buf_width, buf_height);
+    let stride = ((x1 - x0) * 4) as usize;
+    for (i, y) in (y0..y1).enumerate() {
+        let row = (y * buf_width + x0) as usize * 4;
+        let src = i * stride;
+        if src + stride <= saved.len() && row + stride <= buffer.len() {
+            buffer[row..row + stride].copy_from_slice(&saved[src..src + stride]);
+        }
+    }
+}
+
+/// A rect as integer pixel bounds inside the buffer.
+fn clamp_rect(rect: Rect, buf_width: u32, buf_height: u32) -> (u32, u32, u32, u32) {
+    let x0 = rect.x.floor().max(0.0) as u32;
+    let y0 = rect.y.floor().max(0.0) as u32;
+    let x1 = (rect.right().ceil().max(0.0) as u32).min(buf_width);
+    let y1 = (rect.bottom().ceil().max(0.0) as u32).min(buf_height);
+    (x0.min(x1), y0.min(y1), x1, y1)
+}
+
+/// Paint with everything outside `clip` left untouched.
+///
+/// None of the painters takes a clip rectangle, and threading one through all
+/// of them — solid fills, rounded fills, four border sides with their own dash
+/// phases, tiled backgrounds, glyph masks, scaled images — would touch every
+/// call site including the browser chrome. Instead the pixels of `bounds` that
+/// fall outside `clip` are saved, the paint runs, and those pixels are put back.
+///
+/// When the item lies entirely inside the clip, which is the ordinary case,
+/// there is nothing to save and this costs nothing. `bounds` may be generous:
+/// a larger one only means more area is correctly restored.
+pub fn with_scissor(
+    buffer: &mut [u8],
+    buf_width: u32,
+    buf_height: u32,
+    bounds: Rect,
+    clip: Option<Rect>,
+    paint: impl FnOnce(&mut [u8]),
+) {
+    let Some(clip) = clip else {
+        paint(buffer);
+        return;
+    };
+
+    let spill = outside_clip(bounds, clip);
+    if spill.is_empty() {
+        paint(buffer);
+        return;
+    }
+
+    let saved: Vec<(Rect, Vec<u8>)> = spill
+        .into_iter()
+        .map(|rect| (rect, save_region(buffer, buf_width, buf_height, rect)))
+        .collect();
+
+    paint(buffer);
+
+    for (rect, pixels) in saved {
+        restore_region(buffer, buf_width, buf_height, rect, &pixels);
+    }
+}
+
 /// Draw the drop arrow of a `<select>`, inside the padding the UA style
 /// reserves on its right edge.
 pub fn draw_select_arrow(
@@ -1552,6 +1676,103 @@ mod tests {
     /// Whether the top-edge pixel at `x` was painted.
     fn top_edge_painted(dest: &[u8], stride: usize, x: usize) -> bool {
         dest[x * 4 + 3] != 0
+    }
+
+    #[test]
+    fn a_box_fully_inside_the_clip_needs_no_saving() {
+        let bounds = Rect::new(10.0, 10.0, 20.0, 20.0);
+        let clip = Rect::new(0.0, 0.0, 100.0, 100.0);
+        assert!(
+            outside_clip(bounds, clip).is_empty(),
+            "the ordinary case must cost nothing"
+        );
+    }
+
+    #[test]
+    fn a_box_fully_outside_the_clip_is_entirely_spill() {
+        let bounds = Rect::new(200.0, 200.0, 20.0, 20.0);
+        let clip = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let spill = outside_clip(bounds, clip);
+        assert_eq!(spill.len(), 1);
+        assert_eq!(spill[0].width, 20.0);
+    }
+
+    #[test]
+    fn the_spill_of_a_partly_clipped_box_covers_exactly_what_is_outside() {
+        // A 100-wide box in a 40-wide clip: 60 wide of spill on the right.
+        let bounds = Rect::new(0.0, 0.0, 100.0, 10.0);
+        let clip = Rect::new(0.0, 0.0, 40.0, 10.0);
+        let spill = outside_clip(bounds, clip);
+        let area: f32 = spill.iter().map(|r| r.width * r.height).sum();
+        assert_eq!(area, 60.0 * 10.0, "spill: {spill:?}");
+    }
+
+    #[test]
+    fn the_scissor_keeps_paint_inside_the_clip() {
+        let mut dest = vec![0u8; 20 * 20 * 4];
+        let clip = Rect::new(0.0, 0.0, 10.0, 20.0);
+
+        // Paint a full-width bar; only the left half may survive.
+        with_scissor(
+            &mut dest,
+            20,
+            20,
+            Rect::new(0.0, 0.0, 20.0, 4.0),
+            Some(clip),
+            |buf| {
+                draw_solid_rect(buf, 20, 20, 0.0, 0.0, 20.0, 4.0, [255, 0, 0, 255]);
+            },
+        );
+
+        let px = |x: usize, y: usize| dest[(y * 20 + x) * 4 + 3];
+        assert_ne!(px(0, 0), 0, "inside the clip is painted");
+        assert_ne!(px(9, 3), 0, "up to the clip edge is painted");
+        assert_eq!(px(10, 0), 0, "past the clip edge is not");
+        assert_eq!(px(19, 3), 0, "nor is the far end");
+    }
+
+    #[test]
+    fn the_scissor_leaves_earlier_paint_outside_the_clip_intact() {
+        // The spill is restored, not cleared: whatever was already there must
+        // come back untouched.
+        let mut dest = vec![0u8; 20 * 20 * 4];
+        draw_solid_rect(&mut dest, 20, 20, 0.0, 0.0, 20.0, 4.0, [0, 0, 255, 255]);
+
+        let clip = Rect::new(0.0, 0.0, 10.0, 20.0);
+        with_scissor(
+            &mut dest,
+            20,
+            20,
+            Rect::new(0.0, 0.0, 20.0, 4.0),
+            Some(clip),
+            |buf| {
+                draw_solid_rect(buf, 20, 20, 0.0, 0.0, 20.0, 4.0, [255, 0, 0, 255]);
+            },
+        );
+
+        let px = |x: usize| dest[x * 4..x * 4 + 4].to_vec();
+        assert_eq!(px(0), vec![255, 0, 0, 255], "inside: overpainted");
+        assert_eq!(
+            px(15),
+            vec![0, 0, 255, 255],
+            "outside: the earlier blue kept"
+        );
+    }
+
+    #[test]
+    fn no_clip_paints_everything() {
+        let mut dest = vec![0u8; 20 * 20 * 4];
+        with_scissor(
+            &mut dest,
+            20,
+            20,
+            Rect::new(0.0, 0.0, 20.0, 4.0),
+            None,
+            |buf| {
+                draw_solid_rect(buf, 20, 20, 0.0, 0.0, 20.0, 4.0, [255, 0, 0, 255]);
+            },
+        );
+        assert_ne!(dest[19 * 4 + 3], 0);
     }
 
     #[test]

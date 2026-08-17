@@ -765,141 +765,179 @@ impl MistilteinnApp {
 
         let mut text_renderer = TextRenderer::new();
 
-        for item in &display_list {
-            match item {
-                crate::layout::PaintItem::Decoration(deco) => {
-                    let dx = deco.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
-                    let dy = deco.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
+        // Screen coordinates for a layout rect.
+        let to_screen_rect = |r: crate::layout::Rect| {
+            crate::layout::Rect::new(
+                r.x - scroll_offset.0 + TAB_BAR_WIDTH as f32,
+                r.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32,
+                r.width,
+                r.height,
+            )
+        };
 
-                    if let Some(bg) = deco.background_color {
-                        if deco.border_radius > 0.0 {
-                            crate::render::draw_rounded_rect_fill(
-                                &mut composite_buffer,
+        for entry in &display_list {
+            // An `overflow` clip on an ancestor keeps this item inside that
+            // box. The bounds handed to the scissor may be generous — being too
+            // large only means more area is correctly restored.
+            let clip = entry.clip.map(to_screen_rect);
+            let bounds = match &entry.item {
+                crate::layout::PaintItem::Decoration(d) => {
+                    crate::layout::Rect::new(d.x, d.y, d.width, d.height)
+                }
+                crate::layout::PaintItem::Text(t) => crate::layout::Rect::new(
+                    t.x - t.font_size,
+                    t.y - t.font_size,
+                    t.width + t.font_size * 2.0,
+                    t.font_size * 3.0,
+                ),
+                crate::layout::PaintItem::Image(i) => {
+                    crate::layout::Rect::new(i.x, i.y, i.width.max(1.0), i.height.max(1.0))
+                }
+            };
+            let bounds = to_screen_rect(bounds);
+
+            crate::render::with_scissor(
+                &mut composite_buffer,
+                win_w,
+                win_h,
+                bounds,
+                clip,
+                |composite_buffer: &mut [u8]| {
+                    match &entry.item {
+                        crate::layout::PaintItem::Decoration(deco) => {
+                            let dx = deco.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
+                            let dy = deco.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
+
+                            if let Some(bg) = deco.background_color {
+                                if deco.border_radius > 0.0 {
+                                    crate::render::draw_rounded_rect_fill(
+                                        composite_buffer,
+                                        win_w,
+                                        win_h,
+                                        dx,
+                                        dy,
+                                        deco.width,
+                                        deco.height,
+                                        deco.border_radius,
+                                        bg,
+                                    );
+                                } else {
+                                    crate::render::draw_solid_rect(
+                                        composite_buffer,
+                                        win_w,
+                                        win_h,
+                                        dx,
+                                        dy,
+                                        deco.width,
+                                        deco.height,
+                                        bg,
+                                    );
+                                }
+                            }
+
+                            // The image paints over the background colour and under the border.
+                            if let Some(ref src) = deco.background_image {
+                                if let Some(cached) = lookup_image(src) {
+                                    crate::render::draw_background_image(
+                                        &cached.rgba,
+                                        cached.width,
+                                        cached.height,
+                                        composite_buffer,
+                                        win_w,
+                                        win_h,
+                                        dx,
+                                        dy,
+                                        deco.width,
+                                        deco.height,
+                                        deco.background_size,
+                                        deco.background_position,
+                                        deco.background_repeat,
+                                    );
+                                }
+                            }
+
+                            crate::render::draw_rect_borders(
+                                composite_buffer,
                                 win_w,
                                 win_h,
                                 dx,
                                 dy,
                                 deco.width,
                                 deco.height,
-                                deco.border_radius,
-                                bg,
-                            );
-                        } else {
-                            crate::render::draw_solid_rect(
-                                &mut composite_buffer,
-                                win_w,
-                                win_h,
-                                dx,
-                                dy,
-                                deco.width,
-                                deco.height,
-                                bg,
+                                deco.border_width,
+                                deco.border_color,
+                                deco.border_style,
                             );
                         }
-                    }
 
-                    // The image paints over the background colour and under the border.
-                    if let Some(ref src) = deco.background_image {
-                        if let Some(cached) = lookup_image(src) {
-                            crate::render::draw_background_image(
-                                &cached.rgba,
-                                cached.width,
-                                cached.height,
-                                &mut composite_buffer,
+                        crate::layout::PaintItem::Text(text_info) => {
+                            let color_f32: [f32; 4] = [
+                                text_info.color[0] as f32 / 255.0,
+                                text_info.color[1] as f32 / 255.0,
+                                text_info.color[2] as f32 / 255.0,
+                                text_info.color[3] as f32 / 255.0,
+                            ];
+
+                            // Apply scroll offset and shift by chrome dimensions
+                            let text_x = text_info.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
+                            let text_y = text_info.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
+
+                            text_renderer.rasterize_to_bitmap_styled(
+                                &text_info.text,
+                                text_info.font_size,
+                                &text_info.font_family,
+                                color_f32,
+                                text_x,
+                                text_y,
+                                text_info.width,
+                                text_info.text_style,
+                                composite_buffer,
                                 win_w,
                                 win_h,
-                                dx,
-                                dy,
-                                deco.width,
-                                deco.height,
-                                deco.background_size,
-                                deco.background_position,
-                                deco.background_repeat,
                             );
                         }
+
+                        crate::layout::PaintItem::Image(img_info) => {
+                            // Skip unpositioned or collapsed small icons at (0, 0).
+                            let collapsed_icon = img_info.x <= 0.0
+                                && img_info.y <= 0.0
+                                && img_info.width < 32.0
+                                && img_info.height < 32.0;
+                            let Some(cached) =
+                                lookup_image(&img_info.src).filter(|_| !collapsed_icon)
+                            else {
+                                return;
+                            };
+                            let img_x = img_info.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
+                            let img_y = img_info.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
+                            let target_w = if img_info.width >= 4.0 {
+                                img_info.width
+                            } else {
+                                cached.width as f32
+                            };
+                            let target_h = if img_info.height >= 4.0 {
+                                img_info.height
+                            } else {
+                                cached.height as f32
+                            };
+                            if target_w >= 4.0 && target_h >= 4.0 {
+                                crate::render::composite_image_scaled(
+                                    &cached.rgba,
+                                    cached.width,
+                                    cached.height,
+                                    composite_buffer,
+                                    win_w,
+                                    win_h,
+                                    img_x,
+                                    img_y,
+                                    target_w,
+                                    target_h,
+                                );
+                            }
+                        }
                     }
-
-                    crate::render::draw_rect_borders(
-                        &mut composite_buffer,
-                        win_w,
-                        win_h,
-                        dx,
-                        dy,
-                        deco.width,
-                        deco.height,
-                        deco.border_width,
-                        deco.border_color,
-                        deco.border_style,
-                    );
-                }
-
-                crate::layout::PaintItem::Text(text_info) => {
-                    let color_f32: [f32; 4] = [
-                        text_info.color[0] as f32 / 255.0,
-                        text_info.color[1] as f32 / 255.0,
-                        text_info.color[2] as f32 / 255.0,
-                        text_info.color[3] as f32 / 255.0,
-                    ];
-
-                    // Apply scroll offset and shift by chrome dimensions
-                    let text_x = text_info.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
-                    let text_y = text_info.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
-
-                    text_renderer.rasterize_to_bitmap_styled(
-                        &text_info.text,
-                        text_info.font_size,
-                        &text_info.font_family,
-                        color_f32,
-                        text_x,
-                        text_y,
-                        text_info.width,
-                        text_info.text_style,
-                        &mut composite_buffer,
-                        win_w,
-                        win_h,
-                    );
-                }
-
-                crate::layout::PaintItem::Image(img_info) => {
-                    let Some(cached) = lookup_image(&img_info.src) else {
-                        continue;
-                    };
-                    // Skip unpositioned or collapsed small icons at (0, 0)
-                    if img_info.x <= 0.0
-                        && img_info.y <= 0.0
-                        && img_info.width < 32.0
-                        && img_info.height < 32.0
-                    {
-                        continue;
-                    }
-                    let img_x = img_info.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
-                    let img_y = img_info.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
-                    let target_w = if img_info.width >= 4.0 {
-                        img_info.width
-                    } else {
-                        cached.width as f32
-                    };
-                    let target_h = if img_info.height >= 4.0 {
-                        img_info.height
-                    } else {
-                        cached.height as f32
-                    };
-                    if target_w >= 4.0 && target_h >= 4.0 {
-                        crate::render::composite_image_scaled(
-                            &cached.rgba,
-                            cached.width,
-                            cached.height,
-                            &mut composite_buffer,
-                            win_w,
-                            win_h,
-                            img_x,
-                            img_y,
-                            target_w,
-                            target_h,
-                        );
-                    }
-                }
-            }
+                },
+            );
         }
 
         // Highlight focused page input with blue outline

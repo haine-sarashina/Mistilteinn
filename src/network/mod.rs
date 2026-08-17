@@ -185,14 +185,10 @@ fn tag_attributes(tag: &str) -> Vec<(String, String)> {
 /// If an HTTPS request times out or fails to connect, automatically falls back to HTTP
 /// to resolve domains that redirect via port 80 (e.g. apple.co.jp -> https://www.apple.com/jp/).
 pub async fn fetch(url: &str) -> Result<FetchResult, NetworkError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(12))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(NetworkError::Http)?;
+    let client = http_client();
+    let request = || client.get(url).timeout(std::time::Duration::from_secs(12));
 
-    match client.get(url).send().await {
+    match request().send().await {
         Ok(response) => into_fetch_result(response).await,
         Err(e) => {
             if url.starts_with("https://") {
@@ -202,7 +198,12 @@ pub async fn fetch(url: &str) -> Result<FetchResult, NetworkError> {
                     e,
                     http_url
                 );
-                if let Ok(response) = client.get(&http_url).send().await {
+                if let Ok(response) = client
+                    .get(&http_url)
+                    .timeout(std::time::Duration::from_secs(12))
+                    .send()
+                    .await
+                {
                     return into_fetch_result(response).await;
                 }
             }
@@ -401,15 +402,53 @@ pub fn extract_css(html_content: &str) -> String {
     css_parts.join("\n")
 }
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
+/// What we tell servers we are.
+///
+/// A browser UA rather than our own name: a great many sites serve a different
+/// document, or refuse outright, to anything they do not recognise.
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+/// How many redirects to follow before giving up.
+const MAX_REDIRECTS: usize = 10;
+
+/// The cookie jar shared by every request.
+///
+/// Cookies belong to an origin, not to a tab, so one jar for the process is
+/// what a browser does. It lives only as long as the process — nothing is
+/// written to disk, so every run starts a fresh session.
+static COOKIE_JAR: LazyLock<Arc<reqwest::cookie::Jar>> =
+    LazyLock::new(|| Arc::new(reqwest::cookie::Jar::default()));
+
+/// The jar backing [`http_client`], for inspection and for seeding cookies.
+pub fn cookie_jar() -> &'static Arc<reqwest::cookie::Jar> {
+    &COOKIE_JAR
+}
+
+/// The one HTTP client every request goes through.
+///
+/// Sharing it is what makes cookies work at all: a client built per request
+/// starts with an empty jar, so a `Set-Cookie` was accepted and then
+/// immediately thrown away. It also means connections, DNS results and the
+/// redirect limit are shared rather than rebuilt for every image on a page.
+///
+/// No timeout is set here — each caller applies its own with
+/// `RequestBuilder::timeout`, since a stylesheet and a page do not deserve the
+/// same patience.
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent("Mistilteinn/0.2.10 (https://github.com/haine-sarashina/Mistilteinn; dev@mistilteinn.local) reqwest/0.12")
+        .user_agent(USER_AGENT)
+        .cookie_provider(COOKIE_JAR.clone())
+        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
         .build()
         .expect("Failed to build global HTTP client")
 });
+
+/// The shared client. See [`HTTP_CLIENT`].
+pub fn http_client() -> &'static reqwest::Client {
+    &HTTP_CLIENT
+}
 
 /// Simple base64 decoder for data: URIs without external dependency.
 fn decode_base64(input: &str) -> Option<Vec<u8>> {
@@ -461,7 +500,11 @@ pub async fn fetch_image(url: &str) -> Result<Vec<u8>, NetworkError> {
     }
 
     for attempt in 0..3 {
-        let resp = HTTP_CLIENT.get(url).send().await;
+        let resp = http_client()
+            .get(url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await;
         match resp {
             Ok(res) if res.status().is_success() => {
                 let bytes = res.bytes().await.map_err(NetworkError::Http)?;
@@ -486,13 +529,11 @@ pub async fn fetch_image(url: &str) -> Result<Vec<u8>, NetworkError> {
 
 /// Fetch a single CSS file with a shorter timeout (10s) and the standard User-Agent.
 async fn fetch_css_file(url: &str) -> Result<String, NetworkError> {
-    let client = reqwest::Client::builder()
+    let response = http_client()
+        .get(url)
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .build()
-        .map_err(NetworkError::Http)?;
-
-    let response = client.get(url).send().await?;
+        .send()
+        .await?;
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -759,6 +800,77 @@ mod tests {
     fn encode_as(label: &str, text: &str) -> Vec<u8> {
         let encoding = encoding_rs::Encoding::for_label(label.as_bytes()).unwrap();
         encoding.encode(text).0.into_owned()
+    }
+
+    /// The cookies the jar would send with a request to `url`.
+    fn cookies_for(jar: &reqwest::cookie::Jar, url: &str) -> String {
+        use reqwest::cookie::CookieStore;
+        jar.cookies(&url.parse().unwrap())
+            .map(|v| v.to_str().unwrap_or_default().to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_cookie_is_sent_back_to_the_origin_that_set_it() {
+        // Using a fresh jar rather than the shared one so the test does not
+        // depend on what else has run.
+        let jar = reqwest::cookie::Jar::default();
+        let url = "https://example.com/".parse().unwrap();
+        jar.add_cookie_str("session=abc123; Path=/", &url);
+
+        assert_eq!(
+            cookies_for(&jar, "https://example.com/account"),
+            "session=abc123"
+        );
+    }
+
+    #[test]
+    fn a_cookie_is_not_leaked_to_another_origin() {
+        let jar = reqwest::cookie::Jar::default();
+        jar.add_cookie_str(
+            "session=secret; Path=/",
+            &"https://example.com/".parse().unwrap(),
+        );
+
+        assert_eq!(
+            cookies_for(&jar, "https://attacker.test/"),
+            "",
+            "a cookie must not travel to a different host"
+        );
+    }
+
+    #[test]
+    fn cookie_paths_are_respected() {
+        let jar = reqwest::cookie::Jar::default();
+        jar.add_cookie_str(
+            "scoped=1; Path=/admin",
+            &"https://example.com/".parse().unwrap(),
+        );
+
+        assert_eq!(
+            cookies_for(&jar, "https://example.com/admin/users"),
+            "scoped=1"
+        );
+        assert_eq!(
+            cookies_for(&jar, "https://example.com/public"),
+            "",
+            "a path-scoped cookie stays inside its path"
+        );
+    }
+
+    #[test]
+    fn the_shared_client_carries_the_shared_jar() {
+        // The wiring is what matters: a client built per request would accept a
+        // Set-Cookie and then discard it with the client.
+        let jar = cookie_jar();
+        jar.add_cookie_str(
+            "wired=yes; Path=/",
+            &"https://mistilteinn.test/".parse().unwrap(),
+        );
+        assert_eq!(cookies_for(jar, "https://mistilteinn.test/"), "wired=yes");
+
+        // And the client is genuinely one instance, not rebuilt per call.
+        assert!(std::ptr::eq(http_client(), http_client()));
     }
 
     #[test]

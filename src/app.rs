@@ -3688,8 +3688,12 @@ impl ApplicationHandler for MistilteinnApp {
                                     self.tab_manager.activate_tab(tabs[next_idx]);
                                     if let Some(tab) = self.tab_manager.active_tab() {
                                         self.address_input = tab.url.clone();
+                                        // Scrolling belongs to the tab; the
+                                        // glide must not carry over.
+                                        self.scroll_target = tab.scroll_offset;
                                     }
                                     self.address_cursor = self.address_input.len();
+                                    self.refresh_find_matches();
                                     self.recompose();
                                     log::info!("Switched to tab {:?}", tabs[next_idx]);
                                 }

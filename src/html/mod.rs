@@ -426,6 +426,17 @@ impl DomArena {
     /// Extract all inline `<script>` contents from the DOM.
     /// Only extracts executable JavaScript scripts (skips application/ld+json, text/template, etc.).
     pub fn extract_scripts(&self) -> Vec<String> {
+        self.extract_scripts_with_nonce()
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect()
+    }
+
+    /// [`Self::extract_scripts`], keeping each script's `nonce` attribute.
+    ///
+    /// A Content-Security-Policy that names a nonce allows exactly the inline
+    /// scripts carrying it, so the two cannot be read apart from each other.
+    pub fn extract_scripts_with_nonce(&self) -> Vec<(String, Option<String>)> {
         let mut scripts = Vec::new();
         let script_tag = LocalName::from("script");
         let count = self.len();
@@ -455,7 +466,8 @@ impl DomArena {
             if is_js_script {
                 let text = self.get_text_content(i as u32);
                 if !text.trim().is_empty() {
-                    scripts.push(text);
+                    let nonce = self.get_attribute(i as u32, "nonce");
+                    scripts.push((text, nonce));
                 }
             }
         }

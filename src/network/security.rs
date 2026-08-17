@@ -263,6 +263,8 @@ enum Source {
     SelfOrigin,
     /// `'unsafe-inline'` — inline `<script>` and `<style>` may run.
     UnsafeInline,
+    /// `'nonce-…'` — the inline elements carrying exactly this nonce may run.
+    Nonce(String),
     /// A scheme with no host, such as `https:` or `data:`.
     Scheme(String),
     /// A host, optionally with a scheme, a port, and a leading `*.`.
@@ -320,14 +322,29 @@ impl Csp {
         })
     }
 
-    /// Whether an inline `<script>` or `<style>` may run.
+    /// Whether an inline `<script>` or `<style>` with no nonce may run.
     ///
     /// Blocking inline script is the single most common thing a CSP is set up
     /// to do, and this engine runs inline scripts, so it is a rule with real
     /// effect here rather than a formality.
     pub fn allows_inline(&self, kind: ResourceKind) -> bool {
+        self.allows_inline_with_nonce(kind, None)
+    }
+
+    /// Whether an inline element carrying `nonce` may run.
+    ///
+    /// A nonce is not a secret to be verified, only a value to be matched: the
+    /// site puts an unguessable one in both its policy and its own scripts, so
+    /// injected markup — which cannot know it — carries the wrong one or none.
+    /// Refusing to match it would block the inline scripts of every site that
+    /// uses a nonce-based policy, which browsers run.
+    pub fn allows_inline_with_nonce(&self, kind: ResourceKind, nonce: Option<&str>) -> bool {
         self.each_governing(kind.csp_directive(), |sources| {
-            sources.contains(&Source::UnsafeInline)
+            sources.iter().any(|source| match source {
+                Source::UnsafeInline => true,
+                Source::Nonce(expected) => nonce.is_some_and(|n| n == expected),
+                _ => false,
+            })
         })
     }
 
@@ -383,8 +400,17 @@ fn parse_source(token: &str) -> Source {
         _ => {}
     }
     if lower.starts_with('\'') {
-        // A nonce, a hash, 'unsafe-eval', 'strict-dynamic': recognised as a
-        // source we cannot evaluate rather than silently treated as a host.
+        // A nonce is compared byte for byte, so it must come from the original
+        // token rather than the lower-cased copy.
+        if let Some(nonce) = token
+            .trim_matches('\'')
+            .strip_prefix("nonce-")
+            .or_else(|| token.trim_matches('\'').strip_prefix("NONCE-"))
+        {
+            return Source::Nonce(nonce.to_string());
+        }
+        // A hash, 'unsafe-eval', 'strict-dynamic': recognised as a source we
+        // cannot evaluate rather than silently treated as a host.
         return Source::Unsupported;
     }
 
@@ -426,7 +452,8 @@ fn parse_source(token: &str) -> Source {
 impl Source {
     fn matches(&self, document_url: &str, url: &str) -> bool {
         match self {
-            Source::None | Source::Unsupported => false,
+            // A nonce says nothing about which URLs may be fetched.
+            Source::None | Source::Unsupported | Source::Nonce(_) => false,
             Source::UnsafeInline => false,
             Source::Any => true,
             Source::SelfOrigin => same_origin(document_url, url),
@@ -808,12 +835,24 @@ mod tests {
     }
 
     #[test]
-    fn a_nonce_is_recognised_as_a_source_we_cannot_evaluate() {
-        // It must not be read as a host name, and it must not be mistaken for
-        // 'unsafe-inline' — this engine cannot check a nonce, so inline script
-        // stays blocked.
+    fn a_nonce_admits_the_script_that_carries_it_and_no_other() {
+        // This is how most real sites allow their own inline scripts; refusing
+        // to match a nonce would block every one of them.
         let policy = csp("script-src 'nonce-abc123'");
-        assert!(!policy.allows_inline(ResourceKind::Script));
+        assert!(policy.allows_inline_with_nonce(ResourceKind::Script, Some("abc123")));
+        assert!(!policy.allows_inline_with_nonce(ResourceKind::Script, Some("guessed")));
+        assert!(
+            !policy.allows_inline(ResourceKind::Script),
+            "a script with no nonce at all is still blocked"
+        );
+    }
+
+    #[test]
+    fn a_nonce_is_matched_exactly_and_is_not_a_host_or_a_url_permission() {
+        // It is case-sensitive, and it says nothing about which URLs may load.
+        let policy = csp("script-src 'nonce-AbC123'");
+        assert!(!policy.allows_inline_with_nonce(ResourceKind::Script, Some("abc123")));
+        assert!(policy.allows_inline_with_nonce(ResourceKind::Script, Some("AbC123")));
         assert!(!policy.allows(
             "https://example.com/",
             "https://example.com/a.js",

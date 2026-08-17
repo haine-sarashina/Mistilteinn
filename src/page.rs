@@ -107,16 +107,16 @@ impl Page {
         // the arena. The context is kept afterwards: scripts register event
         // listeners that have to survive to be called later.
         let mut js_context = crate::js::init_js_engine_with_arena(arena.clone());
-        let scripts = arena.extract_scripts();
-        if csp.allows_inline(ResourceKind::Script) {
-            for script in scripts {
+        let mut blocked = 0usize;
+        for (script, nonce) in arena.extract_scripts_with_nonce() {
+            if csp.allows_inline_with_nonce(ResourceKind::Script, nonce.as_deref()) {
                 crate::js::execute_script(&mut js_context, &script);
+            } else {
+                blocked += 1;
             }
-        } else if !scripts.is_empty() {
-            log::warn!(
-                "{} inline script(s) blocked by this page's Content-Security-Policy",
-                scripts.len()
-            );
+        }
+        if blocked > 0 {
+            log::warn!("{blocked} inline script(s) blocked by this page's Content-Security-Policy");
         }
 
         // Stage 2: Parse CSS into author stylesheet
@@ -911,6 +911,22 @@ mod tests {
             greeting(&scripted_page(&["script-src 'self' 'unsafe-inline'"])),
             "after"
         );
+    }
+
+    #[test]
+    fn a_script_carrying_the_policys_nonce_runs_and_one_without_it_does_not() {
+        // Nonce-based policies are what real sites use — Wikipedia among them —
+        // so a page's own scripts have to survive one.
+        let policy = crate::network::security::Csp::parse(&["script-src 'nonce-r4nd0m'".into()]);
+        let with_nonce = "<html><body><div id='greeting'>before</div>\
+             <script nonce='r4nd0m'>document.getElementById('greeting').textContent='after';</script>\
+             </body></html>";
+        let page = Page::new_with_csp(with_nonce, "", 800.0, 600.0, &policy);
+        assert_eq!(greeting(&page), "after");
+
+        let wrong_nonce = with_nonce.replace("r4nd0m'>", "guessed'>");
+        let page = Page::new_with_csp(&wrong_nonce, "", 800.0, 600.0, &policy);
+        assert_eq!(greeting(&page), "before");
     }
 
     #[test]

@@ -581,6 +581,42 @@ mod tests {
         );
     }
 
+    /// Where the single text run of a 400px paragraph lands.
+    fn aligned_text_x(align: &str) -> (f32, f32) {
+        let page = Page::new(
+            "<html><body><p>hello</p></body></html>",
+            &format!("body {{ margin: 0 }} p {{ width: 400px; text-align: {align}; }}"),
+            800.0,
+            600.0,
+        );
+        let runs = crate::layout::collect_text_nodes(&page.layout_root);
+        assert_eq!(runs.len(), 1, "expected one run, got {runs:?}");
+        (runs[0].x, runs[0].width)
+    }
+
+    #[test]
+    fn text_align_moves_the_painted_text_not_just_child_boxes() {
+        // The alignment shift used to be applied only where inline child
+        // elements were positioned, so the text itself never moved.
+        let (left_x, w) = aligned_text_x("left");
+        assert!(
+            left_x.abs() < 1.0,
+            "left starts at the content edge: {left_x}"
+        );
+
+        let (right_x, _) = aligned_text_x("right");
+        assert!(
+            (right_x - (400.0 - w)).abs() < 1.0,
+            "right should end at the content edge: x={right_x}, width={w}"
+        );
+
+        let (center_x, _) = aligned_text_x("center");
+        assert!(
+            (center_x - (400.0 - w) / 2.0).abs() < 1.0,
+            "center should split the free space: x={center_x}, width={w}"
+        );
+    }
+
     #[test]
     fn page_has_empty_image_cache() {
         let page = Page::new("<html><body></body></html>", "", 800.0, 600.0);

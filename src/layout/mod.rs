@@ -1455,7 +1455,7 @@ fn compute_block_children(
                 }
 
                 // Break into lines
-                let line_boxes = break_into_lines(
+                let mut line_boxes = break_into_lines(
                     inline_boxes,
                     available_width,
                     text_renderer,
@@ -1464,6 +1464,10 @@ fn compute_block_children(
                     y,
                 );
 
+                // Alignment is folded into the lines before anyone reads them,
+                // so positioning and painting cannot disagree about it.
+                apply_line_alignment(&mut line_boxes, available_width, parent.text_align);
+
                 // Position inline children within line boxes
                 position_inline_children_in_lines(
                     &mut parent.children[i..run_end],
@@ -1471,7 +1475,6 @@ fn compute_block_children(
                     parent_x,
                     y,
                     available_width,
-                    parent.text_align,
                 );
 
                 // Store line boxes on parent
@@ -2939,6 +2942,45 @@ fn build_inline_boxes_from_slice(parent: &LayoutNode, children: &[LayoutNode]) -
     boxes
 }
 
+/// The width a line box occupies.
+fn line_box_width(line: &LineBox) -> f32 {
+    line.boxes
+        .iter()
+        .map(|b| match b {
+            InlineBox::Text { width, .. } => *width,
+            InlineBox::Element { width, .. } => *width,
+            InlineBox::Whitespace { width, .. } => *width,
+            InlineBox::LineBreak => 0.0,
+        })
+        .sum()
+}
+
+/// Fold `text-align` into each line's own x offset.
+///
+/// The shift has to live on the line rather than being applied by one consumer,
+/// because two of them read the same line boxes: the pass that positions inline
+/// child elements, and the text collection that paints the runs. Applying it in
+/// only one of those is why `text-align: right` moved a nested `<img>` but left
+/// the text where it was.
+fn apply_line_alignment(
+    line_boxes: &mut [LineBox],
+    available_width: f32,
+    text_align: crate::css::TextAlign,
+) {
+    use crate::css::TextAlign;
+    if matches!(text_align, TextAlign::Left | TextAlign::Justify) {
+        return;
+    }
+    for line in line_boxes.iter_mut() {
+        let free = (available_width - line_box_width(line)).max(0.0);
+        line.x += match text_align {
+            TextAlign::Center => free / 2.0,
+            TextAlign::Right => free,
+            _ => 0.0,
+        };
+    }
+}
+
 /// Collect rect positions from line boxes back into LayoutNode children.
 ///
 /// Walks the line boxes and for each inline box updates the corresponding
@@ -2950,8 +2992,7 @@ fn position_inline_children_in_lines(
     line_boxes: &[LineBox],
     parent_x: f32,
     line_area_y: f32,
-    available_width: f32,
-    text_align: crate::css::TextAlign,
+    _available_width: f32,
 ) {
     // First pass: collect positions for all children based on inline box data.
     // We track a child_idx that walks through the children slice matching
@@ -2966,26 +3007,9 @@ fn position_inline_children_in_lines(
         let _baseline_y = line.baseline_y;
         let line_top = line.y;
 
-        let total_line_width: f32 = line
-            .boxes
-            .iter()
-            .map(|b| match b {
-                InlineBox::Text { width, .. } => *width,
-                InlineBox::Element { width, .. } => *width,
-                InlineBox::Whitespace { width, .. } => *width,
-                _ => 0.0,
-            })
-            .sum();
-
-        let align_shift = match text_align {
-            crate::css::TextAlign::Center => ((available_width - total_line_width) / 2.0).max(0.0),
-            crate::css::TextAlign::Right => (available_width - total_line_width).max(0.0),
-            _ => 0.0,
-        };
-
+        // `line.x` already carries the alignment shift; see apply_line_alignment.
         let mut x_offset = parent_x
             + line.x
-            + align_shift
             + if children.is_empty() {
                 0.0
             } else {

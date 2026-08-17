@@ -7,6 +7,7 @@
 /// 2. Create render pipeline (vertex + fragment shaders)
 /// 3. For each frame: clear → draw rectangles → draw text → present
 pub mod font_data;
+pub mod icons;
 pub mod text;
 
 use crate::css::{

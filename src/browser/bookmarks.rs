@@ -15,6 +15,39 @@ pub struct Bookmark {
     pub title: String,
 }
 
+/// One line of the bookmark tree as it is drawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRow {
+    /// How far the row is indented: 0 for a folder, 1 for a page inside one.
+    pub depth: u8,
+    /// What the row reads.
+    pub label: String,
+    pub kind: RowKind,
+}
+
+/// What a tree row stands for, and what clicking it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowKind {
+    Folder {
+        host: String,
+        collapsed: bool,
+        count: usize,
+    },
+    Bookmark {
+        url: String,
+    },
+}
+
+/// Which folder a bookmark belongs in.
+///
+/// The host it came from, or a catch-all for anything with no host — the
+/// browser's own pages, and a `data:` URI, have nowhere else to go.
+fn folder_of(url: &str) -> String {
+    crate::network::security::Origin::parse(url)
+        .map(|origin| origin.host)
+        .unwrap_or_else(|| "その他".to_string())
+}
+
 /// The user's bookmarks, backed by a file.
 #[derive(Debug, Default)]
 pub struct BookmarkStore {
@@ -103,6 +136,55 @@ impl BookmarkStore {
         if let Err(e) = std::fs::write(path, serialize(&self.items)) {
             log::warn!("could not save bookmarks to {path:?}: {e}");
         }
+    }
+
+    /// The bookmark list as a tree of rows, ready to be drawn.
+    ///
+    /// The folders are the sites: a saved page belongs under the host it came
+    /// from, which is a grouping the bookmarks already carry rather than one
+    /// the user has to build and maintain by hand. Hosts are listed
+    /// alphabetically; the pages under each keep the order they were saved in.
+    ///
+    /// `collapsed` names the folders that are closed, so the caller owns that
+    /// state and this stays a pure function of the bookmarks.
+    pub fn tree_rows(&self, collapsed: &std::collections::HashSet<String>) -> Vec<TreeRow> {
+        let mut folders: Vec<(String, Vec<&Bookmark>)> = Vec::new();
+
+        for bookmark in &self.items {
+            let host = folder_of(&bookmark.url);
+            match folders.iter_mut().find(|(name, _)| name == &host) {
+                Some((_, items)) => items.push(bookmark),
+                None => folders.push((host, vec![bookmark])),
+            }
+        }
+        folders.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut rows = Vec::new();
+        for (host, items) in folders {
+            let is_collapsed = collapsed.contains(&host);
+            rows.push(TreeRow {
+                depth: 0,
+                label: host.clone(),
+                kind: RowKind::Folder {
+                    host,
+                    collapsed: is_collapsed,
+                    count: items.len(),
+                },
+            });
+            if is_collapsed {
+                continue;
+            }
+            for bookmark in items {
+                rows.push(TreeRow {
+                    depth: 1,
+                    label: bookmark.title.clone(),
+                    kind: RowKind::Bookmark {
+                        url: bookmark.url.clone(),
+                    },
+                });
+            }
+        }
+        rows
     }
 
     /// The bookmark list as a page, for the internal `mistilteinn://bookmarks`
@@ -253,6 +335,82 @@ mod tests {
         let parsed = parse("no-tab-here\nhttps://ok.example/\tOK\n\n");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].url, "https://ok.example/");
+    }
+
+    /// The labels of a tree, with folders marked, for compact assertions.
+    fn tree_labels(store: &BookmarkStore, collapsed: &[&str]) -> Vec<String> {
+        let collapsed: std::collections::HashSet<String> =
+            collapsed.iter().map(|s| s.to_string()).collect();
+        store
+            .tree_rows(&collapsed)
+            .into_iter()
+            .map(|row| match row.kind {
+                RowKind::Folder { .. } => format!("[{}]", row.label),
+                RowKind::Bookmark { .. } => format!("  {}", row.label),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_tree_groups_pages_under_the_site_they_came_from() {
+        let mut store = store();
+        store.toggle("https://example.com/a", "A");
+        store.toggle("https://other.test/x", "X");
+        store.toggle("https://example.com/b", "B");
+
+        assert_eq!(
+            tree_labels(&store, &[]),
+            vec!["[example.com]", "  A", "  B", "[other.test]", "  X"],
+            "folders come out alphabetically, pages in the order they were saved"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_folder_hides_its_pages_but_keeps_its_own_row() {
+        let mut store = store();
+        store.toggle("https://example.com/a", "A");
+        store.toggle("https://other.test/x", "X");
+
+        assert_eq!(
+            tree_labels(&store, &["example.com"]),
+            vec!["[example.com]", "[other.test]", "  X"]
+        );
+    }
+
+    #[test]
+    fn a_folder_row_carries_the_count_of_what_it_holds() {
+        let mut store = store();
+        store.toggle("https://example.com/a", "A");
+        store.toggle("https://example.com/b", "B");
+
+        let rows = store.tree_rows(&Default::default());
+        assert_eq!(
+            rows[0].kind,
+            RowKind::Folder {
+                host: "example.com".to_string(),
+                collapsed: false,
+                count: 2,
+            },
+            "a collapsed folder still has to say how much it is hiding"
+        );
+    }
+
+    #[test]
+    fn a_page_with_no_host_still_lands_somewhere() {
+        // The browser's own pages can be bookmarked and have no host to file
+        // them under; dropping them from the tree would lose them silently.
+        let mut store = store();
+        store.toggle("mistilteinn://bookmarks", "ブックマーク");
+
+        let rows = store.tree_rows(&Default::default());
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0].kind, RowKind::Folder { .. }));
+        assert!(matches!(rows[1].kind, RowKind::Bookmark { .. }));
+    }
+
+    #[test]
+    fn an_empty_store_has_no_rows() {
+        assert!(store().tree_rows(&Default::default()).is_empty());
     }
 
     #[test]

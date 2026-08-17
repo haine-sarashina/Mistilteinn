@@ -68,8 +68,11 @@ impl Tab {
     }
 
     /// Check if there are entries to navigate forward to.
+    ///
+    /// The empty case has to be tested first: `len() - 1` on an empty history
+    /// underflows, and a tab that has not navigated anywhere yet has one.
     pub fn can_go_forward(&self) -> bool {
-        self.history_index < self.history.len() - 1
+        !self.history.is_empty() && self.history_index < self.history.len() - 1
     }
 
     /// Navigate back in history, returning the URL at the new position.
@@ -83,7 +86,7 @@ impl Tab {
 
     /// Navigate forward in history, returning the URL at the new position.
     pub fn go_forward(&mut self) -> Option<String> {
-        if self.history_index >= self.history.len() - 1 {
+        if !self.can_go_forward() {
             return None;
         }
         self.history_index += 1;
@@ -283,6 +286,20 @@ mod tests {
 
         let url = tab.go_forward();
         assert_eq!(url, Some("https://c.com".to_string()));
+    }
+
+    #[test]
+    fn a_tab_that_has_not_navigated_anywhere_can_go_neither_way() {
+        // The chrome asks this to decide whether to grey the arrows out, and a
+        // brand-new tab has an empty history — where `len() - 1` underflows.
+        let mut manager = TabManager::new();
+        manager.create_tab();
+        let tab = manager.active_tab_mut().expect("tab exists");
+
+        assert!(!tab.can_go_back());
+        assert!(!tab.can_go_forward());
+        assert_eq!(tab.go_forward(), None);
+        assert_eq!(tab.go_back(), None);
     }
 
     #[test]

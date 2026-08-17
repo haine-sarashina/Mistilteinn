@@ -11,6 +11,14 @@ use crate::render::{ColorF, MAX_RECTS, RectClip, Renderer, layout_to_clip};
 
 /// Chrome layout constants.
 const TAB_BAR_WIDTH: u32 = 200;
+/// Width of the bookmark pane on the right, when it is open.
+const BOOKMARK_PANE_WIDTH: f32 = 240.0;
+/// Height of one row in the bookmark tree.
+const BOOKMARK_ROW_HEIGHT: f32 = 24.0;
+/// Height of the bookmark pane's title row.
+const BOOKMARK_HEADER_HEIGHT: f32 = 30.0;
+/// How far a page inside a folder is indented from the folder itself.
+const BOOKMARK_INDENT: f32 = 16.0;
 const ADDRESS_BAR_HEIGHT: u32 = 40;
 const TAB_BUTTON_HEIGHT: f32 = 40.0;
 const TAB_BUTTON_SPACING: f32 = 4.0;
@@ -186,6 +194,14 @@ pub struct MistilteinnApp {
     last_scroll_step: Option<std::time::Instant>,
     /// The user's saved pages.
     bookmarks: crate::browser::bookmarks::BookmarkStore,
+    /// Whether the bookmark pane on the right is shown.
+    bookmark_pane_open: bool,
+    /// Bookmark folders the user has closed, by host.
+    collapsed_bookmark_folders: std::collections::HashSet<String>,
+    /// How far the bookmark pane is scrolled, in pixels.
+    bookmark_scroll: f32,
+    /// Which bookmark row the cursor is over, for the hover highlight.
+    hovered_bookmark_row: Option<usize>,
     /// In-page search (Ctrl+F).
     find_bar: FindBar,
 }
@@ -249,6 +265,42 @@ struct ScrollbarMetrics {
     max_scroll: f32,
 }
 
+/// Shorten a label so it fits `max_width`, ending it with an ellipsis.
+///
+/// The rasterizer wraps rather than clips, so a long bookmark title would
+/// otherwise spill onto the row below it. The cut is estimated from the string's
+/// average character width and then checked, rather than measured one character
+/// at a time: this runs for every visible row on every frame.
+fn fit_label(
+    text_renderer: &mut TextRenderer,
+    label: &str,
+    font_size: f32,
+    max_width: f32,
+) -> String {
+    if max_width <= 0.0 || label.is_empty() {
+        return String::new();
+    }
+    let full = text_renderer.measure(label, font_size, "sans-serif").0;
+    if full <= max_width {
+        return label.to_string();
+    }
+
+    let chars: Vec<char> = label.chars().collect();
+    let mut keep = ((max_width / full) * chars.len() as f32) as usize;
+    keep = keep.min(chars.len().saturating_sub(1));
+
+    // Trim further if the estimate was optimistic — proportional cutting is
+    // only exact for text of even width.
+    while keep > 0 {
+        let candidate: String = chars[..keep].iter().collect::<String>() + "…";
+        if text_renderer.measure(&candidate, font_size, "sans-serif").0 <= max_width {
+            return candidate;
+        }
+        keep -= 1;
+    }
+    "…".to_string()
+}
+
 /// The coordinate of a point along one axis.
 fn along(axis: Axis, x: f32, y: f32) -> f32 {
     match axis {
@@ -299,6 +351,10 @@ impl MistilteinnApp {
             scroll_target: (0.0, 0.0),
             last_scroll_step: None,
             bookmarks: crate::browser::bookmarks::BookmarkStore::load(),
+            bookmark_pane_open: true,
+            collapsed_bookmark_folders: std::collections::HashSet::new(),
+            bookmark_scroll: 0.0,
+            hovered_bookmark_row: None,
             find_bar: FindBar::default(),
         }
     }
@@ -331,6 +387,10 @@ enum HitTestResult {
     ScrollbarTrack(Axis),
     /// Clicked the bookmark star
     BookmarkButton,
+    /// Clicked a row of the bookmark tree
+    BookmarkRow(usize),
+    /// Clicked the bookmark pane, but not on a row
+    BookmarkPane,
 }
 
 impl HitTestResult {
@@ -667,6 +727,70 @@ impl MistilteinnApp {
             a: 1.0,
         });
 
+        // Bookmark pane — the right of the three panes
+        if let Some(pane) = self.bookmark_pane_rect(window_width, window_height) {
+            rects.push(layout_to_clip(
+                pane.x,
+                pane.y,
+                pane.width,
+                pane.height,
+                window_width as f32,
+                window_height as f32,
+            ));
+            colors.push(ColorF {
+                r: 38.0 / 255.0,
+                g: 38.0 / 255.0,
+                b: 43.0 / 255.0,
+                a: 1.0,
+            });
+
+            // A hairline against the page, so the two do not read as one area.
+            rects.push(layout_to_clip(
+                pane.x,
+                pane.y,
+                1.0,
+                pane.height,
+                window_width as f32,
+                window_height as f32,
+            ));
+            colors.push(ColorF {
+                r: 70.0 / 255.0,
+                g: 70.0 / 255.0,
+                b: 78.0 / 255.0,
+                a: 1.0,
+            });
+
+            // The row under the cursor, and the folder rows, get a background
+            // so the tree reads as rows rather than as floating text.
+            let rows = self.bookmark_rows();
+            for (index, row) in rows.iter().enumerate() {
+                let Some(row_rect) = self.bookmark_row_rect(&pane, index) else {
+                    continue;
+                };
+                let hovered = self.hovered_bookmark_row == Some(index);
+                let is_folder =
+                    matches!(row.kind, crate::browser::bookmarks::RowKind::Folder { .. });
+                if !hovered && !is_folder {
+                    continue;
+                }
+                rects.push(layout_to_clip(
+                    row_rect.x,
+                    row_rect.y,
+                    row_rect.width,
+                    row_rect.height,
+                    window_width as f32,
+                    window_height as f32,
+                ));
+                let shade = if hovered { 62.0 } else { 48.0 };
+                colors.push(ColorF {
+                    r: shade / 255.0,
+                    g: shade / 255.0,
+                    b: (shade + 6.0) / 255.0,
+                    a: 1.0,
+                });
+            }
+        }
+
         // Loading progress bar — appears below address bar when active tab is loading
         if self.tab_manager.is_active_tab_loading() {
             rects.push(layout_to_clip(
@@ -790,51 +914,61 @@ impl MistilteinnApp {
             }
         }
 
-        // Draw Navigation buttons (Back, Forward, Reload)
+        // Navigation buttons (back, forward, reload), drawn as shapes.
+        //
+        // They used to be typed as `◀ ▶ ↻`, which made each button's
+        // appearance depend on the system font covering that character. On this
+        // machine it does not cover `↻`, so the reload button painted nothing
+        // and looked like it did not exist at all.
+        let icon_size = 18.0;
+        let icon_y = (ADDRESS_BAR_HEIGHT as f32 - icon_size) / 2.0;
+        let can_go_back = self
+            .tab_manager
+            .active_tab()
+            .is_some_and(|t| t.can_go_back());
+        let can_go_forward = self
+            .tab_manager
+            .active_tab()
+            .is_some_and(|t| t.can_go_forward());
+        // A greyed-out arrow says the history ends here, rather than leaving
+        // the user to click a button that does nothing.
+        let enabled = [230u8, 230, 235, 255];
+        let disabled = [120u8, 120, 128, 255];
+
         let mut curr_x = TAB_BAR_WIDTH as f32;
+        for (index, direction) in [
+            crate::render::icons::Direction::Left,
+            crate::render::icons::Direction::Right,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let available = if index == 0 {
+                can_go_back
+            } else {
+                can_go_forward
+            };
+            crate::render::icons::chevron(
+                buffer,
+                win_w,
+                win_h,
+                curr_x + (NAV_BUTTON_WIDTH - icon_size) / 2.0,
+                icon_y,
+                icon_size,
+                if available { enabled } else { disabled },
+                direction,
+            );
+            curr_x += NAV_BUTTON_WIDTH;
+        }
 
-        // Back button
-        text_renderer.rasterize_to_bitmap(
-            "◀",
-            18.0,
-            "sans-serif",
-            text_color,
-            curr_x + 9.0,
-            9.0,
-            30.0,
+        crate::render::icons::reload(
             buffer,
             win_w,
             win_h,
-        );
-        curr_x += NAV_BUTTON_WIDTH;
-
-        // Forward button
-        text_renderer.rasterize_to_bitmap(
-            "▶",
-            18.0,
-            "sans-serif",
-            text_color,
-            curr_x + 9.0,
-            9.0,
-            30.0,
-            buffer,
-            win_w,
-            win_h,
-        );
-        curr_x += NAV_BUTTON_WIDTH;
-
-        // Reload button
-        text_renderer.rasterize_to_bitmap(
-            "↻",
-            18.0,
-            "sans-serif",
-            text_color,
-            curr_x + 9.0,
-            8.0,
-            30.0,
-            buffer,
-            win_w,
-            win_h,
+            curr_x + (NAV_BUTTON_WIDTH - icon_size) / 2.0,
+            icon_y,
+            icon_size,
+            enabled,
         );
         curr_x += NAV_BUTTON_WIDTH;
 
@@ -899,28 +1033,127 @@ impl MistilteinnApp {
             );
         }
 
-        // Bookmark star: filled when this page is saved.
+        // Bookmark star: filled when this page is saved, hollow when it is not.
         let bookmarked = self
             .tab_manager
             .active_tab()
             .map(|t| self.bookmarks.contains(&t.url))
             .unwrap_or(false);
-        text_renderer.rasterize_to_bitmap(
-            if bookmarked { "★" } else { "☆" },
-            17.0,
-            "sans-serif",
+        let star_size = 20.0;
+        crate::render::icons::star(
+            buffer,
+            win_w,
+            win_h,
+            star_box.x + (star_box.width - star_size) / 2.0,
+            star_box.y + (star_box.height - star_size) / 2.0,
+            star_size,
             if bookmarked {
-                [1.0, 0.82, 0.28, 1.0]
+                [255, 205, 70, 255]
             } else {
-                [0.75, 0.75, 0.8, 1.0]
+                [190, 190, 200, 255]
             },
-            star_box.x + 6.0,
-            star_box.y + 3.0,
-            star_box.width,
+            bookmarked,
+        );
+
+        self.draw_bookmark_pane(text_renderer, buffer, win_w, win_h);
+    }
+
+    /// Draw the bookmark pane's title and tree.
+    ///
+    /// The rows' backgrounds are GPU rects, drawn earlier; what is left here is
+    /// the text and the folder arrows, which go into the composite bitmap.
+    fn draw_bookmark_pane(
+        &self,
+        text_renderer: &mut TextRenderer,
+        buffer: &mut [u8],
+        win_w: u32,
+        win_h: u32,
+    ) {
+        use crate::browser::bookmarks::RowKind;
+        let Some(pane) = self.bookmark_pane_rect(win_w, win_h) else {
+            return;
+        };
+
+        text_renderer.rasterize_to_bitmap(
+            &format!("ブックマーク ({})", self.bookmarks.items().len()),
+            13.0,
+            "sans-serif",
+            [0.85, 0.85, 0.9, 1.0],
+            pane.x + 12.0,
+            pane.y + 8.0,
+            pane.width - 24.0,
             buffer,
             win_w,
             win_h,
         );
+
+        let rows = self.bookmark_rows();
+        if rows.is_empty() {
+            text_renderer.rasterize_to_bitmap(
+                "右上のボタンで現在のページを保存",
+                12.0,
+                "sans-serif",
+                [0.55, 0.55, 0.6, 1.0],
+                pane.x + 12.0,
+                pane.y + BOOKMARK_HEADER_HEIGHT + 8.0,
+                pane.width - 24.0,
+                buffer,
+                win_w,
+                win_h,
+            );
+            return;
+        }
+
+        for (index, row) in rows.iter().enumerate() {
+            let Some(rect) = self.bookmark_row_rect(&pane, index) else {
+                continue;
+            };
+            let text_x = rect.x + 10.0 + row.depth as f32 * BOOKMARK_INDENT;
+
+            let label = match &row.kind {
+                RowKind::Folder {
+                    collapsed, count, ..
+                } => {
+                    // The arrow is the control: it says whether the folder is
+                    // open, and it is what the click lands on.
+                    crate::render::icons::chevron(
+                        buffer,
+                        win_w,
+                        win_h,
+                        rect.x + 4.0,
+                        rect.y + (BOOKMARK_ROW_HEIGHT - 12.0) / 2.0,
+                        12.0,
+                        [190, 190, 200, 255],
+                        if *collapsed {
+                            crate::render::icons::Direction::Right
+                        } else {
+                            crate::render::icons::Direction::Down
+                        },
+                    );
+                    format!("{} ({})", row.label, count)
+                }
+                RowKind::Bookmark { .. } => row.label.clone(),
+            };
+
+            let color = match row.kind {
+                RowKind::Folder { .. } => [0.88, 0.88, 0.92, 1.0],
+                RowKind::Bookmark { .. } => [0.68, 0.78, 0.95, 1.0],
+            };
+            let available = (rect.right() - text_x - 8.0).max(10.0);
+            let label = fit_label(text_renderer, &label, 12.0, available);
+            text_renderer.rasterize_to_bitmap(
+                &label,
+                12.0,
+                "sans-serif",
+                color,
+                text_x,
+                rect.y + 5.0,
+                available,
+                buffer,
+                win_w,
+                win_h,
+            );
+        }
     }
 
     /// The zoom factor of the active tab, or 100% when there is no tab.
@@ -942,9 +1175,11 @@ impl MistilteinnApp {
             })
             .unwrap_or((1280, 800));
 
-        // Build chrome rects (tab bar + address bar)
+        // Build chrome rects (tab bar + address bar + bookmark pane)
         let (chrome_rects, chrome_colors) = self.build_chrome_rects(win_w, win_h);
         let _chrome_count = chrome_rects.len();
+        let content_width = self.content_width(win_w);
+        let content_right = self.content_right(win_w);
 
         // Read scroll offset as a value before borrowing page
         let scroll_offset = self
@@ -962,7 +1197,7 @@ impl MistilteinnApp {
             all_rects.push(layout_to_clip(
                 TAB_BAR_WIDTH as f32,
                 ADDRESS_BAR_HEIGHT as f32,
-                win_w as f32 - TAB_BAR_WIDTH as f32,
+                self.content_width(win_w),
                 win_h as f32 - ADDRESS_BAR_HEIGHT as f32,
                 win_w as f32,
                 win_h as f32,
@@ -1049,10 +1284,7 @@ impl MistilteinnApp {
         let display_list = crate::layout::build_display_list_with_scroll(
             &page.layout_root,
             scroll_offset,
-            (
-                win_w as f32 - TAB_BAR_WIDTH as f32,
-                win_h as f32 - ADDRESS_BAR_HEIGHT as f32,
-            ),
+            (content_width, win_h as f32 - ADDRESS_BAR_HEIGHT as f32),
         );
 
         // Allocate full-window RGBA buffer (transparent background)
@@ -1360,11 +1592,13 @@ impl MistilteinnApp {
             }
         }
 
-        // CRITICAL CLIPPING: Clear any page content (text/images) that overflowed into
-        // the left tab bar (x < TAB_BAR_WIDTH) or top address bar (y < ADDRESS_BAR_HEIGHT)
+        // CRITICAL CLIPPING: clear any page content (text/images) that spilled
+        // out of the middle pane — into the tab bar on the left, the address
+        // bar above, or the bookmark pane on the right.
+        let content_right_px = content_right as u32;
         for py in 0..win_h {
             for px in 0..win_w {
-                if px < TAB_BAR_WIDTH || py < ADDRESS_BAR_HEIGHT {
+                if px < TAB_BAR_WIDTH || py < ADDRESS_BAR_HEIGHT || px >= content_right_px {
                     let idx = ((py * win_w + px) * 4) as usize;
                     if idx + 3 < composite_buffer.len() {
                         composite_buffer[idx] = 0;
@@ -1436,7 +1670,7 @@ impl MistilteinnApp {
 
     /// Load a page from HTML and CSS source strings.
     pub fn load_page(&mut self, html_source: &str, css_source: &str) {
-        let w = self.window_width() as f32 - TAB_BAR_WIDTH as f32;
+        let w = self.content_width(self.window_width());
         let h = self.window_height() as f32 - ADDRESS_BAR_HEIGHT as f32;
 
         let mut new_page = crate::page::Page::new(html_source, css_source, w, h);
@@ -1871,7 +2105,7 @@ impl MistilteinnApp {
     ) {
         use crate::network::security::{ResourceKind, SubresourceDecision, check_subresource};
 
-        let w = self.window_width() as f32 - TAB_BAR_WIDTH as f32;
+        let w = self.content_width(self.window_width());
         let h = self.window_height() as f32 - ADDRESS_BAR_HEIGHT as f32;
 
         let mut new_page = crate::page::Page::new_with_csp(html_source, css_source, w, h, csp);
@@ -2327,7 +2561,7 @@ impl MistilteinnApp {
             extent_h.max(page.layout_root.rect.height),
         );
         let viewport = (
-            (win_w as f32 - TAB_BAR_WIDTH as f32).max(1.0),
+            self.content_width(win_w),
             (win_h as f32 - ADDRESS_BAR_HEIGHT as f32).max(1.0),
         );
         Some((content, viewport))
@@ -2378,7 +2612,7 @@ impl MistilteinnApp {
         let (track, thumb) = match axis {
             Axis::Vertical => {
                 let track = crate::layout::Rect::new(
-                    win_w as f32 - SCROLLBAR_WIDTH,
+                    self.content_right(win_w) - SCROLLBAR_WIDTH,
                     ADDRESS_BAR_HEIGHT as f32,
                     SCROLLBAR_WIDTH,
                     viewport_len,
@@ -2495,6 +2729,16 @@ impl MistilteinnApp {
             }
         }
 
+        // The bookmark pane owns everything to the right of the page area.
+        if let Some(pane) = self.bookmark_pane_rect(win_w, win_h) {
+            if pane.contains(x, y) {
+                return match self.bookmark_row_at(x, y, win_w, win_h) {
+                    Some(index) => HitTestResult::BookmarkRow(index),
+                    None => HitTestResult::BookmarkPane,
+                };
+            }
+        }
+
         // Check Address bar area (top)
         if y < ADDRESS_BAR_HEIGHT as f32 {
             if x >= TAB_BAR_WIDTH as f32 {
@@ -2604,7 +2848,8 @@ impl MistilteinnApp {
 
     /// Check if a position falls within the page content area (not on chrome).
     fn is_in_content_area(&self, x: f32, y: f32) -> bool {
-        x >= TAB_BAR_WIDTH as f32 && y >= ADDRESS_BAR_HEIGHT as f32
+        let (win_w, _) = self.window_size();
+        x >= TAB_BAR_WIDTH as f32 && x < self.content_right(win_w) && y >= ADDRESS_BAR_HEIGHT as f32
     }
 
     /// Create a default tab group and assign the active tab to it.
@@ -2723,6 +2968,172 @@ impl MistilteinnApp {
 
     /// Sets the winit window cursor icon from a computed CSS `cursor`.
     #[allow(deprecated)]
+    /// How wide the bookmark pane is right now — zero when it is closed.
+    fn bookmark_pane_width(&self) -> f32 {
+        if self.bookmark_pane_open {
+            BOOKMARK_PANE_WIDTH
+        } else {
+            0.0
+        }
+    }
+
+    /// The x coordinate where the page's area ends.
+    ///
+    /// The window is three panes: tabs on the left, the page in the middle,
+    /// bookmarks on the right. Everything about the page — its layout width,
+    /// its scrollbars, where its content is clipped — measures against this
+    /// rather than against the window's own edge.
+    fn content_right(&self, win_w: u32) -> f32 {
+        (win_w as f32 - self.bookmark_pane_width()).max(TAB_BAR_WIDTH as f32 + 1.0)
+    }
+
+    /// How wide the page's area is.
+    fn content_width(&self, win_w: u32) -> f32 {
+        (self.content_right(win_w) - TAB_BAR_WIDTH as f32).max(1.0)
+    }
+
+    /// The bookmark pane's rectangle, or `None` when it is closed.
+    fn bookmark_pane_rect(&self, win_w: u32, win_h: u32) -> Option<crate::layout::Rect> {
+        if !self.bookmark_pane_open {
+            return None;
+        }
+        Some(crate::layout::Rect::new(
+            self.content_right(win_w),
+            ADDRESS_BAR_HEIGHT as f32,
+            self.bookmark_pane_width(),
+            (win_h as f32 - ADDRESS_BAR_HEIGHT as f32).max(0.0),
+        ))
+    }
+
+    /// The bookmark tree as it currently stands.
+    fn bookmark_rows(&self) -> Vec<crate::browser::bookmarks::TreeRow> {
+        self.bookmarks.tree_rows(&self.collapsed_bookmark_folders)
+    }
+
+    /// Where one bookmark row is drawn, or `None` if it is scrolled out of the
+    /// pane. One definition, used by both the painting and the hit test.
+    fn bookmark_row_rect(
+        &self,
+        pane: &crate::layout::Rect,
+        index: usize,
+    ) -> Option<crate::layout::Rect> {
+        let y = pane.y + BOOKMARK_HEADER_HEIGHT + index as f32 * BOOKMARK_ROW_HEIGHT
+            - self.bookmark_scroll;
+        if y + BOOKMARK_ROW_HEIGHT <= pane.y + BOOKMARK_HEADER_HEIGHT || y >= pane.bottom() {
+            return None;
+        }
+        Some(crate::layout::Rect::new(
+            pane.x + 1.0,
+            y,
+            pane.width - 2.0,
+            BOOKMARK_ROW_HEIGHT,
+        ))
+    }
+
+    /// How far the bookmark tree can be scrolled.
+    fn bookmark_max_scroll(&self, win_w: u32, win_h: u32) -> f32 {
+        let Some(pane) = self.bookmark_pane_rect(win_w, win_h) else {
+            return 0.0;
+        };
+        let content = self.bookmark_rows().len() as f32 * BOOKMARK_ROW_HEIGHT;
+        let visible = (pane.height - BOOKMARK_HEADER_HEIGHT).max(0.0);
+        (content - visible).max(0.0)
+    }
+
+    /// Which bookmark row a point lands on, if any.
+    ///
+    /// Shares the pane's geometry with the drawing rather than recomputing it,
+    /// so a row is always where it looks like it is.
+    fn bookmark_row_at(&self, x: f32, y: f32, win_w: u32, win_h: u32) -> Option<usize> {
+        let pane = self.bookmark_pane_rect(win_w, win_h)?;
+        if !pane.contains(x, y) {
+            return None;
+        }
+        let first_row_y = pane.y + BOOKMARK_HEADER_HEIGHT;
+        if y < first_row_y {
+            return None;
+        }
+        let index = ((y - first_row_y + self.bookmark_scroll) / BOOKMARK_ROW_HEIGHT) as usize;
+        (index < self.bookmark_rows().len()).then_some(index)
+    }
+
+    /// Open or close the bookmark pane.
+    ///
+    /// The page's area changes width, so the document has to be laid out again
+    /// — the pane takes its space from the page rather than covering it.
+    fn toggle_bookmark_pane(&mut self) {
+        self.bookmark_pane_open = !self.bookmark_pane_open;
+        self.relayout_active_page();
+        self.refresh_find_matches();
+        self.recompose();
+    }
+
+    /// Lay the active page out again for the current size of the page area.
+    fn relayout_active_page(&mut self) {
+        let (win_w, win_h) = self.window_size();
+        let (width, height) = (
+            self.content_width(win_w),
+            (win_h as f32 - ADDRESS_BAR_HEIGHT as f32).max(1.0),
+        );
+
+        if let Some(tab) = self.tab_manager.active_tab_mut() {
+            if let Some(page) = tab.page.as_mut() {
+                page.view_width = width;
+                page.view_height = height;
+                page.recompute_with_hover(&[]);
+            }
+        }
+        // Whatever the page was scrolled to may be past the end of the
+        // reflowed document.
+        let at = self
+            .tab_manager
+            .get_active_tab_scroll()
+            .unwrap_or((0.0, 0.0));
+        self.set_scroll_immediate(at.0, at.1, win_w, win_h);
+    }
+
+    /// Act on a click in the bookmark tree.
+    ///
+    /// A folder opens and closes; a page is loaded. Navigation from here is a
+    /// navigation the browser itself is making, so it may reach internal pages.
+    fn activate_bookmark_row(&mut self, index: usize) {
+        use crate::browser::bookmarks::RowKind;
+        let Some(row) = self.bookmark_rows().into_iter().nth(index) else {
+            return;
+        };
+        match row.kind {
+            RowKind::Folder {
+                host, collapsed, ..
+            } => {
+                if collapsed {
+                    self.collapsed_bookmark_folders.remove(&host);
+                } else {
+                    self.collapsed_bookmark_folders.insert(host);
+                }
+                self.recompose();
+            }
+            RowKind::Bookmark { url } => {
+                self.mark_page_internal(true);
+                self.address_input = url.clone();
+                self.load_url(&url);
+            }
+        }
+    }
+
+    /// Remove the bookmark a row stands for. Folders are left alone: closing a
+    /// site's folder must not be a way to lose everything under it by accident.
+    fn remove_bookmark_row(&mut self, index: usize) {
+        use crate::browser::bookmarks::RowKind;
+        let Some(row) = self.bookmark_rows().into_iter().nth(index) else {
+            return;
+        };
+        if let RowKind::Bookmark { url } = row.kind {
+            self.bookmarks.toggle(&url, "");
+            log::info!("removed the bookmark for {url}");
+            self.recompose();
+        }
+    }
+
     /// Record whether the document now showing came from the browser itself.
     fn mark_page_internal(&mut self, internal: bool) {
         if let Some(tab) = self.tab_manager.active_tab_mut() {
@@ -3080,20 +3491,10 @@ impl ApplicationHandler for MistilteinnApp {
                 if let Some(ref mut renderer) = self.renderer {
                     renderer.resize(size.width, size.height);
                 }
-                // Trigger recompose with new view dimensions
-                if let Some(tab) = self.tab_manager.active_tab_mut() {
-                    if let Some(ref mut page) = tab.page {
-                        page.view_width = size.width as f32 - TAB_BAR_WIDTH as f32;
-                        page.view_height = size.height as f32 - ADDRESS_BAR_HEIGHT as f32;
-                        // Rebuild layout positions with new view width
-                        let mut text_renderer = TextRenderer::new();
-                        crate::layout::compute_layout(
-                            &mut page.layout_root,
-                            page.view_width,
-                            &mut text_renderer,
-                        );
-                    }
-                }
+                // The page area is the window minus the panes on either side,
+                // so a resize is the same relayout that opening a pane is.
+                self.relayout_active_page();
+                self.refresh_find_matches();
                 self.recompose();
                 if let Some(ref renderer) = self.renderer {
                     renderer.window().request_redraw();
@@ -3111,6 +3512,21 @@ impl ApplicationHandler for MistilteinnApp {
                         (-pos.x as f32, -pos.y as f32)
                     }
                 };
+
+                // The wheel scrolls whichever pane it is over.
+                if self
+                    .bookmark_pane_rect(win_w, win_h)
+                    .is_some_and(|pane| pane.contains(self.cursor_pos.0, self.cursor_pos.1))
+                {
+                    let max = self.bookmark_max_scroll(win_w, win_h);
+                    self.bookmark_scroll = (self.bookmark_scroll + dy).clamp(0.0, max);
+                    self.recompose();
+                    if let Some(ref renderer) = self.renderer {
+                        renderer.window().request_redraw();
+                    }
+                    return;
+                }
+
                 // Shift turns a vertical wheel horizontal, which is how a wheel
                 // with only one axis reaches a wide page.
                 if self.shift_pressed && dx == 0.0 {
@@ -3193,7 +3609,20 @@ impl ApplicationHandler for MistilteinnApp {
                                 HitTestResult::BookmarkButton => {
                                     self.is_address_focused = false;
                                     self.toggle_bookmark();
+                                    // Saving a page adds a row to the pane, so
+                                    // the star and the tree stay in step.
+                                    if !self.bookmark_pane_open {
+                                        self.toggle_bookmark_pane();
+                                    }
                                     self.recompose();
+                                }
+                                HitTestResult::BookmarkRow(index) => {
+                                    self.is_address_focused = false;
+                                    self.activate_bookmark_row(index);
+                                    return;
+                                }
+                                HitTestResult::BookmarkPane => {
+                                    self.is_address_focused = false;
                                 }
                                 HitTestResult::GroupHeader(group_id) => {
                                     if let Some(is_now_collapsed) =
@@ -3421,6 +3850,19 @@ impl ApplicationHandler for MistilteinnApp {
                         }
                     }
                     MouseButton::Right => {
+                        // Right-click on a bookmark removes it, matching the
+                        // tab bar, where right-click closes a tab.
+                        if state == ElementState::Pressed {
+                            if let HitTestResult::BookmarkRow(index) = self.hit_test_chrome(cx, cy)
+                            {
+                                self.remove_bookmark_row(index);
+                                if let Some(ref renderer) = self.renderer {
+                                    renderer.window().request_redraw();
+                                }
+                                return;
+                            }
+                        }
+
                         // Right-click on a tab closes it
                         if state == ElementState::Pressed && cx < TAB_BAR_WIDTH as f32 {
                             if let Some(clicked_tab) = self.hit_test_chrome(cx, cy).into_tab_id() {
@@ -3505,7 +3947,12 @@ impl ApplicationHandler for MistilteinnApp {
                 let scrollbar_hover_changed = self.hovered_scrollbar != is_over_scrollbar;
                 self.hovered_scrollbar = is_over_scrollbar;
 
-                if tab_changed || addr_changed || scrollbar_hover_changed {
+                // Hit-test the bookmark tree for its row highlight
+                let new_hovered_row = self.bookmark_row_at(cx, cy, win_w, win_h);
+                let row_changed = self.hovered_bookmark_row != new_hovered_row;
+                self.hovered_bookmark_row = new_hovered_row;
+
+                if tab_changed || addr_changed || scrollbar_hover_changed || row_changed {
                     self.recompose();
                     if let Some(ref renderer) = self.renderer {
                         renderer.window().request_redraw();
@@ -3708,8 +4155,8 @@ impl ApplicationHandler for MistilteinnApp {
                                 self.recompose();
                             }
                             PhysicalKey::Code(KeyCode::KeyB) => {
-                                // Ctrl+B: open the bookmark list
-                                self.load_url(BOOKMARKS_URL);
+                                // Ctrl+B: show or hide the bookmark pane
+                                self.toggle_bookmark_pane();
                             }
                             PhysicalKey::Code(KeyCode::KeyF) => {
                                 // Ctrl+F: open the find bar and type into it
@@ -3952,13 +4399,39 @@ pub fn run(start_url: Option<String>) {
 mod tests {
     use super::*;
 
+    /// The window every test measures against.
+    const TEST_WINDOW: (u32, u32) = (1280, 800);
+
     /// An app with one active tab showing `page`.
+    ///
+    /// The bookmark store is replaced with an in-memory one. `MistilteinnApp::new`
+    /// loads the user's real file, and a test that saved into it would both
+    /// scribble on their data and depend on what was already there — a test
+    /// that toggles a URL the user has saved would silently delete it.
     fn app_with_page(page: crate::page::Page) -> MistilteinnApp {
         let mut app = MistilteinnApp::new(None);
+        app.bookmarks = crate::browser::bookmarks::BookmarkStore::default();
         let tab_id = app.tab_manager.create_tab();
         app.tab_manager.activate_tab(tab_id);
         app.tab_manager.set_active_tab_page(page);
         app
+    }
+
+    /// An app showing a page laid out at the size the page area actually is.
+    ///
+    /// The middle pane is the window minus the tab bar and the bookmark pane,
+    /// so a test that hard-codes a width goes stale the moment either changes.
+    fn app_with_html(html: &str, css: &str) -> MistilteinnApp {
+        let mut probe = MistilteinnApp::new(None);
+        probe.bookmarks = crate::browser::bookmarks::BookmarkStore::default();
+        let (win_w, win_h) = TEST_WINDOW;
+        let page = crate::page::Page::new(
+            html,
+            css,
+            probe.content_width(win_w),
+            win_h as f32 - ADDRESS_BAR_HEIGHT as f32,
+        );
+        app_with_page(page)
     }
 
     #[test]
@@ -3987,7 +4460,11 @@ mod tests {
             .scrollbar_metrics(Axis::Vertical, 1280, 800)
             .expect("Long page should produce scrollbar metrics");
 
-        assert_eq!(metrics.track.x, 1280.0 - SCROLLBAR_WIDTH);
+        assert_eq!(
+            metrics.track.x,
+            app.content_right(1280) - SCROLLBAR_WIDTH,
+            "the vertical bar sits at the right of the page area, not the window"
+        );
         assert_eq!(metrics.track.y, ADDRESS_BAR_HEIGHT as f32);
         assert_eq!(metrics.track.width, SCROLLBAR_WIDTH);
         assert_eq!(metrics.track.height, 800.0 - ADDRESS_BAR_HEIGHT as f32);
@@ -4003,12 +4480,7 @@ mod tests {
 
     #[test]
     fn a_page_narrower_than_the_window_has_no_horizontal_scrollbar() {
-        let app = app_with_page(crate::page::Page::new(
-            "<html><body><p>short</p></body></html>",
-            "",
-            1080.0,
-            760.0,
-        ));
+        let app = app_with_html("<html><body><p>short</p></body></html>", "");
         assert!(app.scrollbar_metrics(Axis::Horizontal, 1280, 800).is_none());
         assert_eq!(app.max_scroll(1280, 800).0, 0.0);
     }
@@ -4017,20 +4489,18 @@ mod tests {
     fn a_box_wider_than_the_window_can_be_scrolled_to() {
         // The root box is the width of the viewport, so a wide child is only
         // reachable if the scroll range comes from the painted extent.
-        let app = app_with_page(crate::page::Page::new(
+        let app = app_with_html(
             "<html><body><div id='wide'></div></body></html>",
             "body { margin: 0 } #wide { width: 3000px; height: 50px }",
-            1080.0,
-            760.0,
-        ));
+        );
 
         let metrics = app
             .scrollbar_metrics(Axis::Horizontal, 1280, 800)
-            .expect("a 3000px box in a 1080px viewport scrolls sideways");
+            .expect("a 3000px box in a narrower viewport scrolls sideways");
         assert_eq!(metrics.track.y, 800.0 - SCROLLBAR_WIDTH);
         assert_eq!(metrics.track.x, TAB_BAR_WIDTH as f32);
         assert!(
-            (metrics.max_scroll - (3000.0 - 1080.0)).abs() < 1.0,
+            (metrics.max_scroll - (3000.0 - app.content_width(1280))).abs() < 1.0,
             "scroll range should reach the far edge, got {}",
             metrics.max_scroll
         );
@@ -4081,12 +4551,7 @@ mod tests {
         // The certificate warning's "proceed" link grants an exception to a
         // host; a page that could link to it would be pressing that button on
         // the user's behalf.
-        let mut app = app_with_page(crate::page::Page::new(
-            "<html><body></body></html>",
-            "",
-            1080.0,
-            760.0,
-        ));
+        let mut app = app_with_html("<html><body></body></html>", "");
 
         app.mark_page_internal(false);
         assert!(!app.may_navigate_to(BOOKMARKS_URL));
@@ -4128,6 +4593,191 @@ mod tests {
         );
     }
 
+    /// An app with the given pages saved, showing the bookmark pane.
+    fn app_with_bookmarks(saved: &[(&str, &str)]) -> MistilteinnApp {
+        let mut app = app_with_html("<html><body></body></html>", "");
+        for (url, title) in saved {
+            app.bookmarks.toggle(url, title);
+        }
+        app
+    }
+
+    #[test]
+    fn the_bookmark_pane_takes_its_width_from_the_page_rather_than_covering_it() {
+        // Three panes: the page is the window minus the tab bar and the
+        // bookmark pane, so opening the pane has to reflow the page rather
+        // than hide part of it.
+        let mut app = app_with_html("<html><body></body></html>", "");
+        let (win_w, win_h) = TEST_WINDOW;
+
+        assert!(app.bookmark_pane_open, "the pane is shown by default");
+        let with_pane = app.content_width(win_w);
+        assert_eq!(app.content_right(win_w), win_w as f32 - BOOKMARK_PANE_WIDTH);
+
+        app.toggle_bookmark_pane();
+        assert!(!app.bookmark_pane_open);
+        assert_eq!(app.content_right(win_w), win_w as f32);
+        assert_eq!(
+            app.content_width(win_w),
+            with_pane + BOOKMARK_PANE_WIDTH,
+            "the page gets the pane's width back"
+        );
+        assert!(app.bookmark_pane_rect(win_w, win_h).is_none());
+    }
+
+    #[test]
+    fn the_page_area_stops_where_the_bookmark_pane_starts() {
+        let app = app_with_html("<html><body></body></html>", "");
+        let (win_w, _) = TEST_WINDOW;
+        let edge = app.content_right(win_w);
+
+        assert!(app.is_in_content_area(edge - 1.0, 100.0));
+        assert!(
+            !app.is_in_content_area(edge + 1.0, 100.0),
+            "a click in the pane is not a click on the page"
+        );
+    }
+
+    #[test]
+    fn clicking_a_folder_row_opens_and_closes_it() {
+        let mut app = app_with_bookmarks(&[
+            ("https://example.com/a", "A"),
+            ("https://example.com/b", "B"),
+        ]);
+        assert_eq!(app.bookmark_rows().len(), 3, "one folder, two pages");
+
+        app.activate_bookmark_row(0);
+        assert_eq!(
+            app.bookmark_rows().len(),
+            1,
+            "collapsing hides the pages but keeps the folder"
+        );
+
+        app.activate_bookmark_row(0);
+        assert_eq!(app.bookmark_rows().len(), 3);
+    }
+
+    #[test]
+    fn a_click_in_the_pane_lands_on_the_row_it_looks_like() {
+        // The hit test and the painting share one definition of where a row
+        // is, which is the only way a click reliably lands on what was clicked.
+        let app = app_with_bookmarks(&[("https://example.com/a", "A")]);
+        let (win_w, win_h) = TEST_WINDOW;
+        let pane = app.bookmark_pane_rect(win_w, win_h).unwrap();
+
+        let first = app.bookmark_row_rect(&pane, 0).expect("row 0 is visible");
+        assert_eq!(
+            app.bookmark_row_at(first.x + 5.0, first.y + 5.0, win_w, win_h),
+            Some(0)
+        );
+        assert_eq!(
+            app.bookmark_row_at(first.x + 5.0, pane.y + 2.0, win_w, win_h),
+            None,
+            "the pane's title row is not a bookmark"
+        );
+        assert_eq!(
+            app.bookmark_row_at(pane.x - 5.0, first.y + 5.0, win_w, win_h),
+            None,
+            "just left of the pane is the page"
+        );
+    }
+
+    #[test]
+    fn the_pane_hit_test_reports_rows_and_empty_space_apart() {
+        let app = app_with_bookmarks(&[("https://example.com/a", "A")]);
+        let (win_w, win_h) = TEST_WINDOW;
+        let pane = app.bookmark_pane_rect(win_w, win_h).unwrap();
+        let row = app.bookmark_row_rect(&pane, 0).unwrap();
+
+        assert_eq!(
+            app.hit_test_chrome(row.x + 5.0, row.y + 5.0),
+            HitTestResult::BookmarkRow(0)
+        );
+        assert_eq!(
+            app.hit_test_chrome(pane.x + 5.0, pane.bottom() - 5.0),
+            HitTestResult::BookmarkPane,
+            "empty space below the tree is still the pane, not the page"
+        );
+    }
+
+    #[test]
+    fn right_clicking_a_page_removes_it_and_a_folder_is_left_alone() {
+        // Closing a folder must not be a way to lose everything under it.
+        let mut app = app_with_bookmarks(&[
+            ("https://example.com/a", "A"),
+            ("https://example.com/b", "B"),
+        ]);
+
+        app.remove_bookmark_row(0);
+        assert_eq!(app.bookmarks.items().len(), 2, "row 0 is the folder");
+
+        app.remove_bookmark_row(1);
+        assert_eq!(app.bookmarks.items().len(), 1);
+        assert!(!app.bookmarks.contains("https://example.com/a"));
+    }
+
+    #[test]
+    fn the_tree_scrolls_only_when_it_is_taller_than_the_pane() {
+        let (win_w, win_h) = TEST_WINDOW;
+        let app = app_with_bookmarks(&[("https://example.com/a", "A")]);
+        assert_eq!(app.bookmark_max_scroll(win_w, win_h), 0.0);
+
+        let saved: Vec<(String, String)> = (0..200)
+            .map(|i| (format!("https://site{i}.example/"), format!("Page {i}")))
+            .collect();
+        let mut app = app_with_html("<html><body></body></html>", "");
+        for (url, title) in &saved {
+            app.bookmarks.toggle(url, title);
+        }
+        assert!(
+            app.bookmark_max_scroll(win_w, win_h) > 0.0,
+            "400 rows do not fit in one pane"
+        );
+    }
+
+    #[test]
+    fn a_row_scrolled_out_of_the_pane_is_not_drawn() {
+        let mut app = app_with_html("<html><body></body></html>", "");
+        for i in 0..100 {
+            app.bookmarks
+                .toggle(&format!("https://site{i}.example/"), &format!("Page {i}"));
+        }
+        let (win_w, win_h) = TEST_WINDOW;
+        let pane = app.bookmark_pane_rect(win_w, win_h).unwrap();
+
+        let last = app.bookmark_rows().len() - 1;
+        assert!(app.bookmark_row_rect(&pane, last).is_none());
+
+        app.bookmark_scroll = app.bookmark_max_scroll(win_w, win_h);
+        assert!(
+            app.bookmark_row_rect(&pane, last).is_some(),
+            "scrolled to the end, the last row is on screen"
+        );
+        assert!(
+            app.bookmark_row_rect(&pane, 0).is_none(),
+            "and the first has gone off the top"
+        );
+    }
+
+    #[test]
+    fn a_long_bookmark_title_is_cut_rather_than_wrapped_onto_the_next_row() {
+        // The rasterizer wraps, and a wrapped title would run over the row
+        // below it.
+        let mut renderer = TextRenderer::new();
+        let long = "とても長いブックマークのタイトルがここに入ります";
+        let fitted = fit_label(&mut renderer, long, 12.0, 80.0);
+
+        assert!(fitted.chars().count() < long.chars().count());
+        assert!(fitted.ends_with('…'));
+        assert!(renderer.measure(&fitted, 12.0, "sans-serif").0 <= 80.0);
+    }
+
+    #[test]
+    fn a_title_that_already_fits_is_left_exactly_as_it_is() {
+        let mut renderer = TextRenderer::new();
+        assert_eq!(fit_label(&mut renderer, "short", 12.0, 400.0), "short");
+    }
+
     #[test]
     fn the_bookmark_star_is_hit_at_the_right_end_of_the_address_bar() {
         let app = MistilteinnApp::new(None);
@@ -4150,12 +4800,10 @@ mod tests {
 
     #[test]
     fn find_matches_land_on_the_text_they_matched() {
-        let mut app = app_with_page(crate::page::Page::new(
+        let mut app = app_with_html(
             "<html><body><p>hello findable world</p></body></html>",
             "body { margin: 0 } p { margin: 0; width: 600px }",
-            1080.0,
-            760.0,
-        ));
+        );
 
         app.find_bar.active = true;
         app.find_bar.query = "findable".to_string();
@@ -4199,12 +4847,7 @@ mod tests {
 
     #[test]
     fn zoom_steps_through_the_ladder_and_returns_to_100_percent() {
-        let mut app = app_with_page(crate::page::Page::new(
-            "<html><body><p>text</p></body></html>",
-            "",
-            1080.0,
-            760.0,
-        ));
+        let mut app = app_with_html("<html><body><p>text</p></body></html>", "");
 
         app.adjust_zoom(Some(1));
         assert!(app.active_zoom() > 1.0);
@@ -4221,12 +4864,7 @@ mod tests {
 
     #[test]
     fn zoom_stops_at_the_ends_of_the_ladder() {
-        let mut app = app_with_page(crate::page::Page::new(
-            "<html><body></body></html>",
-            "",
-            1080.0,
-            760.0,
-        ));
+        let mut app = app_with_html("<html><body></body></html>", "");
         for _ in 0..40 {
             app.adjust_zoom(Some(1));
         }

@@ -243,6 +243,8 @@ pub struct LayoutNode {
     /// Typography properties
     pub text_style: crate::css::TextStyleFlags,
     pub text_align: crate::css::TextAlign,
+    /// `direction` — the inline base direction of this box.
+    pub direction: crate::css::Direction,
     /// `visibility` — hidden nodes still lay out, they are just not painted.
     pub visibility: crate::css::Visibility,
     /// `cursor` — `Auto` defers to `interaction_type`.
@@ -306,7 +308,8 @@ impl LayoutNode {
             border_style: [crate::css::BorderStyle::None; 4],
             border_radius: 0.0,
             text_style: crate::css::TextStyleFlags::default(),
-            text_align: crate::css::TextAlign::Left,
+            text_align: crate::css::TextAlign::Start,
+            direction: crate::css::Direction::Ltr,
             visibility: crate::css::Visibility::Visible,
             cursor: crate::css::Cursor::Auto,
             z_index: None,
@@ -528,6 +531,7 @@ where
     root_layout.cursor = root_styles.cursor;
     root_layout.z_index = root_styles.z_index;
     root_layout.text_align = root_styles.text_align;
+    root_layout.direction = root_styles.direction;
 
     // Propagate font properties from computed styles
     root_layout.font_size = root_styles.font_size;
@@ -691,6 +695,7 @@ fn build_layout_children<N, F>(
                     layout_node.cursor = child_styles.cursor;
                     layout_node.z_index = child_styles.z_index;
                     layout_node.text_align = child_styles.text_align;
+                    layout_node.direction = child_styles.direction;
 
                     // Extract image src and dimensions from <img> and <svg> tags
                     if node.tag_name() == "img" {
@@ -893,6 +898,7 @@ fn build_layout_children<N, F>(
                     layout_node.cursor = child_styles.cursor;
                     layout_node.z_index = child_styles.z_index;
                     layout_node.text_align = child_styles.text_align;
+                    layout_node.direction = child_styles.direction;
 
                     // Extract image src and dimensions from <img> and <svg> tags
                     if node.tag_name() == "img" {
@@ -1464,9 +1470,17 @@ fn compute_block_children(
                     y,
                 );
 
+                // Visual order first, then alignment: the shift is measured from
+                // the line's edge, which reordering does not change.
+                apply_bidi_reordering(&mut line_boxes, parent.direction);
                 // Alignment is folded into the lines before anyone reads them,
-                // so positioning and painting cannot disagree about it.
-                apply_line_alignment(&mut line_boxes, available_width, parent.text_align);
+                // so positioning and painting cannot disagree about it. `start`
+                // and `end` mean opposite edges depending on direction.
+                apply_line_alignment(
+                    &mut line_boxes,
+                    available_width,
+                    parent.text_align.resolve(parent.direction),
+                );
 
                 // Position inline children within line boxes
                 position_inline_children_in_lines(
@@ -2013,7 +2027,7 @@ fn compute_grid_children(
         let parent_align = parent.text_align;
         let child = &mut parent.children[idx];
         if parent_align == crate::css::TextAlign::Center
-            && child.text_align == crate::css::TextAlign::Left
+            && child.text_align == crate::css::TextAlign::Start
         {
             child.text_align = crate::css::TextAlign::Center;
         }
@@ -2953,6 +2967,127 @@ fn line_box_width(line: &LineBox) -> f32 {
             InlineBox::LineBreak => 0.0,
         })
         .sum()
+}
+
+/// The direction a character forces on the text around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrongDirection {
+    /// Latin, Cyrillic, CJK — anything read left to right.
+    Ltr,
+    /// Hebrew, Arabic, Syriac, Thaana and the Arabic presentation forms.
+    Rtl,
+    /// Digits, punctuation, spaces: they take the direction around them.
+    Neutral,
+}
+
+/// Classify a character's bidirectional strength.
+///
+/// A range check rather than a full Unicode property table: it covers the
+/// right-to-left scripts in the Basic Multilingual Plane, which is what
+/// documents actually contain.
+fn strong_direction(c: char) -> StrongDirection {
+    match c {
+        // Hebrew, Arabic, Syriac, Thaana, N'Ko, Samaritan, Mandaic
+        '\u{0590}'..='\u{05FF}'
+        | '\u{0600}'..='\u{07BF}'
+        | '\u{0800}'..='\u{085F}'
+        | '\u{FB1D}'..='\u{FDFF}'
+        | '\u{FE70}'..='\u{FEFF}' => StrongDirection::Rtl,
+        // Explicit marks
+        '\u{200F}' | '\u{061C}' => StrongDirection::Rtl,
+        '\u{200E}' => StrongDirection::Ltr,
+        c if c.is_alphabetic() => StrongDirection::Ltr,
+        _ => StrongDirection::Neutral,
+    }
+}
+
+/// The embedding level of one inline run.
+///
+/// Runs whose direction matches the paragraph keep the base level; runs of the
+/// opposite direction go one level deeper, which is what makes rule L2 reverse
+/// exactly them.
+fn run_level(text: Option<&str>, base: u8) -> u8 {
+    let Some(text) = text else {
+        return base;
+    };
+    let direction = text
+        .chars()
+        .map(strong_direction)
+        .find(|d| *d != StrongDirection::Neutral);
+
+    match (direction, base % 2) {
+        // Neutral runs (spaces, digit-only runs) stay at the base level.
+        (None, _) => base,
+        (Some(StrongDirection::Ltr), 0) | (Some(StrongDirection::Rtl), 1) => base,
+        _ => base + 1,
+    }
+}
+
+/// Reorder a line's inline boxes from logical order into visual order.
+///
+/// This is rule L2 of the Unicode bidirectional algorithm: from the highest
+/// embedding level down to the lowest odd level, reverse every contiguous run
+/// of boxes at or above that level. Applied at run granularity rather than per
+/// character, which is the granularity line breaking already produced — a
+/// single run's own glyphs are ordered by the shaper.
+fn reorder_line_visually(boxes: &mut Vec<InlineBox>, base_level: u8) {
+    let levels: Vec<u8> = boxes
+        .iter()
+        .map(|b| match b {
+            InlineBox::Text { text, .. } => run_level(Some(text), base_level),
+            _ => base_level,
+        })
+        .collect();
+
+    let Some(&max_level) = levels.iter().max() else {
+        return;
+    };
+    // Nothing to do for an all-left-to-right line, which is the common case.
+    if max_level == 0 {
+        return;
+    }
+    let lowest_odd = levels
+        .iter()
+        .copied()
+        .filter(|l| l % 2 == 1)
+        .min()
+        .unwrap_or(max_level + 1);
+
+    let mut order: Vec<usize> = (0..boxes.len()).collect();
+    let mut level = max_level;
+    while level >= lowest_odd {
+        let mut i = 0;
+        while i < order.len() {
+            if levels[order[i]] >= level {
+                let start = i;
+                while i < order.len() && levels[order[i]] >= level {
+                    i += 1;
+                }
+                order[start..i].reverse();
+            } else {
+                i += 1;
+            }
+        }
+        if level == 0 {
+            break;
+        }
+        level -= 1;
+    }
+
+    let mut reordered: Vec<Option<InlineBox>> = boxes.drain(..).map(Some).collect();
+    for index in order {
+        if let Some(item) = reordered[index].take() {
+            boxes.push(item);
+        }
+    }
+}
+
+/// Put every line of a block into visual order for its base direction.
+fn apply_bidi_reordering(line_boxes: &mut [LineBox], direction: crate::css::Direction) {
+    let base_level = direction.base_level();
+    for line in line_boxes.iter_mut() {
+        reorder_line_visually(&mut line.boxes, base_level);
+    }
 }
 
 /// Fold `text-align` into each line's own x offset.
@@ -5761,6 +5896,91 @@ mod tests {
                 LineBreakToken::Space => " ",
             })
             .collect()
+    }
+
+    /// Reorder a line of text runs and read back the visual order.
+    fn visual_order(logical: &[&str], base: crate::css::Direction) -> Vec<String> {
+        let mut boxes: Vec<InlineBox> = logical
+            .iter()
+            .map(|t| InlineBox::test_text(*t, 16.0))
+            .collect();
+        reorder_line_visually(&mut boxes, base.base_level());
+        boxes
+            .into_iter()
+            .map(|b| match b {
+                InlineBox::Text { text, .. } => text,
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_left_to_right_line_is_left_alone() {
+        use crate::css::Direction;
+        assert_eq!(
+            visual_order(&["one", "two", "three"], Direction::Ltr),
+            vec!["one", "two", "three"]
+        );
+    }
+
+    #[test]
+    fn a_right_to_left_run_is_reversed_inside_ltr_text() {
+        use crate::css::Direction;
+        // "he said שלום עולם today" — the Hebrew words swap, the English does not.
+        assert_eq!(
+            visual_order(&["he", "said", "שלום", "עולם", "today"], Direction::Ltr),
+            vec!["he", "said", "עולם", "שלום", "today"]
+        );
+    }
+
+    #[test]
+    fn a_right_to_left_paragraph_runs_the_other_way() {
+        use crate::css::Direction;
+        assert_eq!(
+            visual_order(&["שלום", "עולם", "חדש"], Direction::Rtl),
+            vec!["חדש", "עולם", "שלום"]
+        );
+    }
+
+    #[test]
+    fn latin_inside_a_right_to_left_paragraph_keeps_its_own_order() {
+        use crate::css::Direction;
+        // The Latin words stay readable left-to-right while the line as a whole
+        // reads right-to-left.
+        assert_eq!(
+            visual_order(&["שלום", "hello", "world", "עולם"], Direction::Rtl),
+            vec!["עולם", "hello", "world", "שלום"]
+        );
+    }
+
+    #[test]
+    fn arabic_is_treated_as_right_to_left() {
+        use crate::css::Direction;
+        assert_eq!(
+            visual_order(&["مرحبا", "بالعالم"], Direction::Rtl),
+            vec!["بالعالم", "مرحبا"]
+        );
+    }
+
+    #[test]
+    fn neutral_runs_take_the_paragraph_direction() {
+        use crate::css::Direction;
+        // Digits and punctuation have no direction of their own, so they must
+        // not split a right-to-left line into separately reversed pieces.
+        assert_eq!(
+            visual_order(&["שלום", "123", "עולם"], Direction::Rtl),
+            vec!["עולם", "123", "שלום"]
+        );
+    }
+
+    #[test]
+    fn text_align_start_follows_the_direction() {
+        use crate::css::{Direction, TextAlign};
+        assert_eq!(TextAlign::Start.resolve(Direction::Ltr), TextAlign::Left);
+        assert_eq!(TextAlign::Start.resolve(Direction::Rtl), TextAlign::Right);
+        assert_eq!(TextAlign::End.resolve(Direction::Rtl), TextAlign::Left);
+        // An explicit physical value is unaffected by direction.
+        assert_eq!(TextAlign::Left.resolve(Direction::Rtl), TextAlign::Left);
     }
 
     #[test]

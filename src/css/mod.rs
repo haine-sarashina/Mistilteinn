@@ -282,8 +282,12 @@ fn inherit_properties(parent: &ComputedValues, mut child: ComputedValues) -> Com
         child.line_height = parent.line_height;
     }
     // `text-align` inherits
-    if child.text_align == TextAlign::Left && parent.text_align != TextAlign::Left {
+    if child.text_align == TextAlign::Start && parent.text_align != TextAlign::Start {
         child.text_align = parent.text_align;
+    }
+    // `direction` inherits.
+    if child.direction == Direction::Ltr && parent.direction != Direction::Ltr {
+        child.direction = parent.direction;
     }
     // `font-weight` / `font-style` inherit. Decoration lines do not technically
     // inherit, but they are drawn across descendant text, so propagating them
@@ -1305,6 +1309,8 @@ pub struct ComputedValues {
     // Typography
     pub text_style: TextStyleFlags,
     pub text_align: TextAlign,
+    /// `direction` — the inline base direction; inherits.
+    pub direction: Direction,
     pub visibility: Visibility,
     /// `cursor`; inherits, and `Auto` defers to the element's own role.
     pub cursor: Cursor,
@@ -1451,11 +1457,57 @@ fn parse_is_bold(val: &str) -> bool {
 /// CSS text-align property
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TextAlign {
+    /// The initial value: the inline start edge, which `direction` decides.
     #[default]
+    Start,
+    /// The inline end edge.
+    End,
     Left,
     Center,
     Right,
     Justify,
+}
+
+impl TextAlign {
+    /// Resolve the writing-mode-relative values against a direction.
+    ///
+    /// `start` and `end` are the ones that depend on it: in right-to-left text
+    /// the start edge is the right one.
+    pub fn resolve(self, direction: Direction) -> Self {
+        match (self, direction) {
+            (Self::Start, Direction::Ltr) => Self::Left,
+            (Self::Start, Direction::Rtl) => Self::Right,
+            (Self::End, Direction::Ltr) => Self::Right,
+            (Self::End, Direction::Rtl) => Self::Left,
+            (other, _) => other,
+        }
+    }
+}
+
+/// The computed `direction` property — the inline base direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Direction {
+    #[default]
+    Ltr,
+    Rtl,
+}
+
+impl Direction {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ltr" => Some(Self::Ltr),
+            "rtl" => Some(Self::Rtl),
+            _ => None,
+        }
+    }
+
+    /// The base embedding level: even for left-to-right, odd for right-to-left.
+    pub fn base_level(self) -> u8 {
+        match self {
+            Self::Ltr => 0,
+            Self::Rtl => 1,
+        }
+    }
 }
 
 impl Default for ComputedValues {
@@ -1512,7 +1564,8 @@ impl Default for ComputedValues {
             border_style: [BorderStyle::None; 4],
             border_radius: 0.0,
             text_style: TextStyleFlags::default(),
-            text_align: TextAlign::Left,
+            text_align: TextAlign::Start,
+            direction: Direction::Ltr,
             visibility: Visibility::Visible,
             cursor: Cursor::Auto,
             z_index: None,
@@ -2190,6 +2243,11 @@ impl ComputedValues {
                     _ => Visibility::Visible,
                 };
             }
+            "direction" => {
+                if let Some(d) = Direction::parse(val) {
+                    self.direction = d;
+                }
+            }
             "letter-spacing" => {
                 // `normal` is the initial value and means no extra tracking.
                 self.text_style.letter_spacing = if val.eq_ignore_ascii_case("normal") {
@@ -2218,7 +2276,10 @@ impl ComputedValues {
                     "center" => TextAlign::Center,
                     "right" => TextAlign::Right,
                     "justify" => TextAlign::Justify,
-                    _ => TextAlign::Left,
+                    "start" => TextAlign::Start,
+                    "end" => TextAlign::End,
+                    "left" => TextAlign::Left,
+                    _ => self.text_align,
                 };
             }
             _ => {}
@@ -3155,6 +3216,14 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
         ("title", "display: none"),
         ("link", "display: none"),
         ("noscript", "display: none"),
+        // `dir` is how documents actually set direction. Mapping it here rather
+        // than reading the attribute during the cascade keeps it a declaration,
+        // so it survives the inheritance rebuild and an author rule can still
+        // override it — which is exactly what a real UA stylesheet does.
+        ("[dir=\"rtl\"]", "direction: rtl"),
+        ("[dir=\"ltr\"]", "direction: ltr"),
+        ("[dir=rtl]", "direction: rtl"),
+        ("[dir=ltr]", "direction: ltr"),
     ];
 
     let mut rules = Vec::new();

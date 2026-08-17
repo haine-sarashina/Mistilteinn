@@ -595,6 +595,64 @@ mod tests {
     }
 
     #[test]
+    fn dir_rtl_starts_the_line_at_the_right_edge() {
+        // `direction: rtl` makes `text-align: start` mean the right edge, so the
+        // text is pushed over without the page naming an alignment at all.
+        let page = Page::new(
+            "<html><body><p dir='rtl'>שלום</p></body></html>",
+            "body { margin: 0 } p { width: 400px; }",
+            800.0,
+            600.0,
+        );
+        let runs = crate::layout::collect_text_nodes(&page.layout_root);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].x > 200.0,
+            "right-to-left text should sit at the right of a 400px box, got x={}",
+            runs[0].x
+        );
+    }
+
+    #[test]
+    fn the_dir_attribute_and_the_css_property_agree() {
+        for source in [
+            ("<p dir='rtl'>a</p>", "p { width: 400px }"),
+            ("<p>a</p>", "p { width: 400px; direction: rtl }"),
+        ] {
+            let page = Page::new(
+                &format!("<html><body>{}</body></html>", source.0),
+                &format!("body {{ margin: 0 }} {}", source.1),
+                800.0,
+                600.0,
+            );
+            let p = page
+                .arena
+                .find_by_tag("p")
+                .expect("the paragraph is in the DOM");
+            assert_eq!(
+                page.styles.get(&p).unwrap().direction,
+                css::Direction::Rtl,
+                "for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn direction_inherits_to_descendants() {
+        let page = Page::new(
+            "<html dir='rtl'><body><div><span id='deep'>x</span></div></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let deep = page.arena.find_by_id("deep").unwrap();
+        assert_eq!(
+            page.styles.get(&deep).unwrap().direction,
+            css::Direction::Rtl
+        );
+    }
+
+    #[test]
     fn text_align_moves_the_painted_text_not_just_child_boxes() {
         // The alignment shift used to be applied only where inline child
         // elements were positioned, so the text itself never moved.

@@ -1451,15 +1451,21 @@ fn compute_block_children(
                 run_end += 1;
             }
 
+            // Inline-level boxes that size themselves need real dimensions
+            // before the line is measured. See size_self_sizing_inline_box.
+            for j in i..run_end {
+                size_self_sizing_inline_box(
+                    &mut parent.children[j],
+                    available_width,
+                    depth,
+                    text_renderer,
+                );
+            }
+
             // Build inline boxes from the run
             let inline_boxes = build_inline_boxes_from_slice(parent, &parent.children[i..run_end]);
 
             if !inline_boxes.is_empty() {
-                // Compute heights of inline children first (needed for element sizing)
-                for j in i..run_end {
-                    compute_block_height_inner(&parent.children[j], depth + 1, text_renderer);
-                }
-
                 // Break into lines
                 let mut line_boxes = break_into_lines(
                     inline_boxes,
@@ -1738,6 +1744,62 @@ fn compute_block_children(
 }
 
 /// Compute shrink-to-fit width for auto-width floats and inline blocks.
+/// Give an inline-level box that sizes itself its width and height, before the
+/// line it sits on is measured.
+///
+/// An `inline-block` has no width of its own until something works one out, but
+/// inline box collection reads its rect, and line breaking floors an empty one
+/// at a single pixel. The box then laid its own content out inside that pixel:
+/// a Japanese caption came out one character per line — every CJK character is
+/// its own break opportunity — on a line only one pixel tall, which the content
+/// after it then overlapped.
+///
+/// The height is measured on a copy. The real layout cannot run yet, because it
+/// needs the box's final position and line breaking has not chosen one — and
+/// running it twice on the same node would append its line boxes twice.
+fn size_self_sizing_inline_box(
+    child: &mut LayoutNode,
+    available_width: f32,
+    depth: usize,
+    text_renderer: &mut crate::render::text::TextRenderer,
+) {
+    if !matches!(
+        child.display,
+        DisplayType::InlineBlock | DisplayType::InlineFlex | DisplayType::InlineTable
+    ) {
+        // A replaced element carries its own intrinsic size, and a plain inline
+        // box takes the size of the runs inside it.
+        return;
+    }
+    if child.image_src.is_some() {
+        return;
+    }
+
+    if child.rect.width <= 0.0 {
+        let fit = compute_shrink_to_fit_width(child, depth + 1, text_renderer);
+        // Shrink to fit, but never wider than the line it has to sit on.
+        let mut width = child.explicit_width.unwrap_or(fit).min(available_width);
+        if let Some(min_w) = child.min_width {
+            width = width.max(min_w);
+        }
+        if let Some(max_w) = child.max_width {
+            width = width.min(max_w);
+        }
+        child.rect.width = width.max(0.0);
+    }
+
+    if child.rect.height <= 0.0 {
+        if let Some(height) = child.explicit_height {
+            child.rect.height = height;
+        } else if child.rect.width > 0.0 {
+            let mut probe = child.clone();
+            let probe_width = probe.rect.width;
+            compute_layout(&mut probe, probe_width, text_renderer);
+            child.rect.height = probe.rect.height;
+        }
+    }
+}
+
 fn compute_shrink_to_fit_width(
     node: &LayoutNode,
     depth: usize,
@@ -3232,6 +3294,23 @@ fn position_inline_children_in_lines(
             }
         }
     }
+}
+
+/// The layout rect of a DOM node, if it has one.
+///
+/// Absolutely positioned boxes are searched too: they were lifted out of the
+/// normal flow, so a caller looking for an element by id would otherwise miss
+/// anything positioned.
+pub fn find_layout_rect_by_dom_id(node: &LayoutNode, dom_id: u32) -> Option<Rect> {
+    if node.dom_node_id == Some(dom_id) {
+        return Some(node.rect);
+    }
+    for child in node.children.iter().chain(node.absolute_children.iter()) {
+        if let Some(rect) = find_layout_rect_by_dom_id(child, dom_id) {
+            return Some(rect);
+        }
+    }
+    None
 }
 
 /// Every `<select>` box in the tree, for drawing its drop arrow.

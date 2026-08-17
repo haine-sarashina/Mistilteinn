@@ -904,7 +904,9 @@ impl MistilteinnApp {
 
         // Highlight focused page input with blue outline
         if let Some(focused_dom_id) = self.focused_page_input {
-            if let Some(rect) = find_layout_rect_by_dom_id(&page.layout_root, focused_dom_id) {
+            if let Some(rect) =
+                crate::layout::find_layout_rect_by_dom_id(&page.layout_root, focused_dom_id)
+            {
                 let fx = rect.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
                 let fy = rect.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
                 crate::render::draw_rect_borders(
@@ -945,7 +947,9 @@ impl MistilteinnApp {
         }
 
         if let Some(open_id) = self.open_select {
-            if let Some(rect) = find_layout_rect_by_dom_id(&page.layout_root, open_id) {
+            if let Some(rect) =
+                crate::layout::find_layout_rect_by_dom_id(&page.layout_root, open_id)
+            {
                 let options = page.select_options(open_id);
                 let (sx, sy) = to_screen(rect.x, rect.y);
                 let popup = select_popup_geometry(sx, sy, rect.width, rect.height, options.len());
@@ -1681,22 +1685,6 @@ fn find_input_layout_at_pos(node: &crate::layout::LayoutNode, x: f32, y: f32) ->
     None
 }
 
-/// Recursively searches for the layout rect of a given DOM node ID.
-fn find_layout_rect_by_dom_id(
-    node: &crate::layout::LayoutNode,
-    dom_id: u32,
-) -> Option<crate::layout::Rect> {
-    if node.dom_node_id == Some(dom_id) {
-        return Some(node.rect);
-    }
-    for child in &node.children {
-        if let Some(r) = find_layout_rect_by_dom_id(child, dom_id) {
-            return Some(r);
-        }
-    }
-    None
-}
-
 /// Constructs the appropriate search/form submit URL given a form input and query string.
 fn get_form_submit_url(page: &crate::page::Page, input_dom_id: u32, query_val: &str) -> String {
     let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(input_dom_id));
@@ -2082,7 +2070,7 @@ impl MistilteinnApp {
             .get_active_tab_scroll()
             .unwrap_or((0.0, 0.0));
         let hit = self.tab_manager.get_active_tab_page().and_then(|page| {
-            let rect = find_layout_rect_by_dom_id(&page.layout_root, open_id)?;
+            let rect = crate::layout::find_layout_rect_by_dom_id(&page.layout_root, open_id)?;
             let options = page.select_options(open_id);
             let popup = select_popup_geometry(
                 rect.x - scroll.0 + TAB_BAR_WIDTH as f32,

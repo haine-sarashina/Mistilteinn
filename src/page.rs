@@ -594,6 +594,83 @@ mod tests {
         (runs[0].x, runs[0].width)
     }
 
+    /// Find the widest box in the tree whose display matches.
+    fn find_box(node: &crate::layout::LayoutNode, display: css::DisplayType) -> Option<Rect> {
+        let mut found = if node.display == display {
+            Some(node.rect)
+        } else {
+            None
+        };
+        for child in node.children.iter().chain(node.absolute_children.iter()) {
+            if let Some(rect) = find_box(child, display) {
+                if found.is_none_or(|f: Rect| rect.width > f.width) {
+                    found = Some(rect);
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn an_inline_block_shrinks_to_fit_instead_of_collapsing_to_a_pixel() {
+        // An inline-block's rect is empty when inline box collection reads it,
+        // and line breaking floored the empty one at 1px. The box then laid its
+        // own text out in that pixel: every CJK character is a break
+        // opportunity, so a Japanese caption came out one character per line.
+        let page = Page::new(
+            "<html><body><div class='wrap'><span class='cap'>\
+             日本語のキャプションが一行に収まる</span></div></body></html>",
+            "body { margin: 0 } .wrap { width: 600px } .cap { display: inline-block }",
+            800.0,
+            600.0,
+        );
+
+        let cap = find_box(&page.layout_root, css::DisplayType::InlineBlock)
+            .expect("the inline-block is in the layout tree");
+        assert!(
+            cap.width > 100.0,
+            "the inline-block should shrink to fit its text, got width {}",
+            cap.width
+        );
+
+        let runs = crate::layout::collect_text_nodes(&page.layout_root);
+        assert!(
+            runs.len() < 5,
+            "the caption should not break per character, got {} runs: {:?}",
+            runs.len(),
+            runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn content_after_an_inline_block_clears_its_real_height() {
+        // The line's height came from the same 1px floor, so whatever followed
+        // was placed a pixel below a box hundreds of pixels tall.
+        let page = Page::new(
+            "<html><body>\
+             <div class='wrap'><span class='cap'>あ い う え お か き く け こ</span></div>\
+             <p id='after'>下の段落</p></body></html>",
+            "body { margin: 0 } .wrap { width: 80px } .cap { display: inline-block } \
+             p { margin: 0 }",
+            800.0,
+            600.0,
+        );
+
+        let cap = find_box(&page.layout_root, css::DisplayType::InlineBlock).unwrap();
+        let after = page.arena.find_by_id("after").unwrap();
+        let after_y = crate::layout::find_layout_rect_by_dom_id(&page.layout_root, after)
+            .expect("the paragraph is laid out")
+            .y;
+
+        assert!(cap.height > 20.0, "the wrapped box is tall: {}", cap.height);
+        assert!(
+            after_y >= cap.y + cap.height - 1.0,
+            "following content must start below the box: box bottom {}, paragraph y {}",
+            cap.y + cap.height,
+            after_y
+        );
+    }
+
     #[test]
     fn dir_rtl_starts_the_line_at_the_right_edge() {
         // `direction: rtl` makes `text-align: start` mean the right edge, so the

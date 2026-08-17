@@ -4,10 +4,58 @@ use boa_engine::{
 use std::cell::RefCell;
 use std::rc::Rc;
 
-pub type SharedArena = Rc<RefCell<crate::html::DomArena>>;
+/// The DOM shared between the page and its JavaScript context.
+///
+/// `DomArena` already has interior mutability, so no `RefCell` is needed here —
+/// which is what lets `Page` hold the same `Rc` and see JS mutations directly.
+pub type SharedArena = Rc<crate::html::DomArena>;
 
 thread_local! {
     static ACTIVE_ARENA: RefCell<Option<SharedArena>> = const { RefCell::new(None) };
+}
+
+/// The listener target used for `window` and `document`.
+///
+/// Page-level events (`load`, `DOMContentLoaded`) have no element to hang off,
+/// so they register against a node id no real node can have.
+pub const WINDOW_TARGET: u32 = u32::MAX;
+
+/// A native `addEventListener` that registers against [`WINDOW_TARGET`].
+fn window_add_listener(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let (Some(event_type), Some(callback)) = (args.first(), args.get(1)) else {
+        return Ok(JsValue::undefined());
+    };
+    call_global(
+        ctx,
+        "__addListener",
+        &[
+            JsValue::from(WINDOW_TARGET),
+            event_type.clone(),
+            callback.clone(),
+        ],
+    )?;
+    Ok(JsValue::undefined())
+}
+
+/// A native `removeEventListener` for [`WINDOW_TARGET`].
+fn window_remove_listener(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let (Some(event_type), Some(callback)) = (args.first(), args.get(1)) else {
+        return Ok(JsValue::undefined());
+    };
+    call_global(
+        ctx,
+        "__removeListener",
+        &[
+            JsValue::from(WINDOW_TARGET),
+            event_type.clone(),
+            callback.clone(),
+        ],
+    )?;
+    Ok(JsValue::undefined())
 }
 
 /// Set the currently active DOM arena for JavaScript execution.
@@ -19,12 +67,12 @@ pub fn set_active_arena(arena: Option<SharedArena>) {
 
 /// Helper to execute a closure with the currently active DOM arena.
 pub fn with_active_arena<R, F: FnOnce(&crate::html::DomArena) -> R>(f: F) -> Option<R> {
-    ACTIVE_ARENA.with(|a| a.borrow().as_ref().map(|arena_rc| f(&arena_rc.borrow())))
+    ACTIVE_ARENA.with(|a| a.borrow().as_ref().map(|arena_rc| f(arena_rc.as_ref())))
 }
 
 /// Initialize standard global DOM bindings (`console`, `document`).
 pub fn init_dom_bindings(context: &mut Context) -> JsResult<()> {
-    let arena = Rc::new(RefCell::new(crate::html::DomArena::new()));
+    let arena = Rc::new(crate::html::DomArena::new());
     init_dom_bindings_with_arena(context, arena)
 }
 
@@ -130,6 +178,30 @@ pub fn init_dom_bindings_with_arena(context: &mut Context, arena: SharedArena) -
             js_string!("querySelector"),
             1,
         )
+        .function(
+            // `document.addEventListener('DOMContentLoaded', ...)` is as common
+            // as the window form; both fire at page-ready time.
+            NativeFunction::from_fn_ptr(window_add_listener),
+            js_string!("addEventListener"),
+            2,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(window_remove_listener),
+            js_string!("removeEventListener"),
+            2,
+        )
+        .function(
+            // Used by the event dispatcher to build `event.target`.
+            NativeFunction::from_fn_ptr(|_this, args, ctx| {
+                let Some(node_id) = args.first().and_then(|v| v.as_number()) else {
+                    return Ok(JsValue::null());
+                };
+                let elem_obj = create_element_object(ctx, node_id as u32)?;
+                Ok(JsValue::new(elem_obj))
+            }),
+            js_string!("__elementById"),
+            1,
+        )
         .property(
             js_string!("title"),
             js_string!("Mistilteinn Browser"),
@@ -187,12 +259,12 @@ pub fn init_dom_bindings_with_arena(context: &mut Context, arena: SharedArena) -
             boa_engine::property::Attribute::all(),
         )
         .function(
-            NativeFunction::from_fn_ptr(|_this, _args, _ctx| Ok(JsValue::undefined())),
+            NativeFunction::from_fn_ptr(window_add_listener),
             js_string!("addEventListener"),
             2,
         )
         .function(
-            NativeFunction::from_fn_ptr(|_this, _args, _ctx| Ok(JsValue::undefined())),
+            NativeFunction::from_fn_ptr(window_remove_listener),
             js_string!("removeEventListener"),
             2,
         )
@@ -219,7 +291,12 @@ pub fn init_dom_bindings_with_arena(context: &mut Context, arena: SharedArena) -
     let _ = context.register_global_callable(
         js_string!("addEventListener"),
         2,
-        NativeFunction::from_fn_ptr(|_this, _args, _ctx| Ok(JsValue::undefined())),
+        NativeFunction::from_fn_ptr(window_add_listener),
+    );
+    let _ = context.register_global_callable(
+        js_string!("removeEventListener"),
+        2,
+        NativeFunction::from_fn_ptr(window_remove_listener),
     );
 
     Ok(())
@@ -260,12 +337,10 @@ fn create_element_object(context: &mut Context, node_id: u32) -> JsResult<boa_en
                     if let Some(target_id) = get_node_id_from_this(this, ctx) {
                         ACTIVE_ARENA.with(|a| {
                             if let Some(arena) = a.borrow().as_ref() {
-                                let cur = arena
-                                    .borrow()
-                                    .get_attribute(target_id, "style")
-                                    .unwrap_or_default();
+                                let cur =
+                                    arena.get_attribute(target_id, "style").unwrap_or_default();
                                 let new_style = format!("{}; {}: {}", cur, p, v);
-                                arena.borrow().set_attribute(target_id, "style", &new_style);
+                                arena.set_attribute(target_id, "style", &new_style);
                             }
                         });
                     }
@@ -298,7 +373,7 @@ fn create_element_object(context: &mut Context, node_id: u32) -> JsResult<boa_en
                 .unwrap_or_default();
             ACTIVE_ARENA.with(|a| {
                 if let Some(arena) = a.borrow().as_ref() {
-                    arena.borrow().set_text_content(target_id, &new_val);
+                    arena.set_text_content(target_id, &new_val);
                 }
             });
         }
@@ -325,7 +400,7 @@ fn create_element_object(context: &mut Context, node_id: u32) -> JsResult<boa_en
                 .unwrap_or_default();
             ACTIVE_ARENA.with(|a| {
                 if let Some(arena) = a.borrow().as_ref() {
-                    arena.borrow().set_text_content(target_id, &new_val);
+                    arena.set_text_content(target_id, &new_val);
                 }
             });
         }
@@ -338,6 +413,30 @@ fn create_element_object(context: &mut Context, node_id: u32) -> JsResult<boa_en
             js_string!("__node_id"),
             JsValue::new(node_id as f64),
             boa_engine::property::Attribute::READONLY,
+        )
+        .property(
+            // The two identity properties a handler reaches for first, on
+            // `event.target` as much as on a looked-up element.
+            js_string!("id"),
+            js_string!(
+                with_active_arena(|arena| arena.get_attribute(node_id, "id"))
+                    .flatten()
+                    .unwrap_or_default()
+            ),
+            boa_engine::property::Attribute::all(),
+        )
+        .property(
+            js_string!("tagName"),
+            js_string!(
+                with_active_arena(|arena| arena
+                    .get(crate::html::DomHandle(crate::html::NodeId::from_raw(
+                        node_id
+                    )))
+                    .and_then(|n| n.tag_name().map(|t| t.to_string().to_uppercase())))
+                .flatten()
+                .unwrap_or_default()
+            ),
+            boa_engine::property::Attribute::all(),
         )
         .accessor(
             js_string!("textContent"),
@@ -376,7 +475,7 @@ fn create_element_object(context: &mut Context, node_id: u32) -> JsResult<boa_en
                     if let Some(target_id) = get_node_id_from_this(this, ctx) {
                         ACTIVE_ARENA.with(|a| {
                             if let Some(arena) = a.borrow().as_ref() {
-                                arena.borrow().set_attribute(target_id, &k, &v);
+                                arena.set_attribute(target_id, &k, &v);
                             }
                         });
                     }
@@ -387,16 +486,45 @@ fn create_element_object(context: &mut Context, node_id: u32) -> JsResult<boa_en
             2,
         )
         .function(
-            NativeFunction::from_fn_ptr(|_this, args, _ctx| {
-                if let Some(event_name) = args.get(0) {
-                    log::info!(
-                        "JS registered addEventListener for '{}'",
-                        event_name.display()
-                    );
-                }
+            NativeFunction::from_fn_ptr(|this, args, ctx| {
+                let Some(node_id) = get_node_id_from_this(this, ctx) else {
+                    return Ok(JsValue::undefined());
+                };
+                let Some(event_type) = args.first() else {
+                    return Ok(JsValue::undefined());
+                };
+                let Some(callback) = args.get(1) else {
+                    return Ok(JsValue::undefined());
+                };
+                // The listener is kept on the JS side: a callback stored in a
+                // Rust-side collection would sit outside the garbage
+                // collector's reach.
+                call_global(
+                    ctx,
+                    "__addListener",
+                    &[JsValue::from(node_id), event_type.clone(), callback.clone()],
+                )?;
                 Ok(JsValue::undefined())
             }),
             js_string!("addEventListener"),
+            2,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(|this, args, ctx| {
+                let Some(node_id) = get_node_id_from_this(this, ctx) else {
+                    return Ok(JsValue::undefined());
+                };
+                let (Some(event_type), Some(callback)) = (args.first(), args.get(1)) else {
+                    return Ok(JsValue::undefined());
+                };
+                call_global(
+                    ctx,
+                    "__removeListener",
+                    &[JsValue::from(node_id), event_type.clone(), callback.clone()],
+                )?;
+                Ok(JsValue::undefined())
+            }),
+            js_string!("removeEventListener"),
             2,
         )
         .property(
@@ -407,4 +535,78 @@ fn create_element_object(context: &mut Context, node_id: u32) -> JsResult<boa_en
         .build();
 
     Ok(elem)
+}
+
+/// Call a function defined on the global object.
+fn call_global(context: &mut Context, name: &str, args: &[JsValue]) -> JsResult<JsValue> {
+    let global = context.global_object();
+    let func = global.get(js_string!(name.to_string()), context)?;
+    match func.as_callable() {
+        Some(callable) => callable.call(&JsValue::undefined(), args, context),
+        None => Ok(JsValue::undefined()),
+    }
+}
+
+/// The event plumbing, defined in JavaScript.
+///
+/// Listeners live in a plain JS array rather than in a Rust collection so the
+/// callbacks stay reachable from the garbage collector for the whole life of
+/// the page. Dispatch also runs here, which keeps calling back into JS out of
+/// the native side entirely.
+const EVENT_PRELUDE: &str = r#"
+globalThis.__listeners = [];
+globalThis.__lastDefaultPrevented = false;
+
+globalThis.__addListener = function (nodeId, type, cb) {
+    if (typeof cb !== 'function') return;
+    globalThis.__listeners.push([nodeId, String(type).toLowerCase(), cb]);
+};
+
+globalThis.__removeListener = function (nodeId, type, cb) {
+    var t = String(type).toLowerCase();
+    globalThis.__listeners = globalThis.__listeners.filter(function (l) {
+        return !(l[0] === nodeId && l[1] === t && l[2] === cb);
+    });
+};
+
+/// Fire `type` at one node. Returns how many listeners ran.
+globalThis.__dispatchEvent = function (nodeId, type) {
+    var t = String(type).toLowerCase();
+    var prevented = false;
+    var event = {
+        type: t,
+        target: document.__elementById(nodeId),
+        defaultPrevented: false,
+        preventDefault: function () {
+            prevented = true;
+            this.defaultPrevented = true;
+        },
+        stopPropagation: function () {},
+    };
+    var fired = 0;
+    // Snapshot the list: a handler may add or remove listeners while running.
+    var ls = globalThis.__listeners.slice();
+    for (var i = 0; i < ls.length; i++) {
+        if (ls[i][0] === nodeId && ls[i][1] === t) {
+            fired++;
+            try {
+                ls[i][2].call(event.target, event);
+            } catch (e) {
+                console.error('event handler threw: ' + e);
+            }
+        }
+    }
+    if (prevented) {
+        globalThis.__lastDefaultPrevented = true;
+    }
+    return fired;
+};
+"#;
+
+/// Install the event registry and dispatcher into a fresh context.
+pub fn init_event_support(context: &mut Context) {
+    let source = boa_engine::Source::from_bytes(EVENT_PRELUDE.as_bytes());
+    if let Err(e) = context.eval(source) {
+        log::error!("failed to install event support: {e}");
+    }
 }

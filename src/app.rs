@@ -2402,6 +2402,14 @@ impl ApplicationHandler for MistilteinnApp {
                                                     content_y,
                                                 );
 
+                                                // Page script sees the click first, and may
+                                                // call preventDefault() to keep us from
+                                                // following the link under it. A handler can
+                                                // also have changed the DOM, so anything read
+                                                // from the page has to be read after this.
+                                                let script_outcome =
+                                                    page.dispatch_event_along(&dom_path, "click");
+
                                                 // A <select> swallows the click: it opens
                                                 // its list rather than focusing anything.
                                                 let clicked_select =
@@ -2428,6 +2436,10 @@ impl ApplicationHandler for MistilteinnApp {
                                                     {
                                                         break;
                                                     }
+                                                }
+                                                if script_outcome.default_prevented {
+                                                    // The page handled the click itself.
+                                                    clicked_href = None;
                                                 }
                                                 if clicked_select.is_some() {
                                                     clicked_input = None;

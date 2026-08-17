@@ -6,6 +6,7 @@ use rustc_hash::FxHashMap;
 
 use crate::css;
 use crate::html::{self, DomArena, DomHandle, NodeId};
+use crate::js::DispatchOutcome;
 use crate::layout::Rect;
 
 /// Cached decoded image data.
@@ -18,7 +19,13 @@ pub struct CachedImage {
 
 /// A fully parsed and laid-out page ready for rendering.
 pub struct Page {
-    pub arena: DomArena,
+    /// The document.
+    ///
+    /// Shared with this page's JavaScript context rather than owned outright,
+    /// so a handler's DOM mutation is visible here without copying anything
+    /// back. `DomArena` has interior mutability, so `Rc` derefs to `&DomArena`
+    /// and every `page.arena.foo()` call reads through unchanged.
+    pub arena: std::rc::Rc<DomArena>,
     pub title: String,
     #[allow(dead_code)]
     pub styles: FxHashMap<u32, css::ComputedValues>,
@@ -29,6 +36,9 @@ pub struct Page {
     pub image_cache: FxHashMap<String, CachedImage>,
     /// Merged (UA + author) stylesheet for style recomputation (e.g., :hover).
     pub stylesheet: crate::css::parser::Stylesheet,
+    /// The page's JavaScript context, kept alive past the initial script run so
+    /// registered event listeners can still be called.
+    js_context: boa_engine::Context,
 }
 
 impl Page {
@@ -55,19 +65,16 @@ impl Page {
         let title = arena
             .extract_title()
             .unwrap_or_else(|| "New Tab".to_string());
-        let shared_arena = std::rc::Rc::new(std::cell::RefCell::new(arena));
+        let arena = std::rc::Rc::new(arena);
 
-        // Stage 1.5: Execute inline JS scripts with DOM bindings connected to arena
-        let mut js_context = crate::js::init_js_engine_with_arena(shared_arena.clone());
-        let scripts = shared_arena.borrow().extract_scripts();
+        // Stage 1.5: Execute inline JS scripts with DOM bindings connected to
+        // the arena. The context is kept afterwards: scripts register event
+        // listeners that have to survive to be called later.
+        let mut js_context = crate::js::init_js_engine_with_arena(arena.clone());
+        let scripts = arena.extract_scripts();
         for script in scripts {
             crate::js::execute_script(&mut js_context, &script);
         }
-
-        let arena = match std::rc::Rc::try_unwrap(shared_arena) {
-            Ok(cell) => cell.into_inner(),
-            Err(rc) => rc.borrow().clone(),
-        };
 
         // Stage 2: Parse CSS into author stylesheet
         let author_stylesheet = crate::css::parser::parse_stylesheet(css_source);
@@ -128,7 +135,7 @@ impl Page {
             layout_root.children.len()
         );
 
-        Self {
+        let mut page = Self {
             arena,
             title,
             styles,
@@ -138,7 +145,60 @@ impl Page {
             page_url: String::new(),
             image_cache: FxHashMap::default(),
             stylesheet,
+            js_context,
+        };
+
+        // The document exists now, so anything waiting on it can run. This
+        // relayouts only if a handler actually changed something.
+        page.fire_load_events();
+        page
+    }
+
+    /// Fire the page-ready events at `window` / `document`.
+    ///
+    /// Scripts run during parsing, so a handler registered for
+    /// `DOMContentLoaded` or `load` has nothing to fire it until the document
+    /// is built. Called once at the end of the pipeline.
+    pub fn fire_load_events(&mut self) -> DispatchOutcome {
+        let mut total = DispatchOutcome::default();
+        for event in ["domcontentloaded", "load"] {
+            let outcome = self.dispatch_event_along(&[crate::js::dom::WINDOW_TARGET], event);
+            total.fired += outcome.fired;
+            total.default_prevented |= outcome.default_prevented;
         }
+        total
+    }
+
+    /// Fire an event at `node_id` and at each of its ancestors, as bubbling does.
+    ///
+    /// `path` runs outermost-to-innermost, which is the order the hit test
+    /// produces it; dispatch walks it in reverse so the innermost target is
+    /// notified first. Layout is recomputed when any handler ran, because a
+    /// handler is free to have changed the DOM.
+    pub fn dispatch_event_along(&mut self, path: &[u32], event_type: &str) -> DispatchOutcome {
+        crate::js::dom::set_active_arena(Some(self.arena.clone()));
+        crate::js::reset_default_prevented(&mut self.js_context);
+
+        let mut total = DispatchOutcome::default();
+        for &node_id in path.iter().rev() {
+            let outcome = crate::js::dispatch_event(&mut self.js_context, node_id, event_type);
+            total.fired += outcome.fired;
+            total.default_prevented |= outcome.default_prevented;
+        }
+
+        if total.ran() {
+            self.recompute_with_hover(&[]);
+        }
+        total
+    }
+
+    /// Run a script in this page's context, relayouting if it changed the DOM.
+    ///
+    /// Used by tests and by anything that needs to evaluate script after load.
+    pub fn eval_script(&mut self, script: &str) {
+        crate::js::dom::set_active_arena(Some(self.arena.clone()));
+        crate::js::execute_script(&mut self.js_context, script);
+        self.recompute_with_hover(&[]);
     }
 
     /// Recompute styles and rebuild the layout tree with the given set of

@@ -1,3 +1,5 @@
+pub mod cache;
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -450,6 +452,104 @@ pub fn http_client() -> &'static reqwest::Client {
     &HTTP_CLIENT
 }
 
+/// A body obtained either from the network or from the HTTP cache.
+pub struct CachedFetch {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+    /// The URL the body came from, after redirects.
+    pub final_url: String,
+    /// The response status, or `None` when nothing was requested because the
+    /// cached copy was still fresh.
+    pub status: Option<reqwest::StatusCode>,
+}
+
+/// GET a URL through the HTTP cache.
+///
+/// A fresh entry is returned without touching the network. A stale one that
+/// carries a validator is revalidated, which normally costs a 304 and no body
+/// at all — that is where the saving is on a revisit, since most static assets
+/// ship an `ETag` but no lifetime.
+pub async fn get_with_cache(
+    url: &str,
+    timeout: std::time::Duration,
+) -> Result<CachedFetch, NetworkError> {
+    let cached = cache::lookup(url);
+    let mut validators = None;
+
+    if let Some(entry) = &cached {
+        match cache::decide(&entry.policy, entry.age()) {
+            cache::CacheDecision::Fresh => {
+                log::debug!("cache hit: {url}");
+                return Ok(CachedFetch {
+                    bytes: entry.body.clone(),
+                    content_type: entry.content_type.clone(),
+                    final_url: entry.final_url.clone(),
+                    status: None,
+                });
+            }
+            cache::CacheDecision::Revalidate {
+                if_none_match,
+                if_modified_since,
+            } => validators = Some((if_none_match, if_modified_since)),
+            cache::CacheDecision::Miss => {}
+        }
+    }
+
+    let mut request = http_client().get(url).timeout(timeout);
+    if let Some((if_none_match, if_modified_since)) = &validators {
+        if let Some(etag) = if_none_match {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(since) = if_modified_since {
+            request = request.header(reqwest::header::IF_MODIFIED_SINCE, since);
+        }
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        if let Some(entry) = cached {
+            log::debug!("cache revalidated: {url}");
+            cache::refresh(url);
+            return Ok(CachedFetch {
+                bytes: entry.body,
+                content_type: entry.content_type,
+                final_url: entry.final_url,
+                status: Some(status),
+            });
+        }
+    }
+
+    let final_url = response.url().to_string();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let policy = cache::CachePolicy::from_headers(response.headers());
+    let bytes = response.bytes().await?.to_vec();
+
+    if status.is_success() {
+        cache::store(
+            url,
+            cache::new_entry(
+                bytes.clone(),
+                content_type.clone(),
+                final_url.clone(),
+                policy,
+            ),
+        );
+    }
+
+    Ok(CachedFetch {
+        bytes,
+        content_type,
+        final_url,
+        status: Some(status),
+    })
+}
+
 /// Simple base64 decoder for data: URIs without external dependency.
 fn decode_base64(input: &str) -> Option<Vec<u8>> {
     let mut out = Vec::new();
@@ -500,17 +600,14 @@ pub async fn fetch_image(url: &str) -> Result<Vec<u8>, NetworkError> {
     }
 
     for attempt in 0..3 {
-        let resp = http_client()
-            .get(url)
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await;
+        let resp = get_with_cache(url, std::time::Duration::from_secs(15)).await;
         match resp {
-            Ok(res) if res.status().is_success() => {
-                let bytes = res.bytes().await.map_err(NetworkError::Http)?;
-                return Ok(bytes.to_vec());
+            // `None` means the cached copy was still fresh; a 304 means it was
+            // revalidated. Either way the bytes are good.
+            Ok(res) if res.status.is_none_or(|s| s.is_success() || s == 304) => {
+                return Ok(res.bytes);
             }
-            Ok(res) if res.status().as_u16() == 429 => {
+            Ok(res) if res.status.is_some_and(|s| s.as_u16() == 429) => {
                 tokio::time::sleep(std::time::Duration::from_millis(150 * (attempt + 1))).await;
             }
             Ok(_) => {
@@ -518,7 +615,7 @@ pub async fn fetch_image(url: &str) -> Result<Vec<u8>, NetworkError> {
             }
             Err(e) => {
                 if attempt == 2 {
-                    return Err(NetworkError::Http(e));
+                    return Err(e);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -529,20 +626,10 @@ pub async fn fetch_image(url: &str) -> Result<Vec<u8>, NetworkError> {
 
 /// Fetch a single CSS file with a shorter timeout (10s) and the standard User-Agent.
 async fn fetch_css_file(url: &str) -> Result<String, NetworkError> {
-    let response = http_client()
-        .get(url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await?;
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_string());
-    let bytes = response.bytes().await?;
+    let fetched = get_with_cache(url, std::time::Duration::from_secs(10)).await?;
     // Stylesheets are far more often UTF-8 than documents are, but a BOM or a
     // declared charset still has to be honoured.
-    let (content, _) = decode_body(&bytes, content_type.as_deref());
+    let (content, _) = decode_body(&fetched.bytes, fetched.content_type.as_deref());
     Ok(content)
 }
 

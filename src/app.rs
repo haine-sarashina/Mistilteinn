@@ -27,6 +27,67 @@ const LOADING_BAR_COLOR_G: f32 = 140.0 / 255.0;
 const LOADING_BAR_COLOR_B: f32 = 230.0 / 255.0;
 const SCROLLBAR_WIDTH: f32 = 10.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 30.0;
+/// How long the smooth-scroll glide takes to cover ~63% of the remaining
+/// distance. Small enough that scrolling still feels attached to the wheel.
+const SCROLL_GLIDE_TAU: f32 = 0.07;
+/// Below this the glide is over and the offset snaps, so it does not creep
+/// towards its target by ever smaller fractions of a pixel forever.
+const SCROLL_SNAP_DISTANCE: f32 = 0.5;
+/// How far one wheel notch scrolls.
+const WHEEL_LINE_DISTANCE: f32 = 40.0;
+/// Padding between the address bar's boxes and its edges.
+const ADDRESS_BOX_MARGIN: f32 = 6.0;
+/// Width of the bookmark star at the right of the address bar.
+const BOOKMARK_BUTTON_WIDTH: f32 = 30.0;
+/// Height of the in-page find bar.
+const FIND_BAR_HEIGHT: f32 = 30.0;
+/// Width of the in-page find bar.
+const FIND_BAR_WIDTH: f32 = 320.0;
+
+/// The internal page listing saved bookmarks.
+const BOOKMARKS_URL: &str = "mistilteinn://bookmarks";
+
+/// The zoom levels Ctrl+`+` / Ctrl+`-` step through.
+const ZOOM_LEVELS: [f32; 13] = [
+    0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 3.0,
+];
+
+/// Where the find bar sits: top right of the content area, as in Chrome.
+fn find_bar_geometry(win_w: u32) -> crate::layout::Rect {
+    let width = FIND_BAR_WIDTH.min((win_w as f32 - TAB_BAR_WIDTH as f32 - 20.0).max(120.0));
+    crate::layout::Rect::new(
+        win_w as f32 - width - 16.0,
+        ADDRESS_BAR_HEIGHT as f32 + 8.0,
+        width,
+        FIND_BAR_HEIGHT,
+    )
+}
+
+/// Where the address bar's input box and bookmark star sit.
+///
+/// One source for both the drawing and the hit test: they were drawn from
+/// separately computed numbers before, which is how a button ends up not being
+/// where it looks like it is.
+fn address_bar_geometry(win_w: u32) -> (crate::layout::Rect, crate::layout::Rect) {
+    let nav_end = TAB_BAR_WIDTH as f32 + NAV_BUTTON_WIDTH * 3.0;
+    let inner_height = ADDRESS_BAR_HEIGHT as f32 - ADDRESS_BOX_MARGIN * 2.0;
+
+    let star = crate::layout::Rect::new(
+        (win_w as f32 - ADDRESS_BOX_MARGIN - BOOKMARK_BUTTON_WIDTH).max(nav_end),
+        ADDRESS_BOX_MARGIN,
+        BOOKMARK_BUTTON_WIDTH,
+        inner_height,
+    );
+    let box_x = nav_end + ADDRESS_BOX_MARGIN;
+    let address = crate::layout::Rect::new(
+        box_x,
+        ADDRESS_BOX_MARGIN,
+        (star.x - ADDRESS_BOX_MARGIN - box_x).max(0.0),
+        inner_height,
+    );
+
+    (address, star)
+}
 
 /// Main application struct implementing winit's ApplicationHandler trait.
 pub struct MistilteinnApp {
@@ -39,6 +100,8 @@ pub struct MistilteinnApp {
     cursor_pos: (f32, f32),
     /// Whether Ctrl key is currently pressed (for keyboard shortcuts).
     ctrl_pressed: bool,
+    /// Whether Shift is currently pressed (wheel axis, find-previous).
+    shift_pressed: bool,
     /// The tab id currently under the cursor (for hover highlight).
     hovered_tab_id: Option<crate::browser::tab::TabId>,
     /// Whether the address bar is currently under the cursor.
@@ -56,14 +119,139 @@ pub struct MistilteinnApp {
     focused_page_input: Option<u32>,
     /// The DOM node ID of the `<select>` whose option list is open, if any.
     open_select: Option<u32>,
-    /// Whether the user is actively dragging the scrollbar thumb.
+    /// Whether the user is actively dragging a scrollbar thumb.
     is_dragging_scrollbar: bool,
-    /// The cursor Y position when scrollbar dragging started.
-    scrollbar_drag_start_y: f32,
-    /// The scroll Y offset when scrollbar dragging started.
-    scrollbar_drag_start_scroll_y: f32,
-    /// Whether the scrollbar is currently hovered by cursor.
+    /// Which scrollbar is being dragged.
+    dragging_axis: Axis,
+    /// The cursor position along the dragged axis when dragging started.
+    scrollbar_drag_start_pos: f32,
+    /// The scroll offset along the dragged axis when dragging started.
+    scrollbar_drag_start_scroll: f32,
+    /// Whether a scrollbar is currently hovered by cursor.
     hovered_scrollbar: bool,
+    /// Where scrolling is heading. The tab's own offset chases this, so a
+    /// wheel notch glides instead of jumping. See [`Self::step_scroll`].
+    scroll_target: (f32, f32),
+    /// When the scroll animation was last advanced.
+    last_scroll_step: Option<std::time::Instant>,
+    /// The user's saved pages.
+    bookmarks: crate::browser::bookmarks::BookmarkStore,
+    /// In-page search (Ctrl+F).
+    find_bar: FindBar,
+}
+
+/// A scroll axis. The two scrollbars differ only in which coordinate they use,
+/// so the geometry is written once and read along one axis or the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+/// The state of the in-page search bar (Ctrl+F).
+#[derive(Debug, Default)]
+struct FindBar {
+    /// Whether the bar is open. It takes keyboard input while it is.
+    active: bool,
+    query: String,
+    /// Where each match is on the page, in layout coordinates, in document
+    /// order. Recomputed whenever the query or the page changes.
+    matches: Vec<crate::layout::Rect>,
+    /// Which match is the current one, indexing `matches`.
+    current: usize,
+}
+
+impl FindBar {
+    /// The rectangle of the match the user is on, if there is one.
+    fn current_match(&self) -> Option<crate::layout::Rect> {
+        self.matches.get(self.current).copied()
+    }
+
+    /// Move to the next or previous match, wrapping around the page as a
+    /// browser's find does.
+    fn step(&mut self, forward: bool) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.current = if forward {
+            (self.current + 1) % self.matches.len()
+        } else {
+            (self.current + self.matches.len() - 1) % self.matches.len()
+        };
+    }
+
+    /// What the bar reports: "3/12", or "0/0" when nothing matched.
+    fn counter(&self) -> String {
+        if self.matches.is_empty() {
+            "0/0".to_string()
+        } else {
+            format!("{}/{}", self.current + 1, self.matches.len())
+        }
+    }
+}
+
+/// Where one scrollbar sits and how far its axis can scroll.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScrollbarMetrics {
+    track: crate::layout::Rect,
+    thumb: crate::layout::Rect,
+    /// The largest scroll offset on this axis.
+    max_scroll: f32,
+}
+
+/// The coordinate of a point along one axis.
+fn along(axis: Axis, x: f32, y: f32) -> f32 {
+    match axis {
+        Axis::Horizontal => x,
+        Axis::Vertical => y,
+    }
+}
+
+impl ScrollbarMetrics {
+    /// The distance the thumb can travel along its track.
+    fn thumb_travel(&self, axis: Axis) -> f32 {
+        match axis {
+            Axis::Horizontal => (self.track.width - self.thumb.width).max(1.0),
+            Axis::Vertical => (self.track.height - self.thumb.height).max(1.0),
+        }
+    }
+}
+
+impl MistilteinnApp {
+    /// A browser with no window yet, no tabs and nothing loaded.
+    ///
+    /// The state lives in one place rather than in every construction site, so
+    /// a new piece of UI state does not have to be repeated across `run` and
+    /// each test that needs an app to talk to.
+    pub fn new(start_url: Option<String>) -> Self {
+        Self {
+            renderer: None,
+            start_url,
+            tab_manager: crate::browser::tab::TabManager::new(),
+            group_manager: crate::browser::tab_group::GroupManager::new(),
+            tokio_rt: None,
+            cursor_pos: (0.0, 0.0),
+            ctrl_pressed: false,
+            shift_pressed: false,
+            hovered_tab_id: None,
+            hovered_address_bar: false,
+            prev_hovered_dom_id: None,
+            address_input: String::new(),
+            is_address_focused: false,
+            address_cursor: 0,
+            focused_page_input: None,
+            open_select: None,
+            is_dragging_scrollbar: false,
+            dragging_axis: Axis::Vertical,
+            scrollbar_drag_start_pos: 0.0,
+            scrollbar_drag_start_scroll: 0.0,
+            hovered_scrollbar: false,
+            scroll_target: (0.0, 0.0),
+            last_scroll_step: None,
+            bookmarks: crate::browser::bookmarks::BookmarkStore::load(),
+            find_bar: FindBar::default(),
+        }
+    }
 }
 
 /// Hit-test result for tab bar clicks.
@@ -87,10 +275,12 @@ enum HitTestResult {
     ForwardButton,
     /// Clicked on Reload Button
     ReloadButton,
-    /// Clicked on Scrollbar Thumb
-    ScrollbarThumb,
-    /// Clicked on Scrollbar Track
-    ScrollbarTrack,
+    /// Clicked on the thumb of one axis's scrollbar
+    ScrollbarThumb(Axis),
+    /// Clicked on the track of one axis's scrollbar
+    ScrollbarTrack(Axis),
+    /// Clicked the bookmark star
+    BookmarkButton,
 }
 
 impl HitTestResult {
@@ -388,14 +578,12 @@ impl MistilteinnApp {
         curr_x += NAV_BUTTON_WIDTH;
 
         // Inner URL Input box
-        let addr_box_margin = 6.0;
-        let addr_box_x = curr_x + addr_box_margin;
-        let addr_box_w = window_width as f32 - addr_box_x - addr_box_margin;
+        let (addr_box, star_box) = address_bar_geometry(window_width);
         rects.push(layout_to_clip(
-            addr_box_x,
-            addr_box_margin,
-            addr_box_w,
-            ADDRESS_BAR_HEIGHT as f32 - addr_box_margin * 2.0,
+            addr_box.x,
+            addr_box.y,
+            addr_box.width,
+            addr_box.height,
             window_width as f32,
             window_height as f32,
         ));
@@ -410,6 +598,22 @@ impl MistilteinnApp {
             r: addr_r,
             g: addr_g,
             b: addr_b,
+            a: 1.0,
+        });
+
+        // Bookmark star button at the right end of the address bar
+        rects.push(layout_to_clip(
+            star_box.x,
+            star_box.y,
+            star_box.width,
+            star_box.height,
+            window_width as f32,
+            window_height as f32,
+        ));
+        colors.push(ColorF {
+            r: 55.0 / 255.0,
+            g: 55.0 / 255.0,
+            b: 60.0 / 255.0,
             a: 1.0,
         });
 
@@ -585,8 +789,8 @@ impl MistilteinnApp {
         curr_x += NAV_BUTTON_WIDTH;
 
         // Draw Address input
-        let addr_box_margin = 6.0;
-        let addr_box_x = curr_x + addr_box_margin;
+        let (addr_box, star_box) = address_bar_geometry(win_w);
+        let addr_box_x = addr_box.x;
 
         // Show cursor if focused
         let display_text = if self.is_address_focused {
@@ -621,11 +825,57 @@ impl MistilteinnApp {
             addr_color,
             addr_box_x + 10.0,
             10.0,
-            win_w as f32 - addr_box_x - 20.0,
+            addr_box.width - 20.0,
             buffer,
             win_w,
             win_h,
         );
+
+        // Zoom level, shown only when it is not 100% — a browser says nothing
+        // about zoom until there is something to say.
+        let zoom = self.active_zoom();
+        if (zoom - 1.0).abs() > 0.001 {
+            text_renderer.rasterize_to_bitmap(
+                &format!("{}%", (zoom * 100.0).round() as i32),
+                12.0,
+                "sans-serif",
+                [0.75, 0.8, 0.95, 1.0],
+                addr_box.right() - 46.0,
+                12.0,
+                44.0,
+                buffer,
+                win_w,
+                win_h,
+            );
+        }
+
+        // Bookmark star: filled when this page is saved.
+        let bookmarked = self
+            .tab_manager
+            .active_tab()
+            .map(|t| self.bookmarks.contains(&t.url))
+            .unwrap_or(false);
+        text_renderer.rasterize_to_bitmap(
+            if bookmarked { "★" } else { "☆" },
+            17.0,
+            "sans-serif",
+            if bookmarked {
+                [1.0, 0.82, 0.28, 1.0]
+            } else {
+                [0.75, 0.75, 0.8, 1.0]
+            },
+            star_box.x + 6.0,
+            star_box.y + 3.0,
+            star_box.width,
+            buffer,
+            win_w,
+            win_h,
+        );
+    }
+
+    /// The zoom factor of the active tab, or 100% when there is no tab.
+    fn active_zoom(&self) -> f32 {
+        self.tab_manager.active_tab().map(|t| t.zoom).unwrap_or(1.0)
     }
 
     /// Rebuild the render artifacts from the current page and upload to GPU.
@@ -744,7 +994,16 @@ impl MistilteinnApp {
         // Build the page's paint order once, then walk it in order. Painting
         // in three passes (all backgrounds, then all text, then all images)
         // put every positioned overlay underneath the text it should cover.
-        let display_list = crate::layout::build_display_list(&page.layout_root);
+        // The scroll position goes in because `position: sticky` is the one
+        // thing whose painted place depends on it.
+        let display_list = crate::layout::build_display_list_with_scroll(
+            &page.layout_root,
+            scroll_offset,
+            (
+                win_w as f32 - TAB_BAR_WIDTH as f32,
+                win_h as f32 - ADDRESS_BAR_HEIGHT as f32,
+            ),
+        );
 
         // Allocate full-window RGBA buffer (transparent background)
         let mut composite_buffer = vec![0u8; (win_w * win_h * 4) as usize];
@@ -1067,28 +1326,36 @@ impl MistilteinnApp {
             }
         }
 
+        // Highlight what the find bar matched, before the chrome goes on top.
+        self.draw_find_highlights(&mut composite_buffer, win_w, win_h, scroll_offset);
+
         self.draw_chrome_text(&mut text_renderer, &mut composite_buffer, win_w, win_h);
 
-        // Draw Scrollbar (track and thumb)
-        if let Some((track_x, track_y, track_w, track_h, thumb_x, thumb_y, thumb_w, thumb_h, _)) =
-            self.get_scrollbar_metrics(win_w, win_h)
-        {
+        // Draw both scrollbars (track and thumb)
+        for axis in [Axis::Vertical, Axis::Horizontal] {
+            let Some(metrics) = self.scrollbar_metrics(axis, win_w, win_h) else {
+                continue;
+            };
+
             // Track background (subtle light gray)
             crate::render::draw_solid_rect(
                 &mut composite_buffer,
                 win_w,
                 win_h,
-                track_x,
-                track_y,
-                track_w,
-                track_h,
+                metrics.track.x,
+                metrics.track.y,
+                metrics.track.width,
+                metrics.track.height,
                 [230, 230, 230, 80],
             );
 
             // Thumb (rounded pill, styled with hover / drag states)
-            let thumb_color = if self.is_dragging_scrollbar {
+            let dragging = self.is_dragging_scrollbar && self.dragging_axis == axis;
+            let hovered = self.hovered_scrollbar
+                && metrics.track.contains(self.cursor_pos.0, self.cursor_pos.1);
+            let thumb_color = if dragging {
                 [70, 70, 70, 230]
-            } else if self.hovered_scrollbar {
+            } else if hovered {
                 [100, 100, 100, 200]
             } else {
                 [140, 140, 140, 160]
@@ -1098,13 +1365,17 @@ impl MistilteinnApp {
                 &mut composite_buffer,
                 win_w,
                 win_h,
-                thumb_x,
-                thumb_y,
-                thumb_w,
-                thumb_h,
+                metrics.thumb.x,
+                metrics.thumb.y,
+                metrics.thumb.width,
+                metrics.thumb.height,
                 3.0,
                 thumb_color,
             );
+        }
+
+        if self.find_bar.active {
+            self.draw_find_bar(&mut text_renderer, &mut composite_buffer, win_w, win_h);
         }
 
         // Upload the composite bitmap to GPU
@@ -1118,11 +1389,19 @@ impl MistilteinnApp {
         let w = self.window_width() as f32 - TAB_BAR_WIDTH as f32;
         let h = self.window_height() as f32 - ADDRESS_BAR_HEIGHT as f32;
 
-        let new_page = crate::page::Page::new(html_source, css_source, w, h);
+        let mut new_page = crate::page::Page::new(html_source, css_source, w, h);
+        let zoom = self.active_zoom();
+        if (zoom - 1.0).abs() > 0.001 {
+            new_page.set_zoom(zoom);
+        }
         if let Some(tab) = self.tab_manager.active_tab_mut() {
             tab.title = new_page.title.clone();
+            // A new document is scrolled to the top, with nothing in flight.
+            tab.scroll_offset = (0.0, 0.0);
         }
+        self.scroll_target = (0.0, 0.0);
         self.tab_manager.set_active_tab_page(new_page);
+        self.refresh_find_matches();
         self.recompose();
 
         if let Some(ref mut renderer) = self.renderer {
@@ -1159,6 +1438,22 @@ impl MistilteinnApp {
     /// Internal URL loading logic.
     fn load_url_internal(&mut self, url: &str, push_history: bool) {
         let trimmed = url.trim();
+
+        // Internal pages are built here rather than fetched. They are rendered
+        // by the same engine as any other document.
+        if trimmed.eq_ignore_ascii_case(BOOKMARKS_URL) {
+            let html = self.bookmarks.to_html();
+            if let Some(tab) = self.tab_manager.active_tab_mut() {
+                tab.url = BOOKMARKS_URL.to_string();
+                if push_history {
+                    tab.push_history(BOOKMARKS_URL);
+                }
+            }
+            self.address_input = BOOKMARKS_URL.to_string();
+            self.load_page(&html, "");
+            return;
+        }
+
         let full_url = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
             trimmed.to_string()
         } else if trimmed.contains(' ') || !trimmed.contains('.') {
@@ -1441,6 +1736,12 @@ impl MistilteinnApp {
         if let Some(url) = &base_url {
             new_page.page_url = url.to_string();
         }
+        // Zoom belongs to the tab, so a page loaded into a zoomed tab arrives
+        // zoomed rather than snapping back to 100%.
+        let zoom = self.active_zoom();
+        if (zoom - 1.0).abs() > 0.001 {
+            new_page.set_zoom(zoom);
+        }
 
         let image_nodes = crate::layout::collect_image_nodes(&new_page.layout_root);
         // Resolve against <base href> when the document declares one; it is
@@ -1535,8 +1836,11 @@ impl MistilteinnApp {
 
         if let Some(tab) = self.tab_manager.active_tab_mut() {
             tab.title = new_page.title.clone();
+            tab.scroll_offset = (0.0, 0.0);
         }
+        self.scroll_target = (0.0, 0.0);
         self.tab_manager.set_active_tab_page(new_page);
+        self.refresh_find_matches();
         self.recompose();
 
         if let Some(ref mut renderer) = self.renderer {
@@ -1844,73 +2148,184 @@ impl MistilteinnApp {
             .unwrap_or((1280, 800))
     }
 
-    /// Calculate scrollbar layout metrics:
-    /// Returns `(track_x, track_y, track_w, track_h, thumb_x, thumb_y, thumb_w, thumb_h, max_scroll)` if scrollable.
-    fn get_scrollbar_metrics(
-        &self,
-        win_w: u32,
-        win_h: u32,
-    ) -> Option<(f32, f32, f32, f32, f32, f32, f32, f32, f32)> {
+    /// The size of the area the page is scrolled over, and the window onto it.
+    ///
+    /// The content size is the furthest edge anything is painted at, not the
+    /// root box's own size: a box wider than its container overflows, and
+    /// reaching that overflow is the whole point of a horizontal scrollbar.
+    fn scroll_extents(&self, win_w: u32, win_h: u32) -> Option<((f32, f32), (f32, f32))> {
         let page = self.tab_manager.get_active_tab_page()?;
-        let content_h = page.layout_root.rect.height;
-        let viewport_h = (win_h as f32 - ADDRESS_BAR_HEIGHT as f32).max(1.0);
+        let (extent_w, extent_h) = crate::layout::content_extent(&page.layout_root);
+        let content = (
+            extent_w.max(page.layout_root.rect.width),
+            extent_h.max(page.layout_root.rect.height),
+        );
+        let viewport = (
+            (win_w as f32 - TAB_BAR_WIDTH as f32).max(1.0),
+            (win_h as f32 - ADDRESS_BAR_HEIGHT as f32).max(1.0),
+        );
+        Some((content, viewport))
+    }
 
-        if content_h <= viewport_h {
+    /// How far the page can be scrolled on each axis.
+    fn max_scroll(&self, win_w: u32, win_h: u32) -> (f32, f32) {
+        match self.scroll_extents(win_w, win_h) {
+            Some((content, viewport)) => (
+                (content.0 - viewport.0).max(0.0),
+                (content.1 - viewport.1).max(0.0),
+            ),
+            None => (0.0, 0.0),
+        }
+    }
+
+    /// Scrollbar geometry for one axis, or `None` when the content fits.
+    fn scrollbar_metrics(&self, axis: Axis, win_w: u32, win_h: u32) -> Option<ScrollbarMetrics> {
+        let (content, viewport) = self.scroll_extents(win_w, win_h)?;
+        let (content_len, viewport_len) = match axis {
+            Axis::Horizontal => (content.0, viewport.0),
+            Axis::Vertical => (content.1, viewport.1),
+        };
+        if content_len <= viewport_len {
             return None;
         }
 
-        let scroll_y = self
+        let scroll = self
             .tab_manager
             .get_active_tab_scroll()
-            .map(|s| s.1)
+            .map(|s| match axis {
+                Axis::Horizontal => s.0,
+                Axis::Vertical => s.1,
+            })
             .unwrap_or(0.0);
-        let max_scroll = (content_h - viewport_h).max(0.0);
-        let thumb_h = (viewport_h / content_h * viewport_h)
+
+        let max_scroll = (content_len - viewport_len).max(0.0);
+        let thumb_len = (viewport_len / content_len * viewport_len)
             .max(SCROLLBAR_MIN_THUMB_HEIGHT)
-            .min(viewport_h);
-        let track_w = SCROLLBAR_WIDTH;
-        let track_x = win_w as f32 - track_w;
-        let track_y = ADDRESS_BAR_HEIGHT as f32;
-        let track_h = viewport_h;
+            .min(viewport_len);
+        let travel = (viewport_len - thumb_len).max(1.0);
+        let thumb_offset = if max_scroll > 0.0 {
+            (scroll / max_scroll * travel).clamp(0.0, travel)
+        } else {
+            0.0
+        };
 
-        let thumb_travel = (track_h - thumb_h).max(1.0);
-        let thumb_y = track_y
-            + if max_scroll > 0.0 {
-                (scroll_y / max_scroll * thumb_travel).clamp(0.0, thumb_travel)
-            } else {
-                0.0
-            };
+        let (track, thumb) = match axis {
+            Axis::Vertical => {
+                let track = crate::layout::Rect::new(
+                    win_w as f32 - SCROLLBAR_WIDTH,
+                    ADDRESS_BAR_HEIGHT as f32,
+                    SCROLLBAR_WIDTH,
+                    viewport_len,
+                );
+                let thumb = crate::layout::Rect::new(
+                    track.x + 2.0,
+                    track.y + thumb_offset,
+                    SCROLLBAR_WIDTH - 4.0,
+                    thumb_len,
+                );
+                (track, thumb)
+            }
+            Axis::Horizontal => {
+                let track = crate::layout::Rect::new(
+                    TAB_BAR_WIDTH as f32,
+                    win_h as f32 - SCROLLBAR_WIDTH,
+                    viewport_len,
+                    SCROLLBAR_WIDTH,
+                );
+                let thumb = crate::layout::Rect::new(
+                    track.x + thumb_offset,
+                    track.y + 2.0,
+                    thumb_len,
+                    SCROLLBAR_WIDTH - 4.0,
+                );
+                (track, thumb)
+            }
+        };
 
-        let thumb_w = track_w - 4.0;
-        let thumb_x = track_x + 2.0;
-
-        Some((
-            track_x, track_y, track_w, track_h, thumb_x, thumb_y, thumb_w, thumb_h, max_scroll,
-        ))
+        Some(ScrollbarMetrics {
+            track,
+            thumb,
+            max_scroll,
+        })
     }
 
-    /// Hit-test the chrome area (tab bar, address bar, scrollbar).
+    /// Move the page's scroll offset towards where scrolling is heading.
+    ///
+    /// The offset chases the target rather than jumping to it, which is what
+    /// makes a wheel notch glide. The step is time-based, not per-frame, so the
+    /// glide takes the same wall-clock time however fast the window redraws.
+    /// Returns whether anything moved — the caller repaints only if so.
+    fn step_scroll(&mut self, win_w: u32, win_h: u32) -> bool {
+        let now = std::time::Instant::now();
+        let dt = self
+            .last_scroll_step
+            .map(|t| (now - t).as_secs_f32())
+            .unwrap_or(0.0)
+            // A long pause (another window in front, a slow page load) must not
+            // turn into one enormous jump.
+            .clamp(0.0, 0.1);
+        self.last_scroll_step = Some(now);
+        self.step_scroll_by(dt, win_w, win_h)
+    }
+
+    /// [`Self::step_scroll`] with the elapsed time supplied rather than read
+    /// from the clock.
+    fn step_scroll_by(&mut self, dt: f32, win_w: u32, win_h: u32) -> bool {
+        let (max_x, max_y) = self.max_scroll(win_w, win_h);
+        self.scroll_target = (
+            self.scroll_target.0.clamp(0.0, max_x),
+            self.scroll_target.1.clamp(0.0, max_y),
+        );
+        let target = self.scroll_target;
+
+        let Some(scroll) = self.tab_manager.get_active_tab_scroll_mut() else {
+            return false;
+        };
+        let dx = target.0 - scroll.0;
+        let dy = target.1 - scroll.1;
+        if dx.abs() < SCROLL_SNAP_DISTANCE && dy.abs() < SCROLL_SNAP_DISTANCE {
+            if dx == 0.0 && dy == 0.0 {
+                return false;
+            }
+            *scroll = target;
+            return true;
+        }
+
+        // Exponential approach: the remaining distance decays by a fixed
+        // proportion per second, so it starts fast and eases out.
+        let t = 1.0 - (-dt / SCROLL_GLIDE_TAU).exp();
+        *scroll = (scroll.0 + dx * t, scroll.1 + dy * t);
+        true
+    }
+
+    /// Put scrolling exactly where asked, with no glide.
+    ///
+    /// Dragging a thumb, jumping to an anchor and switching tabs all place the
+    /// page directly; animating those would fight the pointer or replay the
+    /// previous tab's scroll.
+    fn set_scroll_immediate(&mut self, x: f32, y: f32, win_w: u32, win_h: u32) {
+        let (max_x, max_y) = self.max_scroll(win_w, win_h);
+        let at = (x.clamp(0.0, max_x), y.clamp(0.0, max_y));
+        self.scroll_target = at;
+        if let Some(scroll) = self.tab_manager.get_active_tab_scroll_mut() {
+            *scroll = at;
+        }
+    }
+
+    /// Hit-test the chrome area (tab bar, address bar, scrollbars).
     fn hit_test_chrome(&self, x: f32, y: f32) -> HitTestResult {
-        // Check Scrollbar area (right edge)
+        // Check both scrollbars (right edge and bottom edge)
         let (win_w, win_h) = self.window_size();
-        if let Some((
-            track_x,
-            track_y,
-            track_w,
-            track_h,
-            _thumb_x,
-            thumb_y,
-            _thumb_w,
-            thumb_h,
-            _max_scroll,
-        )) = self.get_scrollbar_metrics(win_w, win_h)
-        {
-            if x >= track_x && x <= track_x + track_w && y >= track_y && y <= track_y + track_h {
-                if y >= thumb_y && y <= thumb_y + thumb_h {
-                    return HitTestResult::ScrollbarThumb;
+        for axis in [Axis::Vertical, Axis::Horizontal] {
+            let Some(metrics) = self.scrollbar_metrics(axis, win_w, win_h) else {
+                continue;
+            };
+            if metrics.track.contains(x, y) {
+                return if metrics.thumb.contains(x, y) {
+                    HitTestResult::ScrollbarThumb(axis)
                 } else {
-                    return HitTestResult::ScrollbarTrack;
-                }
+                    HitTestResult::ScrollbarTrack(axis)
+                };
             }
         }
 
@@ -1933,7 +2348,11 @@ impl MistilteinnApp {
                     return HitTestResult::ReloadButton;
                 }
                 curr_x += NAV_BUTTON_WIDTH;
-                // Address bar input box
+                // Bookmark star, then the address bar input box
+                let (_, star) = address_bar_geometry(win_w);
+                if x >= star.x {
+                    return HitTestResult::BookmarkButton;
+                }
                 if x >= curr_x {
                     return HitTestResult::AddressBar;
                 }
@@ -2138,6 +2557,232 @@ impl MistilteinnApp {
 
     /// Sets the winit window cursor icon from a computed CSS `cursor`.
     #[allow(deprecated)]
+    /// Save or unsave the page in the active tab.
+    fn toggle_bookmark(&mut self) {
+        let Some(tab) = self.tab_manager.active_tab() else {
+            return;
+        };
+        let (url, title) = (tab.url.clone(), tab.title.clone());
+        if self.bookmarks.toggle(&url, &title) {
+            log::info!("bookmarked {url}");
+        } else {
+            log::info!("removed the bookmark for {url}");
+        }
+    }
+
+    /// Change the active tab's zoom and lay the page out again at that scale.
+    ///
+    /// `step` moves through the ladder of zoom levels a browser offers; passing
+    /// `None` returns to 100%.
+    fn adjust_zoom(&mut self, step: Option<i32>) {
+        let current = self.active_zoom();
+        let zoom = match step {
+            None => 1.0,
+            Some(step) => {
+                let index = ZOOM_LEVELS
+                    .iter()
+                    .position(|z| (z - current).abs() < 0.001)
+                    .unwrap_or_else(|| {
+                        // Not on the ladder (a page loaded at an odd zoom):
+                        // step from the nearest rung instead of refusing.
+                        ZOOM_LEVELS
+                            .iter()
+                            .enumerate()
+                            .min_by(|a, b| (a.1 - current).abs().total_cmp(&(b.1 - current).abs()))
+                            .map(|(i, _)| i)
+                            .unwrap_or(0)
+                    });
+                let next = (index as i32 + step).clamp(0, ZOOM_LEVELS.len() as i32 - 1);
+                ZOOM_LEVELS[next as usize]
+            }
+        };
+
+        if (zoom - current).abs() < 0.001 {
+            return;
+        }
+        if let Some(tab) = self.tab_manager.active_tab_mut() {
+            tab.zoom = zoom;
+            if let Some(page) = tab.page.as_mut() {
+                page.set_zoom(zoom);
+            }
+        }
+        // The page is a different size now, so where it was scrolled to may no
+        // longer exist.
+        let (win_w, win_h) = self.window_size();
+        let at = self
+            .tab_manager
+            .get_active_tab_scroll()
+            .unwrap_or((0.0, 0.0));
+        self.set_scroll_immediate(at.0, at.1, win_w, win_h);
+        self.refresh_find_matches();
+        log::info!("zoom: {}%", (zoom * 100.0).round() as i32);
+        self.recompose();
+    }
+
+    /// Find every place the query occurs on the page, in document order.
+    ///
+    /// A match is located by measuring the text before it in the same run: the
+    /// run's own x is where it starts, and the prefix width is how far into it
+    /// the match begins.
+    fn refresh_find_matches(&mut self) {
+        self.find_bar.matches.clear();
+        self.find_bar.current = 0;
+        if self.find_bar.query.is_empty() {
+            return;
+        }
+
+        let Some(page) = self.tab_manager.get_active_tab_page() else {
+            return;
+        };
+        let runs = crate::layout::collect_text_nodes(&page.layout_root);
+        let texts: Vec<String> = runs.iter().map(|r| r.text.clone()).collect();
+        let found = crate::browser::find::find_matches(&texts, &self.find_bar.query);
+
+        let mut text_renderer = TextRenderer::new();
+        let mut rects = Vec::with_capacity(found.len());
+        for m in found {
+            let run = &runs[m.run];
+            let prefix = text_renderer
+                .measure_styled(
+                    &run.text[..m.start],
+                    run.font_size,
+                    &run.font_family,
+                    run.text_style,
+                )
+                .0;
+            let (width, height) = text_renderer.measure_styled(
+                &run.text[m.start..m.end],
+                run.font_size,
+                &run.font_family,
+                run.text_style,
+            );
+            rects.push(crate::layout::Rect::new(
+                run.x + prefix,
+                run.y,
+                width.max(2.0),
+                height.max(run.font_size),
+            ));
+        }
+        self.find_bar.matches = rects;
+    }
+
+    /// Scroll the current match into view, leaving it a third of the way down
+    /// the window rather than at the very edge.
+    fn scroll_to_current_match(&mut self) {
+        let Some(rect) = self.find_bar.current_match() else {
+            return;
+        };
+        let (win_w, win_h) = self.window_size();
+        let viewport_h = (win_h as f32 - ADDRESS_BAR_HEIGHT as f32).max(1.0);
+        let viewport_w = (win_w as f32 - TAB_BAR_WIDTH as f32).max(1.0);
+        let at = self
+            .tab_manager
+            .get_active_tab_scroll()
+            .unwrap_or((0.0, 0.0));
+
+        // Only move if the match is not already comfortably on screen.
+        let mut target = at;
+        if rect.y < at.1 || rect.bottom() > at.1 + viewport_h {
+            target.1 = rect.y - viewport_h / 3.0;
+        }
+        if rect.x < at.0 || rect.right() > at.0 + viewport_w {
+            target.0 = rect.x - viewport_w / 3.0;
+        }
+        self.set_scroll_immediate(target.0, target.1, win_w, win_h);
+    }
+
+    /// Paint the find matches over the page: every match tinted, the current
+    /// one stronger.
+    ///
+    /// The tint goes on top rather than behind because the page has already
+    /// been composited by this point; it is translucent so the text under it
+    /// stays readable.
+    fn draw_find_highlights(&self, buffer: &mut [u8], win_w: u32, win_h: u32, scroll: (f32, f32)) {
+        if !self.find_bar.active {
+            return;
+        }
+        for (index, rect) in self.find_bar.matches.iter().enumerate() {
+            let color = if index == self.find_bar.current {
+                [255, 150, 50, 130]
+            } else {
+                [255, 235, 59, 90]
+            };
+            crate::render::draw_solid_rect(
+                buffer,
+                win_w,
+                win_h,
+                rect.x - scroll.0 + TAB_BAR_WIDTH as f32,
+                rect.y - scroll.1 + ADDRESS_BAR_HEIGHT as f32,
+                rect.width,
+                rect.height,
+                color,
+            );
+        }
+    }
+
+    /// Draw the find bar itself, at the top right of the content area.
+    fn draw_find_bar(
+        &self,
+        text_renderer: &mut TextRenderer,
+        buffer: &mut [u8],
+        win_w: u32,
+        win_h: u32,
+    ) {
+        let bar = find_bar_geometry(win_w);
+        crate::render::draw_solid_rect(
+            buffer,
+            win_w,
+            win_h,
+            bar.x,
+            bar.y,
+            bar.width,
+            bar.height,
+            [250, 250, 252, 255],
+        );
+        crate::render::draw_rect_borders(
+            buffer,
+            win_w,
+            win_h,
+            bar.x,
+            bar.y,
+            bar.width,
+            bar.height,
+            [1.0; 4],
+            [[150, 150, 155, 255]; 4],
+            [crate::css::BorderStyle::Solid; 4],
+        );
+
+        let query_color = if self.find_bar.matches.is_empty() && !self.find_bar.query.is_empty() {
+            [0.8, 0.1, 0.1, 1.0]
+        } else {
+            [0.1, 0.1, 0.1, 1.0]
+        };
+        text_renderer.rasterize_to_bitmap(
+            &format!("検索: {}|", self.find_bar.query),
+            13.0,
+            "sans-serif",
+            query_color,
+            bar.x + 8.0,
+            bar.y + 7.0,
+            bar.width - 80.0,
+            buffer,
+            win_w,
+            win_h,
+        );
+        text_renderer.rasterize_to_bitmap(
+            &self.find_bar.counter(),
+            12.0,
+            "sans-serif",
+            [0.35, 0.35, 0.4, 1.0],
+            bar.right() - 62.0,
+            bar.y + 8.0,
+            56.0,
+            buffer,
+            win_w,
+            win_h,
+        );
+    }
+
     fn set_winit_cursor(renderer: Option<&Renderer>, cursor: crate::css::Cursor) {
         if let Some(r) = renderer {
             // `cursor: none` hides the pointer rather than picking an icon.
@@ -2267,21 +2912,29 @@ impl ApplicationHandler for MistilteinnApp {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (win_w, win_h) = self.window_size();
-                let max_scroll = self
-                    .get_scrollbar_metrics(win_w, win_h)
-                    .map(|m| m.8)
-                    .unwrap_or(0.0);
+                let (max_x, max_y) = self.max_scroll(win_w, win_h);
 
-                if let Some(scroll) = self.tab_manager.get_active_tab_scroll_mut() {
-                    match delta {
-                        winit::event::MouseScrollDelta::LineDelta(_dx, dy) => {
-                            *scroll = (scroll.0, (scroll.1 - (dy * 40.0)).clamp(0.0, max_scroll));
-                        }
-                        winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                            *scroll = (scroll.0, (scroll.1 - pos.y as f32).clamp(0.0, max_scroll));
-                        }
+                let (mut dx, mut dy) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(lx, ly) => {
+                        (-lx * WHEEL_LINE_DISTANCE, -ly * WHEEL_LINE_DISTANCE)
                     }
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        (-pos.x as f32, -pos.y as f32)
+                    }
+                };
+                // Shift turns a vertical wheel horizontal, which is how a wheel
+                // with only one axis reaches a wide page.
+                if self.shift_pressed && dx == 0.0 {
+                    dx = dy;
+                    dy = 0.0;
                 }
+
+                // Scrolling moves the target; the offset itself glides towards
+                // it over the next few frames.
+                self.scroll_target = (
+                    (self.scroll_target.0 + dx).clamp(0.0, max_x),
+                    (self.scroll_target.1 + dy).clamp(0.0, max_y),
+                );
                 self.recompose();
                 if let Some(ref renderer) = self.renderer {
                     renderer.window().request_redraw();
@@ -2294,46 +2947,64 @@ impl ApplicationHandler for MistilteinnApp {
                     MouseButton::Left => {
                         if state == ElementState::Pressed {
                             match self.hit_test_chrome(cx, cy) {
-                                HitTestResult::ScrollbarThumb => {
+                                HitTestResult::ScrollbarThumb(axis) => {
                                     self.is_address_focused = false;
                                     self.is_dragging_scrollbar = true;
-                                    self.scrollbar_drag_start_y = cy;
-                                    self.scrollbar_drag_start_scroll_y = self
+                                    self.dragging_axis = axis;
+                                    self.scrollbar_drag_start_pos = along(axis, cx, cy);
+                                    self.scrollbar_drag_start_scroll = self
                                         .tab_manager
                                         .get_active_tab_scroll()
-                                        .map(|s| s.1)
+                                        .map(|s| along(axis, s.0, s.1))
                                         .unwrap_or(0.0);
                                     self.recompose();
                                 }
-                                HitTestResult::ScrollbarTrack => {
+                                HitTestResult::ScrollbarTrack(axis) => {
                                     self.is_address_focused = false;
                                     let (win_w, win_h) = self.window_size();
-                                    if let Some((
-                                        _tx,
-                                        track_y,
-                                        _tw,
-                                        track_h,
-                                        _thumb_x,
-                                        _thumb_y,
-                                        _thumb_w,
-                                        thumb_h,
-                                        max_scroll,
-                                    )) = self.get_scrollbar_metrics(win_w, win_h)
+                                    if let Some(metrics) =
+                                        self.scrollbar_metrics(axis, win_w, win_h)
                                     {
-                                        let thumb_travel = (track_h - thumb_h).max(1.0);
+                                        // Clicking the track centres the thumb
+                                        // on the click.
+                                        let travel = metrics.thumb_travel(axis);
+                                        let (track_start, thumb_len) = match axis {
+                                            Axis::Horizontal => {
+                                                (metrics.track.x, metrics.thumb.width)
+                                            }
+                                            Axis::Vertical => {
+                                                (metrics.track.y, metrics.thumb.height)
+                                            }
+                                        };
                                         let click_offset =
-                                            (cy - track_y - thumb_h * 0.5).clamp(0.0, thumb_travel);
-                                        let new_scroll = (click_offset / thumb_travel) * max_scroll;
-                                        if let Some(scroll) =
-                                            self.tab_manager.get_active_tab_scroll_mut()
-                                        {
-                                            scroll.1 = new_scroll.clamp(0.0, max_scroll);
+                                            (along(axis, cx, cy) - track_start - thumb_len * 0.5)
+                                                .clamp(0.0, travel);
+                                        let new_scroll =
+                                            (click_offset / travel) * metrics.max_scroll;
+
+                                        let at = self
+                                            .tab_manager
+                                            .get_active_tab_scroll()
+                                            .unwrap_or((0.0, 0.0));
+                                        match axis {
+                                            Axis::Horizontal => self.set_scroll_immediate(
+                                                new_scroll, at.1, win_w, win_h,
+                                            ),
+                                            Axis::Vertical => self.set_scroll_immediate(
+                                                at.0, new_scroll, win_w, win_h,
+                                            ),
                                         }
                                         self.is_dragging_scrollbar = true;
-                                        self.scrollbar_drag_start_y = cy;
-                                        self.scrollbar_drag_start_scroll_y = new_scroll;
+                                        self.dragging_axis = axis;
+                                        self.scrollbar_drag_start_pos = along(axis, cx, cy);
+                                        self.scrollbar_drag_start_scroll = new_scroll;
                                         self.recompose();
                                     }
+                                }
+                                HitTestResult::BookmarkButton => {
+                                    self.is_address_focused = false;
+                                    self.toggle_bookmark();
+                                    self.recompose();
                                 }
                                 HitTestResult::GroupHeader(group_id) => {
                                     if let Some(is_now_collapsed) =
@@ -2365,9 +3036,14 @@ impl ApplicationHandler for MistilteinnApp {
                                     self.tab_manager.activate_tab(tab_id);
                                     if let Some(tab) = self.tab_manager.active_tab() {
                                         self.address_input = tab.url.clone();
+                                        // Scrolling belongs to the tab, so the
+                                        // glide must not carry the previous
+                                        // tab's target into this one.
+                                        self.scroll_target = tab.scroll_offset;
                                     }
                                     self.address_cursor = self.address_input.len();
                                     self.is_address_focused = false;
+                                    self.refresh_find_matches();
                                     self.recompose();
                                     log::info!("Activated tab {:?}", tab_id);
                                 }
@@ -2516,20 +3192,15 @@ impl ApplicationHandler for MistilteinnApp {
 
                                             if let Some(target_y) = target_y {
                                                 let (win_w, win_h) = self.window_size();
-                                                let max_scroll = self
-                                                    .get_scrollbar_metrics(win_w, win_h)
-                                                    .map(|m| m.8)
+                                                let x = self
+                                                    .tab_manager
+                                                    .get_active_tab_scroll()
+                                                    .map(|s| s.0)
                                                     .unwrap_or(0.0);
-                                                if let Some(tab) = self.tab_manager.active_tab_mut()
-                                                {
-                                                    tab.scroll_offset.1 =
-                                                        target_y.clamp(0.0, max_scroll);
-                                                    log::info!(
-                                                        "Jumped to anchor #{}: y={}",
-                                                        target_id,
-                                                        tab.scroll_offset.1
-                                                    );
-                                                }
+                                                self.set_scroll_immediate(
+                                                    x, target_y, win_w, win_h,
+                                                );
+                                                log::info!("Jumped to anchor #{target_id}");
                                             }
                                         } else if let Some(target_url) = link_to_navigate {
                                             log::info!(
@@ -2587,24 +3258,22 @@ impl ApplicationHandler for MistilteinnApp {
                 // Handle scrollbar dragging
                 if self.is_dragging_scrollbar {
                     let (win_w, win_h) = self.window_size();
-                    if let Some((
-                        _tx,
-                        _ty,
-                        _tw,
-                        track_h,
-                        _thumb_x,
-                        _thumb_y,
-                        _thumb_w,
-                        thumb_h,
-                        max_scroll,
-                    )) = self.get_scrollbar_metrics(win_w, win_h)
-                    {
-                        let delta_y = cy - self.scrollbar_drag_start_y;
-                        let thumb_travel = (track_h - thumb_h).max(1.0);
-                        let new_scroll = self.scrollbar_drag_start_scroll_y
-                            + (delta_y / thumb_travel) * max_scroll;
-                        if let Some(scroll) = self.tab_manager.get_active_tab_scroll_mut() {
-                            scroll.1 = new_scroll.clamp(0.0, max_scroll);
+                    let axis = self.dragging_axis;
+                    if let Some(metrics) = self.scrollbar_metrics(axis, win_w, win_h) {
+                        let delta = along(axis, cx, cy) - self.scrollbar_drag_start_pos;
+                        let new_scroll = self.scrollbar_drag_start_scroll
+                            + (delta / metrics.thumb_travel(axis)) * metrics.max_scroll;
+                        let at = self
+                            .tab_manager
+                            .get_active_tab_scroll()
+                            .unwrap_or((0.0, 0.0));
+                        match axis {
+                            Axis::Horizontal => {
+                                self.set_scroll_immediate(new_scroll, at.1, win_w, win_h)
+                            }
+                            Axis::Vertical => {
+                                self.set_scroll_immediate(at.0, new_scroll, win_w, win_h)
+                            }
                         }
                         self.recompose();
                         if let Some(ref renderer) = self.renderer {
@@ -2631,19 +3300,12 @@ impl ApplicationHandler for MistilteinnApp {
                 let addr_changed = self.hovered_address_bar != new_hovered_addr;
                 self.hovered_address_bar = new_hovered_addr;
 
-                // Hit-test scrollbar for hover highlight
+                // Hit-test scrollbars for hover highlight
                 let (win_w, win_h) = self.window_size();
-                let is_over_scrollbar =
-                    if let Some((track_x, track_y, track_w, track_h, _, _, _, _, _)) =
-                        self.get_scrollbar_metrics(win_w, win_h)
-                    {
-                        cx >= track_x
-                            && cx <= track_x + track_w
-                            && cy >= track_y
-                            && cy <= track_y + track_h
-                    } else {
-                        false
-                    };
+                let is_over_scrollbar = [Axis::Vertical, Axis::Horizontal].iter().any(|&axis| {
+                    self.scrollbar_metrics(axis, win_w, win_h)
+                        .is_some_and(|m| m.track.contains(cx, cy))
+                });
                 let scrollbar_hover_changed = self.hovered_scrollbar != is_over_scrollbar;
                 self.hovered_scrollbar = is_over_scrollbar;
 
@@ -2761,6 +3423,13 @@ impl ApplicationHandler for MistilteinnApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Advance the smooth scroll before painting: this is the frame
+                // clock, so it is where an animation gets its time from.
+                let (win_w, win_h) = self.window_size();
+                if self.step_scroll(win_w, win_h) {
+                    self.recompose();
+                }
+
                 if let Some(ref mut renderer) = self.renderer
                     && let Err(e) = renderer.render()
                 {
@@ -2779,6 +3448,12 @@ impl ApplicationHandler for MistilteinnApp {
                     || event.physical_key == PhysicalKey::Code(KeyCode::ControlRight)
                 {
                     self.ctrl_pressed = event.state == ElementState::Pressed;
+                    return;
+                }
+                if event.physical_key == PhysicalKey::Code(KeyCode::ShiftLeft)
+                    || event.physical_key == PhysicalKey::Code(KeyCode::ShiftRight)
+                {
+                    self.shift_pressed = event.state == ElementState::Pressed;
                     return;
                 }
 
@@ -2827,6 +3502,34 @@ impl ApplicationHandler for MistilteinnApp {
                                 // Ctrl+G: create group for active tab
                                 self.create_group_for_active_tab();
                             }
+                            PhysicalKey::Code(KeyCode::KeyD) => {
+                                // Ctrl+D: bookmark this page
+                                self.toggle_bookmark();
+                                self.recompose();
+                            }
+                            PhysicalKey::Code(KeyCode::KeyB) => {
+                                // Ctrl+B: open the bookmark list
+                                self.load_url(BOOKMARKS_URL);
+                            }
+                            PhysicalKey::Code(KeyCode::KeyF) => {
+                                // Ctrl+F: open the find bar and type into it
+                                self.find_bar.active = true;
+                                self.is_address_focused = false;
+                                self.focused_page_input = None;
+                                self.refresh_find_matches();
+                                self.recompose();
+                            }
+                            // Ctrl+`+` / Ctrl+`-` / Ctrl+0: page zoom. The
+                            // plus key is Equal unshifted, and the numpad keys
+                            // are separate physical keys.
+                            PhysicalKey::Code(KeyCode::Equal)
+                            | PhysicalKey::Code(KeyCode::NumpadAdd) => self.adjust_zoom(Some(1)),
+                            PhysicalKey::Code(KeyCode::Minus)
+                            | PhysicalKey::Code(KeyCode::NumpadSubtract) => {
+                                self.adjust_zoom(Some(-1))
+                            }
+                            PhysicalKey::Code(KeyCode::Digit0)
+                            | PhysicalKey::Code(KeyCode::Numpad0) => self.adjust_zoom(None),
                             PhysicalKey::Code(KeyCode::KeyV) => {
                                 // Ctrl+V: paste into address bar
                                 if self.is_address_focused {
@@ -2849,6 +3552,38 @@ impl ApplicationHandler for MistilteinnApp {
                     } else if event.physical_key == PhysicalKey::Code(KeyCode::F5) {
                         // F5: Reload active tab
                         self.reload_active_tab();
+                    } else if self.find_bar.active {
+                        // The find bar takes the keyboard while it is open, the
+                        // same way the address bar does.
+                        use winit::keyboard::{Key, NamedKey};
+                        match &event.logical_key {
+                            Key::Named(NamedKey::Escape) => {
+                                self.find_bar.active = false;
+                                self.find_bar.matches.clear();
+                            }
+                            Key::Named(NamedKey::Backspace) => {
+                                self.find_bar.query.pop();
+                                self.refresh_find_matches();
+                                self.scroll_to_current_match();
+                            }
+                            Key::Named(NamedKey::Enter) => {
+                                // Shift+Enter walks backwards, as in a browser.
+                                self.find_bar.step(!self.shift_pressed);
+                                self.scroll_to_current_match();
+                            }
+                            Key::Character(c) => {
+                                for ch in c.chars().filter(|ch| !ch.is_control()) {
+                                    self.find_bar.query.push(ch);
+                                }
+                                self.refresh_find_matches();
+                                self.scroll_to_current_match();
+                            }
+                            _ => {}
+                        }
+                        self.recompose();
+                        if let Some(ref renderer) = self.renderer {
+                            renderer.window().request_redraw();
+                        }
                     } else if self.is_address_focused {
                         use winit::keyboard::{Key, NamedKey};
                         let mut changed = false;
@@ -2967,7 +3702,15 @@ impl ApplicationHandler for MistilteinnApp {
                 }
             }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
-                if self.is_address_focused {
+                if self.find_bar.active {
+                    self.find_bar.query.push_str(&text);
+                    self.refresh_find_matches();
+                    self.scroll_to_current_match();
+                    self.recompose();
+                    if let Some(ref renderer) = self.renderer {
+                        renderer.window().request_redraw();
+                    }
+                } else if self.is_address_focused {
                     for ch in text.chars() {
                         self.address_input.insert(self.address_cursor, ch);
                         self.address_cursor += ch.len_utf8();
@@ -3001,27 +3744,7 @@ impl ApplicationHandler for MistilteinnApp {
 /// Application entry point.
 pub fn run(start_url: Option<String>) {
     let event_loop = EventLoop::new().expect("Failed to create event loop");
-    let mut app = MistilteinnApp {
-        renderer: None,
-        start_url,
-        tab_manager: crate::browser::tab::TabManager::new(),
-        group_manager: crate::browser::tab_group::GroupManager::new(),
-        tokio_rt: None,
-        cursor_pos: (0.0, 0.0),
-        ctrl_pressed: false,
-        hovered_tab_id: None,
-        hovered_address_bar: false,
-        prev_hovered_dom_id: None,
-        address_input: String::new(),
-        is_address_focused: false,
-        address_cursor: 0,
-        focused_page_input: None,
-        open_select: None,
-        is_dragging_scrollbar: false,
-        scrollbar_drag_start_y: 0.0,
-        scrollbar_drag_start_scroll_y: 0.0,
-        hovered_scrollbar: false,
-    };
+    let mut app = MistilteinnApp::new(start_url);
     event_loop.run_app(&mut app).expect("Event loop failed");
 }
 
@@ -3029,60 +3752,28 @@ pub fn run(start_url: Option<String>) {
 mod tests {
     use super::*;
 
+    /// An app with one active tab showing `page`.
+    fn app_with_page(page: crate::page::Page) -> MistilteinnApp {
+        let mut app = MistilteinnApp::new(None);
+        let tab_id = app.tab_manager.create_tab();
+        app.tab_manager.activate_tab(tab_id);
+        app.tab_manager.set_active_tab_page(page);
+        app
+    }
+
     #[test]
     fn test_scrollbar_metrics_no_page() {
-        let app = MistilteinnApp {
-            renderer: None,
-            start_url: None,
-            tab_manager: crate::browser::tab::TabManager::new(),
-            group_manager: crate::browser::tab_group::GroupManager::new(),
-            tokio_rt: None,
-            cursor_pos: (0.0, 0.0),
-            ctrl_pressed: false,
-            hovered_tab_id: None,
-            hovered_address_bar: false,
-            prev_hovered_dom_id: None,
-            address_input: String::new(),
-            is_address_focused: false,
-            address_cursor: 0,
-            focused_page_input: None,
-            open_select: None,
-            is_dragging_scrollbar: false,
-            scrollbar_drag_start_y: 0.0,
-            scrollbar_drag_start_scroll_y: 0.0,
-            hovered_scrollbar: false,
-        };
+        let app = MistilteinnApp::new(None);
 
-        assert!(app.get_scrollbar_metrics(1280, 800).is_none());
+        assert!(
+            app.scrollbar_metrics(Axis::Vertical, 1280, 800).is_none(),
+            "no page, nothing to scroll"
+        );
+        assert_eq!(app.max_scroll(1280, 800), (0.0, 0.0));
     }
 
     #[test]
     fn test_scrollbar_metrics_with_long_page() {
-        let mut app = MistilteinnApp {
-            renderer: None,
-            start_url: None,
-            tab_manager: crate::browser::tab::TabManager::new(),
-            group_manager: crate::browser::tab_group::GroupManager::new(),
-            tokio_rt: None,
-            cursor_pos: (0.0, 0.0),
-            ctrl_pressed: false,
-            hovered_tab_id: None,
-            hovered_address_bar: false,
-            prev_hovered_dom_id: None,
-            address_input: String::new(),
-            is_address_focused: false,
-            address_cursor: 0,
-            focused_page_input: None,
-            open_select: None,
-            is_dragging_scrollbar: false,
-            scrollbar_drag_start_y: 0.0,
-            scrollbar_drag_start_scroll_y: 0.0,
-            hovered_scrollbar: false,
-        };
-
-        let tab_id = app.tab_manager.create_tab();
-        app.tab_manager.activate_tab(tab_id);
-
         let mut page = crate::page::Page::new(
             "<html><body><div style='height: 2000px;'>Long Content</div></body></html>",
             "",
@@ -3090,25 +3781,208 @@ mod tests {
             760.0,
         );
         page.layout_root.rect.height = 2000.0;
-        app.tab_manager.set_active_tab_page(page);
+        let app = app_with_page(page);
 
-        let metrics = app.get_scrollbar_metrics(1280, 800);
+        let metrics = app
+            .scrollbar_metrics(Axis::Vertical, 1280, 800)
+            .expect("Long page should produce scrollbar metrics");
+
+        assert_eq!(metrics.track.x, 1280.0 - SCROLLBAR_WIDTH);
+        assert_eq!(metrics.track.y, ADDRESS_BAR_HEIGHT as f32);
+        assert_eq!(metrics.track.width, SCROLLBAR_WIDTH);
+        assert_eq!(metrics.track.height, 800.0 - ADDRESS_BAR_HEIGHT as f32);
+        assert!(metrics.thumb.width < metrics.track.width);
+        assert_eq!(metrics.thumb.x, metrics.track.x + 2.0);
+        assert_eq!(metrics.thumb.y, metrics.track.y);
+        assert!(metrics.thumb.height >= SCROLLBAR_MIN_THUMB_HEIGHT);
+        assert_eq!(
+            metrics.max_scroll,
+            2000.0 - (800.0 - ADDRESS_BAR_HEIGHT as f32)
+        );
+    }
+
+    #[test]
+    fn a_page_narrower_than_the_window_has_no_horizontal_scrollbar() {
+        let app = app_with_page(crate::page::Page::new(
+            "<html><body><p>short</p></body></html>",
+            "",
+            1080.0,
+            760.0,
+        ));
+        assert!(app.scrollbar_metrics(Axis::Horizontal, 1280, 800).is_none());
+        assert_eq!(app.max_scroll(1280, 800).0, 0.0);
+    }
+
+    #[test]
+    fn a_box_wider_than_the_window_can_be_scrolled_to() {
+        // The root box is the width of the viewport, so a wide child is only
+        // reachable if the scroll range comes from the painted extent.
+        let app = app_with_page(crate::page::Page::new(
+            "<html><body><div id='wide'></div></body></html>",
+            "body { margin: 0 } #wide { width: 3000px; height: 50px }",
+            1080.0,
+            760.0,
+        ));
+
+        let metrics = app
+            .scrollbar_metrics(Axis::Horizontal, 1280, 800)
+            .expect("a 3000px box in a 1080px viewport scrolls sideways");
+        assert_eq!(metrics.track.y, 800.0 - SCROLLBAR_WIDTH);
+        assert_eq!(metrics.track.x, TAB_BAR_WIDTH as f32);
         assert!(
-            metrics.is_some(),
-            "Long page should produce scrollbar metrics"
+            (metrics.max_scroll - (3000.0 - 1080.0)).abs() < 1.0,
+            "scroll range should reach the far edge, got {}",
+            metrics.max_scroll
+        );
+    }
+
+    #[test]
+    fn scrolling_glides_towards_its_target_and_settles_there() {
+        let mut page = crate::page::Page::new("<html><body></body></html>", "", 1080.0, 760.0);
+        page.layout_root.rect.height = 4000.0;
+        let mut app = app_with_page(page);
+
+        app.scroll_target = (0.0, 500.0);
+        // One frame covers part of the distance, not all of it.
+        app.step_scroll_by(1.0 / 60.0, 1280, 800);
+        let after_first = app.tab_manager.get_active_tab_scroll().unwrap().1;
+        assert!(
+            after_first > 0.0 && after_first < 500.0,
+            "one frame should cover part of the distance, got {after_first}"
         );
 
-        let (track_x, track_y, track_w, track_h, thumb_x, thumb_y, thumb_w, thumb_h, max_scroll) =
-            metrics.unwrap();
-        assert_eq!(track_x, 1280.0 - SCROLLBAR_WIDTH);
-        assert_eq!(track_y, ADDRESS_BAR_HEIGHT as f32);
-        assert_eq!(track_w, SCROLLBAR_WIDTH);
-        assert_eq!(track_h, 800.0 - ADDRESS_BAR_HEIGHT as f32);
-        assert!(thumb_w < track_w);
-        assert_eq!(thumb_x, track_x + 2.0);
-        assert_eq!(thumb_y, track_y);
-        assert!(thumb_h >= SCROLLBAR_MIN_THUMB_HEIGHT);
-        assert_eq!(max_scroll, 2000.0 - (800.0 - ADDRESS_BAR_HEIGHT as f32));
+        // Enough frames and it arrives exactly, rather than creeping forever.
+        for _ in 0..60 {
+            app.step_scroll_by(1.0 / 60.0, 1280, 800);
+        }
+        assert_eq!(app.tab_manager.get_active_tab_scroll().unwrap().1, 500.0);
+        assert!(
+            !app.step_scroll_by(1.0 / 60.0, 1280, 800),
+            "a settled scroll reports no change, so the window stops repainting"
+        );
+    }
+
+    #[test]
+    fn a_scroll_target_past_the_end_of_the_page_is_clamped() {
+        let mut page = crate::page::Page::new("<html><body></body></html>", "", 1080.0, 760.0);
+        page.layout_root.rect.height = 1000.0;
+        let mut app = app_with_page(page);
+
+        app.scroll_target = (0.0, 99999.0);
+        for _ in 0..60 {
+            app.step_scroll_by(1.0 / 60.0, 1280, 800);
+        }
+        let max_y = app.max_scroll(1280, 800).1;
+        assert_eq!(app.tab_manager.get_active_tab_scroll().unwrap().1, max_y);
+    }
+
+    #[test]
+    fn the_bookmark_star_is_hit_at_the_right_end_of_the_address_bar() {
+        let app = MistilteinnApp::new(None);
+        let (address, star) = address_bar_geometry(1280);
+
+        assert_eq!(
+            app.hit_test_chrome(star.x + 4.0, 12.0),
+            HitTestResult::BookmarkButton
+        );
+        assert_eq!(
+            app.hit_test_chrome(address.x + 20.0, 12.0),
+            HitTestResult::AddressBar,
+            "the star must not swallow clicks meant for the URL"
+        );
+        assert!(
+            address.right() <= star.x,
+            "the two boxes must not overlap: {address:?} {star:?}"
+        );
+    }
+
+    #[test]
+    fn find_matches_land_on_the_text_they_matched() {
+        let mut app = app_with_page(crate::page::Page::new(
+            "<html><body><p>hello findable world</p></body></html>",
+            "body { margin: 0 } p { margin: 0; width: 600px }",
+            1080.0,
+            760.0,
+        ));
+
+        app.find_bar.active = true;
+        app.find_bar.query = "findable".to_string();
+        app.refresh_find_matches();
+
+        assert_eq!(app.find_bar.matches.len(), 1);
+        let hit = app.find_bar.matches[0];
+        assert!(
+            hit.x > 0.0,
+            "the match is preceded by 'hello ', so it cannot start at the left edge"
+        );
+        assert!(hit.width > 0.0 && hit.height > 0.0);
+    }
+
+    #[test]
+    fn stepping_through_matches_wraps_around() {
+        let mut bar = FindBar {
+            matches: vec![crate::layout::Rect::new(0.0, 0.0, 1.0, 1.0); 3],
+            ..FindBar::default()
+        };
+        assert_eq!(bar.counter(), "1/3");
+        bar.step(true);
+        bar.step(true);
+        assert_eq!(bar.counter(), "3/3");
+        bar.step(true);
+        assert_eq!(
+            bar.counter(),
+            "1/3",
+            "forward from the last wraps to the first"
+        );
+        bar.step(false);
+        assert_eq!(bar.counter(), "3/3", "and back again");
+    }
+
+    #[test]
+    fn an_empty_find_reports_no_matches() {
+        let bar = FindBar::default();
+        assert_eq!(bar.counter(), "0/0");
+        assert!(bar.current_match().is_none());
+    }
+
+    #[test]
+    fn zoom_steps_through_the_ladder_and_returns_to_100_percent() {
+        let mut app = app_with_page(crate::page::Page::new(
+            "<html><body><p>text</p></body></html>",
+            "",
+            1080.0,
+            760.0,
+        ));
+
+        app.adjust_zoom(Some(1));
+        assert!(app.active_zoom() > 1.0);
+        app.adjust_zoom(Some(1));
+        let zoomed = app.active_zoom();
+        assert!(zoomed > 1.1);
+
+        app.adjust_zoom(None);
+        assert_eq!(app.active_zoom(), 1.0, "Ctrl+0 goes back to 100%");
+
+        app.adjust_zoom(Some(-1));
+        assert!(app.active_zoom() < 1.0);
+    }
+
+    #[test]
+    fn zoom_stops_at_the_ends_of_the_ladder() {
+        let mut app = app_with_page(crate::page::Page::new(
+            "<html><body></body></html>",
+            "",
+            1080.0,
+            760.0,
+        ));
+        for _ in 0..40 {
+            app.adjust_zoom(Some(1));
+        }
+        assert_eq!(app.active_zoom(), *ZOOM_LEVELS.last().unwrap());
+        for _ in 0..40 {
+            app.adjust_zoom(Some(-1));
+        }
+        assert_eq!(app.active_zoom(), ZOOM_LEVELS[0]);
     }
 
     #[test]

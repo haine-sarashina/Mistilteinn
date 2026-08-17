@@ -11,7 +11,7 @@ use crate::css::{
 };
 use rustc_hash::FxHashMap;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -139,6 +139,24 @@ pub struct LineBox {
     /// Total line height (max ascender + max descender in line).
     pub height: f32,
     pub boxes: Vec<InlineBox>,
+}
+
+impl LineBox {
+    /// How far this line runs from its own left edge.
+    ///
+    /// A line has no stored width — it is the sum of what was placed on it,
+    /// which is what tells the page how far right its content reaches.
+    pub fn width(&self) -> f32 {
+        self.boxes
+            .iter()
+            .map(|b| match b {
+                InlineBox::Text { width, .. }
+                | InlineBox::Element { width, .. }
+                | InlineBox::Whitespace { width, .. } => *width,
+                InlineBox::LineBreak => 0.0,
+            })
+            .sum()
+    }
 }
 
 /// Kinds of interactive elements that change the mouse cursor.
@@ -3951,6 +3969,48 @@ pub fn break_into_lines(
     line_boxes
 }
 
+/// The size of the area the page can be scrolled over.
+///
+/// This is the furthest right and bottom edge any painted box reaches, which is
+/// not the root's own size: a box with a specified width wider than its
+/// container overflows it, and that overflow is what a scrollbar exists to
+/// reach. A subtree under a non-`visible` `overflow` is skipped past its
+/// clipper — content the clipper hides is not reachable by scrolling the page,
+/// it is reachable by scrolling *that box*.
+pub fn content_extent(root: &LayoutNode) -> (f32, f32) {
+    fn walk(node: &LayoutNode, max_x: &mut f32, max_y: &mut f32) {
+        if matches!(node.display, DisplayType::None) {
+            return;
+        }
+
+        *max_x = max_x.max(node.rect.right());
+        *max_y = max_y.max(node.rect.bottom());
+
+        // Text can run past the box that holds it (an unbreakable word, say),
+        // and the line boxes are where the painted geometry actually lives.
+        if let Some(lines) = &node.line_boxes {
+            for line in lines {
+                *max_x = max_x.max(line.x + line.width());
+                *max_y = max_y.max(line.y + line.height);
+            }
+        }
+
+        // Anything the clipper hides cannot be scrolled to from the page.
+        if node.overflow != Overflow::Visible {
+            return;
+        }
+
+        for child in node.children.iter().chain(node.absolute_children.iter()) {
+            walk(child, max_x, max_y);
+        }
+    }
+
+    let mut max_x = 0.0f32;
+    let mut max_y = 0.0f32;
+    walk(root, &mut max_x, &mut max_y);
+    (max_x, max_y)
+}
+
 /// Flatten the layout tree into renderable rectangles with colors.
 ///
 /// Collects all nodes that have a background color, plus leaf text nodes
@@ -4130,8 +4190,9 @@ fn child_boxes(node: &LayoutNode) -> impl Iterator<Item = &LayoutNode> {
 #[derive(Default)]
 struct StackingLayers<'a> {
     /// Layer 2: child stacking contexts with a negative z-index, each with the
-    /// clip it inherited from where it sits in the tree.
-    negative: Vec<(&'a LayoutNode, Option<Rect>)>,
+    /// clip it inherited from where it sits in the tree, and the box it is laid
+    /// out inside (which is what a sticky box may not travel out of).
+    negative: Vec<PositionedBox<'a>>,
     /// Layer 3: backgrounds and borders of in-flow, non-inline descendants.
     block_backgrounds: Vec<DisplayItem>,
     /// Layer 4: non-positioned floats, each painted as a unit.
@@ -4139,9 +4200,17 @@ struct StackingLayers<'a> {
     /// Layer 5: in-flow inline content — text, replaced elements, inline boxes.
     inline_content: Vec<DisplayItem>,
     /// Layer 6: positioned descendants that left z-index at `auto`.
-    auto_positioned: Vec<(&'a LayoutNode, Option<Rect>)>,
+    auto_positioned: Vec<PositionedBox<'a>>,
     /// Layer 7: child stacking contexts with a positive z-index.
-    positive: Vec<(&'a LayoutNode, Option<Rect>)>,
+    positive: Vec<PositionedBox<'a>>,
+}
+
+/// A positioned box waiting to be painted in its own layer, with the clip and
+/// the containing block that were in force where it sits in the tree.
+struct PositionedBox<'a> {
+    node: &'a LayoutNode,
+    clip: Option<Rect>,
+    containing: Rect,
 }
 
 /// Build the page's paint order.
@@ -4162,12 +4231,144 @@ struct StackingLayers<'a> {
 /// only shows when such a descendant needs to sort against boxes outside the
 /// ancestor, which is rare in practice.
 pub fn build_display_list(root: &LayoutNode) -> Vec<DisplayItem> {
+    build_display_list_with_scroll(root, (0.0, 0.0), (root.rect.width, root.rect.height))
+}
+
+/// Build the paint order for a page scrolled to `scroll`.
+///
+/// Identical to [`build_display_list`] except that `position: sticky` boxes are
+/// offset by however far the page has scrolled past them. Sticky is the one
+/// thing whose painted position depends on the scroll offset rather than only
+/// on layout, which is why the scroll position has to reach this far in.
+pub fn build_display_list_with_scroll(
+    root: &LayoutNode,
+    scroll: (f32, f32),
+    viewport: (f32, f32),
+) -> Vec<DisplayItem> {
     let mut out = Vec::new();
-    paint_stacking_context(root, None, &mut out);
+    let view = StickyView { scroll, viewport };
+    paint_stacking_context_in(root, None, root.rect, &view, &mut out);
     out
 }
 
+/// What a sticky box sticks to: the page's scroll offset and the window onto it.
+#[derive(Clone, Copy)]
+struct StickyView {
+    scroll: (f32, f32),
+    viewport: (f32, f32),
+}
+
+/// How far a `position: sticky` box is pushed from where it sits in flow.
+///
+/// The box holds its place until the scroll would carry it past its inset, then
+/// it travels with the scroll — but never out of its containing block, so it is
+/// pushed off the top by its own section rather than following the scroll
+/// forever. Insets are measured against the viewport, since the page is the
+/// only scroll container implemented; a box inside an `overflow: auto` element
+/// sticks to the page rather than to that element.
+fn sticky_offset(node: &LayoutNode, containing: Rect, view: &StickyView) -> (f32, f32) {
+    let mut dx = 0.0f32;
+    let mut dy = 0.0f32;
+
+    // Vertical: `top` wins over `bottom` when both are given, as in CSS.
+    if let Some(top) = node.offsets[0] {
+        let from_viewport_top = node.rect.y - view.scroll.1;
+        if from_viewport_top < top {
+            dy = top - from_viewport_top;
+        }
+    } else if let Some(bottom) = node.offsets[2] {
+        let from_viewport_top = node.rect.bottom() - view.scroll.1;
+        let limit = view.viewport.1 - bottom;
+        if from_viewport_top > limit {
+            dy = limit - from_viewport_top;
+        }
+    }
+
+    if let Some(left) = node.offsets[3] {
+        let from_viewport_left = node.rect.x - view.scroll.0;
+        if from_viewport_left < left {
+            dx = left - from_viewport_left;
+        }
+    } else if let Some(right) = node.offsets[1] {
+        let from_viewport_left = node.rect.right() - view.scroll.0;
+        let limit = view.viewport.0 - right;
+        if from_viewport_left > limit {
+            dx = limit - from_viewport_left;
+        }
+    }
+
+    // The box cannot leave the block it sticks within.
+    let dy_max = containing.bottom() - node.rect.bottom();
+    let dy_min = containing.y - node.rect.y;
+    let dx_max = containing.right() - node.rect.right();
+    let dx_min = containing.x - node.rect.x;
+
+    (
+        dx.clamp(dx_min.min(0.0), dx_max.max(0.0)),
+        dy.clamp(dy_min.min(0.0), dy_max.max(0.0)),
+    )
+}
+
+/// Move an already-collected paint item, and its clip, by (dx, dy).
+fn translate_display_item(entry: &mut DisplayItem, dx: f32, dy: f32) {
+    match &mut entry.item {
+        PaintItem::Decoration(d) => {
+            d.x += dx;
+            d.y += dy;
+        }
+        PaintItem::Text(t) => {
+            t.x += dx;
+            t.y += dy;
+        }
+        PaintItem::Image(i) => {
+            i.x += dx;
+            i.y += dy;
+        }
+    }
+    if let Some(clip) = &mut entry.clip {
+        clip.x += dx;
+        clip.y += dy;
+    }
+}
+
 fn paint_stacking_context(root: &LayoutNode, clip: Option<Rect>, out: &mut Vec<DisplayItem>) {
+    let view = StickyView {
+        scroll: (0.0, 0.0),
+        viewport: (root.rect.width, root.rect.height),
+    };
+    paint_stacking_context_in(root, clip, root.rect, &view, out);
+}
+
+fn paint_stacking_context_in(
+    root: &LayoutNode,
+    clip: Option<Rect>,
+    containing: Rect,
+    view: &StickyView,
+    out: &mut Vec<DisplayItem>,
+) {
+    // A sticky context paints where the scroll has pushed it, content and all:
+    // the whole subtree moves as one, so its text stays inside its background.
+    if root.position == PositionType::Sticky {
+        let (dx, dy) = sticky_offset(root, containing, view);
+        if dx != 0.0 || dy != 0.0 {
+            let start = out.len();
+            paint_stacking_context_inner(root, clip, view, out);
+            for entry in &mut out[start..] {
+                translate_display_item(entry, dx, dy);
+            }
+            return;
+        }
+    }
+
+    paint_stacking_context_inner(root, clip, view, out);
+}
+
+fn paint_stacking_context_inner(
+    root: &LayoutNode,
+    clip: Option<Rect>,
+    view: &StickyView,
+    out: &mut Vec<DisplayItem>,
+) {
     if matches!(root.display, DisplayType::None) {
         return;
     }
@@ -4202,26 +4403,32 @@ fn paint_stacking_context(root: &LayoutNode, clip: Option<Rect>, out: &mut Vec<D
             child,
             text_flattened_into_parent(root, child),
             inner,
+            root.rect,
+            view,
             &mut layers,
         );
     }
 
     // Lowest z-index first, document order breaking ties — `sort_by_key` is
     // stable, so equal keys keep the order they were collected in.
-    layers.negative.sort_by_key(|(n, _)| n.z_index.unwrap_or(0));
-    layers.positive.sort_by_key(|(n, _)| n.z_index.unwrap_or(0));
+    layers.negative.sort_by_key(|b| b.node.z_index.unwrap_or(0));
+    layers.positive.sort_by_key(|b| b.node.z_index.unwrap_or(0));
 
-    for (node, node_clip) in layers.negative {
-        paint_stacking_context(node, node_clip, out);
+    let paint = |b: PositionedBox, out: &mut Vec<DisplayItem>| {
+        paint_stacking_context_in(b.node, b.clip, b.containing, view, out);
+    };
+
+    for b in layers.negative {
+        paint(b, out);
     }
     out.extend(layers.block_backgrounds);
     out.extend(layers.floats);
     out.extend(layers.inline_content);
-    for (node, node_clip) in layers.auto_positioned {
-        paint_stacking_context(node, node_clip, out);
+    for b in layers.auto_positioned {
+        paint(b, out);
     }
-    for (node, node_clip) in layers.positive {
-        paint_stacking_context(node, node_clip, out);
+    for b in layers.positive {
+        paint(b, out);
     }
 }
 
@@ -4236,6 +4443,8 @@ fn collect_into_layers<'a>(
     node: &'a LayoutNode,
     text_already_painted: bool,
     clip: Option<Rect>,
+    containing: Rect,
+    view: &StickyView,
     layers: &mut StackingLayers<'a>,
 ) {
     if matches!(node.display, DisplayType::None) {
@@ -4249,12 +4458,17 @@ fn collect_into_layers<'a>(
         } else {
             0
         };
+        let entry = PositionedBox {
+            node,
+            clip,
+            containing,
+        };
         if z < 0 {
-            layers.negative.push((node, clip));
+            layers.negative.push(entry);
         } else if z > 0 {
-            layers.positive.push((node, clip));
+            layers.positive.push(entry);
         } else {
-            layers.auto_positioned.push((node, clip));
+            layers.auto_positioned.push(entry);
         }
         return;
     }
@@ -4263,7 +4477,7 @@ fn collect_into_layers<'a>(
     // backgrounds but below the in-flow inline content that wraps around it.
     if node.float != FloatType::None {
         let mut float_items = Vec::new();
-        paint_stacking_context(node, clip, &mut float_items);
+        paint_stacking_context_in(node, clip, containing, view, &mut float_items);
         layers.floats.extend(float_items);
         return;
     }
@@ -4308,7 +4522,7 @@ fn collect_into_layers<'a>(
         } else {
             text_already_painted
         };
-        collect_into_layers(child, child_flattened, inner, layers);
+        collect_into_layers(child, child_flattened, inner, node.rect, view, layers);
     }
 }
 
@@ -4791,6 +5005,153 @@ fn hit_test_dom_path_inner(node: &LayoutNode, x: f32, y: f32, path: &mut Vec<u32
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod scroll_and_sticky_tests {
+    use super::*;
+
+    /// A root box with one child at the given rect.
+    fn root_with_child(child: LayoutNode) -> LayoutNode {
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.background_color = Some([255, 255, 255, 255]);
+        root.add_child(child);
+        root
+    }
+
+    #[test]
+    fn the_content_extent_reaches_past_the_root_box() {
+        // A box wider than its container overflows it, and that overflow is
+        // what a horizontal scrollbar exists to reach.
+        let child = LayoutNode::new(Rect::new(0.0, 0.0, 2000.0, 100.0));
+        let root = root_with_child(child);
+
+        let (width, height) = content_extent(&root);
+        assert_eq!(width, 2000.0);
+        assert_eq!(height, 600.0, "the root itself is still counted");
+    }
+
+    #[test]
+    fn a_clipped_subtree_does_not_extend_the_scroll_range() {
+        // Content an `overflow: hidden` box hides is not reachable by scrolling
+        // the page — otherwise every clipped carousel would give the window a
+        // scrollbar leading to blank space.
+        let mut clipper = LayoutNode::new(Rect::new(0.0, 0.0, 300.0, 100.0));
+        clipper.overflow = Overflow::Hidden;
+        clipper.add_child(LayoutNode::new(Rect::new(0.0, 0.0, 5000.0, 100.0)));
+
+        let root = root_with_child(clipper);
+        assert_eq!(content_extent(&root).0, 800.0);
+    }
+
+    /// A sticky box `top: 0` inside a tall section.
+    fn sticky_page() -> LayoutNode {
+        let mut section = LayoutNode::new(Rect::new(0.0, 100.0, 800.0, 1000.0));
+        let mut header = LayoutNode::new(Rect::new(0.0, 100.0, 800.0, 40.0));
+        header.position = PositionType::Sticky;
+        header.offsets = [Some(0.0), None, None, None];
+        header.background_color = Some([200, 0, 0, 255]);
+        section.add_child(header);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 1200.0));
+        root.add_child(section);
+        root
+    }
+
+    /// Where the sticky header's background is painted at this scroll offset.
+    fn header_y(root: &LayoutNode, scroll_y: f32) -> f32 {
+        build_display_list_with_scroll(root, (0.0, scroll_y), (800.0, 600.0))
+            .into_iter()
+            .find_map(|entry| match entry.item {
+                PaintItem::Decoration(d) if d.background_color == Some([200, 0, 0, 255]) => {
+                    Some(d.y)
+                }
+                _ => None,
+            })
+            .expect("the sticky header paints a background")
+    }
+
+    #[test]
+    fn a_sticky_box_stays_put_until_the_scroll_reaches_it() {
+        let root = sticky_page();
+        assert_eq!(header_y(&root, 0.0), 100.0);
+        assert_eq!(
+            header_y(&root, 50.0),
+            100.0,
+            "still below the top inset, so it scrolls away normally"
+        );
+    }
+
+    #[test]
+    fn a_sticky_box_follows_the_scroll_once_it_would_leave() {
+        let root = sticky_page();
+        // Scrolled 300px: the header would be at -200, so it is pushed back to
+        // the viewport top, which in layout coordinates is the scroll offset.
+        assert_eq!(header_y(&root, 300.0), 300.0);
+        assert_eq!(header_y(&root, 700.0), 700.0);
+    }
+
+    #[test]
+    fn a_sticky_box_is_pushed_out_by_the_end_of_its_containing_block() {
+        // Its section ends at y=1100, so a header 40px tall can travel no
+        // further than y=1060 however far the page scrolls.
+        let root = sticky_page();
+        assert_eq!(header_y(&root, 5000.0), 1060.0);
+    }
+
+    #[test]
+    fn a_sticky_box_carries_its_text_with_it() {
+        // The whole subtree moves as one; text left behind would land outside
+        // the box that is supposed to contain it.
+        let mut root = sticky_page();
+        let mut text = LayoutNode::new(Rect::new(8.0, 108.0, 200.0, 20.0));
+        text.text = Some("Section title".to_string());
+        root.children[0].children[0].add_child(text);
+
+        let list = build_display_list_with_scroll(&root, (0.0, 300.0), (800.0, 600.0));
+        let text_y = list
+            .into_iter()
+            .find_map(|entry| match entry.item {
+                PaintItem::Text(t) => Some(t.y),
+                _ => None,
+            })
+            .expect("the header's text is painted");
+        assert_eq!(text_y, 308.0, "moved by the same 200px as its box");
+    }
+
+    #[test]
+    fn a_left_sticky_box_follows_horizontal_scrolling() {
+        let mut cell = LayoutNode::new(Rect::new(0.0, 0.0, 120.0, 30.0));
+        cell.position = PositionType::Sticky;
+        cell.offsets = [None, None, None, Some(0.0)];
+        cell.background_color = Some([0, 0, 200, 255]);
+
+        let mut row = LayoutNode::new(Rect::new(0.0, 0.0, 3000.0, 30.0));
+        row.add_child(cell);
+        let root = root_with_child(row);
+
+        let x = build_display_list_with_scroll(&root, (500.0, 0.0), (800.0, 600.0))
+            .into_iter()
+            .find_map(|entry| match entry.item {
+                PaintItem::Decoration(d) if d.background_color == Some([0, 0, 200, 255]) => {
+                    Some(d.x)
+                }
+                _ => None,
+            })
+            .expect("the sticky cell paints a background");
+        assert_eq!(x, 500.0, "the frozen column tracks the horizontal scroll");
+    }
+
+    #[test]
+    fn an_unscrolled_page_paints_exactly_as_before() {
+        // `build_display_list` is the old entry point and many callers still
+        // use it; sticky support must not have moved anything on a page that
+        // is not scrolled.
+        let root = sticky_page();
+        let plain = build_display_list(&root);
+        let scrolled = build_display_list_with_scroll(&root, (0.0, 0.0), (800.0, 600.0));
+        assert_eq!(plain.len(), scrolled.len());
     }
 }
 

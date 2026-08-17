@@ -264,13 +264,21 @@ fn is_inheritable(property: &str) -> bool {
 
 /// Clone only the inheritable properties from `parent` into `child`.
 /// Non-inheritable properties use CSS initial (default) values.
-fn inherit_properties(parent: &ComputedValues, mut child: ComputedValues) -> ComputedValues {
+///
+/// `initial_font_size` is the size an element has when nothing set one, which
+/// page zoom moves away from 16px — it is the "nobody assigned this" marker,
+/// not a constant.
+fn inherit_properties(
+    parent: &ComputedValues,
+    mut child: ComputedValues,
+    initial_font_size: f32,
+) -> ComputedValues {
     // `color` inherits
     if parent.color.is_some() && child.color.is_none() {
         child.color = parent.color;
     }
     // `font-size` inherits
-    if child.font_size == 16.0 && parent.font_size != 16.0 {
+    if child.font_size == initial_font_size && parent.font_size != initial_font_size {
         child.font_size = parent.font_size;
     }
     // `font-family` inherits
@@ -382,8 +390,8 @@ fn resolve_root_font_size(
     // Normal declarations first, then !important, each in ascending specificity.
     candidates.sort_by_key(|(decl, spec)| (decl.important, *spec));
 
-    let mut size = DEFAULT_FONT_SIZE;
-    let mut apply = |value: &str, size: &mut f32| {
+    let mut size = DEFAULT_FONT_SIZE * ctx.zoom;
+    let apply = |value: &str, size: &mut f32| {
         let local = LengthContext {
             font_size: *size,
             root_font_size: *size,
@@ -392,7 +400,7 @@ fn resolve_root_font_size(
         // A percentage on the root resolves against the initial font size.
         if let Some(pct) = value.trim().strip_suffix('%') {
             if let Ok(n) = pct.trim().parse::<f32>() {
-                *size = DEFAULT_FONT_SIZE * n / 100.0;
+                *size = DEFAULT_FONT_SIZE * ctx.zoom * n / 100.0;
                 return;
             }
         }
@@ -417,6 +425,17 @@ fn resolve_root_font_size(
     size
 }
 
+/// The values an element starts from before any declaration applies.
+///
+/// The CSS initial values, except that the initial font size is scaled by the
+/// page zoom: text nobody sized explicitly has to grow with everything else.
+fn initial_values(zoom: f32) -> ComputedValues {
+    ComputedValues {
+        font_size: DEFAULT_FONT_SIZE * zoom,
+        ..ComputedValues::default()
+    }
+}
+
 /// Compute the resolved styles for every element node in the DOM tree.
 ///
 /// Takes the parsed DOM arena and a `Stylesheet` (from `parse_css`),
@@ -429,7 +448,24 @@ pub fn compute_styles_for_tree(
     stylesheet: &parser::Stylesheet,
     viewport: (f32, f32),
 ) -> FxHashMap<u32, ComputedValues> {
-    compute_styles_for_tree_internal(arena, stylesheet, viewport, |_| false)
+    compute_styles_for_tree_internal(arena, stylesheet, viewport, 1.0, |_| false)
+}
+
+/// Compute styles with both a hover context and a page zoom factor.
+///
+/// Zoom multiplies every absolute length, so the page reflows into the window
+/// it already has rather than being scaled up as an image would be.
+pub fn compute_styles_for_tree_with_hover_zoom(
+    arena: &crate::html::DomArena,
+    stylesheet: &parser::Stylesheet,
+    viewport: (f32, f32),
+    hovered_ids: &[u32],
+    zoom: f32,
+) -> FxHashMap<u32, ComputedValues> {
+    let hover_set: std::collections::HashSet<u32> = hovered_ids.iter().copied().collect();
+    compute_styles_for_tree_internal(arena, stylesheet, viewport, zoom, |id| {
+        hover_set.contains(&id)
+    })
 }
 
 /// Compute styles with runtime hover context.
@@ -442,8 +478,7 @@ pub fn compute_styles_for_tree_with_hover(
     viewport: (f32, f32),
     hovered_ids: &[u32],
 ) -> FxHashMap<u32, ComputedValues> {
-    let hover_set: std::collections::HashSet<u32> = hovered_ids.iter().copied().collect();
-    compute_styles_for_tree_internal(arena, stylesheet, viewport, |id| hover_set.contains(&id))
+    compute_styles_for_tree_with_hover_zoom(arena, stylesheet, viewport, hovered_ids, 1.0)
 }
 
 /// Internal implementation of style computation with a configurable hover predicate.
@@ -454,6 +489,7 @@ fn compute_styles_for_tree_internal<F>(
     arena: &crate::html::DomArena,
     stylesheet: &parser::Stylesheet,
     viewport: (f32, f32),
+    zoom: f32,
     is_hovered: F,
 ) -> FxHashMap<u32, ComputedValues>
 where
@@ -543,11 +579,19 @@ where
 
     // Base context for resolving relative lengths. `rem` needs the root font
     // size, which is whatever `<html>` resolves to, so compute that first.
+    let zoom = if zoom.is_finite() && zoom > 0.0 {
+        zoom
+    } else {
+        1.0
+    };
     let mut length_ctx = LengthContext {
-        font_size: DEFAULT_FONT_SIZE,
-        root_font_size: DEFAULT_FONT_SIZE,
+        // The initial font size is a length like any other, so zoom applies to
+        // it too — otherwise a zoomed page grows everything except its text.
+        font_size: DEFAULT_FONT_SIZE * zoom,
+        root_font_size: DEFAULT_FONT_SIZE * zoom,
         viewport_width: viewport.0,
         viewport_height: viewport.1,
+        zoom,
     };
     length_ctx.root_font_size = resolve_root_font_size(arena, &active_rules, length_ctx);
 
@@ -624,7 +668,7 @@ where
             }
         }
 
-        let mut computed = ComputedValues::default();
+        let mut computed = initial_values(zoom);
 
         // Collect !important and normal declarations
         let mut important_decls: Vec<(&Declaration, (u32, u32, u32))> = Vec::new();
@@ -690,7 +734,8 @@ where
                 // the Phase 1 result. Every declaration is re-applied below, so
                 // reusing the Phase 1 values would apply them twice — harmless for
                 // absolute values, but `em` would compound (2em → 4x the parent).
-                let mut inherited = inherit_properties(&parent_styles, ComputedValues::default());
+                let mut inherited =
+                    inherit_properties(&parent_styles, initial_values(zoom), length_ctx.font_size);
 
                 // Re-evaluate applied declarations with inherited CSS custom properties
                 if let Some(decls) = applied_decls_per_element.get(&node_id) {
@@ -851,6 +896,9 @@ pub enum PositionType {
     Static,
     Relative,
     Absolute,
+    /// In flow like `relative`, but offset by however far its scroll container
+    /// has scrolled past it, and never further than its containing block.
+    Sticky,
 }
 
 // ------ Float & Clear ------
@@ -2095,6 +2143,9 @@ impl ComputedValues {
                 self.position = match val {
                     "relative" => PositionType::Relative,
                     "absolute" => PositionType::Absolute,
+                    "sticky" => PositionType::Sticky,
+                    // `fixed` is not implemented; treating it as static leaves
+                    // the box in flow rather than dropping it at the origin.
                     _ => PositionType::Static,
                 };
             }
@@ -2386,6 +2437,10 @@ pub struct LengthContext {
     pub viewport_width: f32,
     /// Viewport height in CSS pixels (for `vh`, `vmin`, `vmax`).
     pub viewport_height: f32,
+    /// Page zoom. Every absolute length is multiplied by it, which is what
+    /// makes a zoomed page reflow — the window stays the size it is, and the
+    /// page's own lengths grow inside it.
+    pub zoom: f32,
 }
 
 /// The CSS initial font size, used whenever no explicit context is available.
@@ -2398,6 +2453,7 @@ impl Default for LengthContext {
             root_font_size: DEFAULT_FONT_SIZE,
             viewport_width: 800.0,
             viewport_height: 600.0,
+            zoom: 1.0,
         }
     }
 }
@@ -2668,8 +2724,13 @@ fn parse_length_ctx(s: &str, ctx: LengthContext) -> Option<f32> {
     }
 
     let unit = unit.trim().to_ascii_lowercase();
+    // Page zoom scales absolute lengths only. Font-relative units resolve
+    // against font sizes that are themselves already zoomed, and viewport units
+    // resolve against the window, which zoom does not resize — scaling either
+    // again would apply the zoom twice.
+    let zoom = ctx.zoom;
     let px = match unit.as_str() {
-        "" | "px" => num,
+        "" | "px" => num * zoom,
         "em" => num * ctx.font_size,
         "rem" => num * ctx.root_font_size,
         // Approximations used by every engine when real font metrics are unavailable.
@@ -2680,12 +2741,12 @@ fn parse_length_ctx(s: &str, ctx: LengthContext) -> Option<f32> {
         "vmin" => num * ctx.viewport_width.min(ctx.viewport_height) / 100.0,
         "vmax" => num * ctx.viewport_width.max(ctx.viewport_height) / 100.0,
         // Absolute units, defined by CSS against 96dpi.
-        "pt" => num * 96.0 / 72.0,
-        "pc" => num * 16.0,
-        "in" => num * 96.0,
-        "cm" => num * 96.0 / 2.54,
-        "mm" => num * 96.0 / 25.4,
-        "q" => num * 96.0 / 101.6,
+        "pt" => num * 96.0 / 72.0 * zoom,
+        "pc" => num * 16.0 * zoom,
+        "in" => num * 96.0 * zoom,
+        "cm" => num * 96.0 / 2.54 * zoom,
+        "mm" => num * 96.0 / 25.4 * zoom,
+        "q" => num * 96.0 / 101.6 * zoom,
         _ => return None,
     };
     Some(px)
@@ -4616,6 +4677,7 @@ mod tests {
             root_font_size: 20.0,
             viewport_width: 1000.0,
             viewport_height: 500.0,
+            ..LengthContext::default()
         };
         assert_eq!(parse_length_ctx("calc(2em + 1rem)", ctx), Some(40.0));
         assert_eq!(parse_length_ctx("calc(10vw - 50px)", ctx), Some(50.0));

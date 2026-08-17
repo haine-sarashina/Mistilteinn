@@ -33,6 +33,9 @@ pub struct Page {
     pub view_width: f32,
     pub view_height: f32,
     pub page_url: String,
+    /// Page zoom. Every absolute CSS length is multiplied by it, so the page
+    /// reflows into the window rather than being scaled as a picture.
+    pub zoom: f32,
     pub image_cache: FxHashMap<String, CachedImage>,
     /// Merged (UA + author) stylesheet for style recomputation (e.g., :hover).
     pub stylesheet: crate::css::parser::Stylesheet,
@@ -42,6 +45,16 @@ pub struct Page {
 }
 
 impl Page {
+    /// Set the page zoom and lay the document out again at that scale.
+    ///
+    /// Zoom is a style-time factor rather than a paint-time one, so changing it
+    /// means recomputing the cascade: lengths, and therefore line breaking and
+    /// every box that depends on them, all change.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        self.zoom = zoom;
+        self.recompute_with_hover(&[]);
+    }
+
     /// The URL that relative references in this document resolve against.
     ///
     /// A `<base href>` overrides the document's own URL, and is itself resolved
@@ -143,6 +156,7 @@ impl Page {
             view_width,
             view_height,
             page_url: String::new(),
+            zoom: 1.0,
             image_cache: FxHashMap::default(),
             stylesheet,
             js_context,
@@ -206,11 +220,12 @@ impl Page {
     /// (equivalent to initial load).
     pub fn recompute_with_hover(&mut self, hovered_ids: &[u32]) {
         // Recompute styles with hover awareness
-        self.styles = css::compute_styles_for_tree_with_hover(
+        self.styles = css::compute_styles_for_tree_with_hover_zoom(
             &self.arena,
             &self.stylesheet,
             (self.view_width, self.view_height),
             hovered_ids,
+            self.zoom,
         );
 
         // Rebuild layout tree from new computed styles
@@ -824,6 +839,80 @@ mod tests {
             (center_x - (400.0 - w) / 2.0).abs() < 1.0,
             "center should split the free space: x={center_x}, width={w}"
         );
+    }
+
+    #[test]
+    fn zoom_scales_a_specified_width() {
+        let mut page = Page::new(
+            "<html><body><div id='box'></div></body></html>",
+            "body { margin: 0 } #box { width: 100px; height: 40px }",
+            800.0,
+            600.0,
+        );
+        assert_eq!(rect_of(&page, "box").width, 100.0);
+
+        let base_height = rect_of(&page, "box").height;
+
+        page.set_zoom(2.0);
+        assert_eq!(rect_of(&page, "box").width, 200.0);
+        assert_eq!(rect_of(&page, "box").height, base_height * 2.0);
+    }
+
+    #[test]
+    fn zoom_scales_text_that_nobody_sized() {
+        // Text with no declared size inherits the initial 16px. If zoom only
+        // touched declared lengths, a zoomed page would grow every box and
+        // leave the text in it unchanged.
+        let mut page = Page::new(
+            "<html><body><p id='t'>text</p></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let dom_id = page.arena.find_by_id("t").unwrap();
+        assert_eq!(page.styles.get(&dom_id).unwrap().font_size, 16.0);
+
+        page.set_zoom(1.5);
+        let dom_id = page.arena.find_by_id("t").unwrap();
+        assert_eq!(page.styles.get(&dom_id).unwrap().font_size, 24.0);
+    }
+
+    #[test]
+    fn zoom_leaves_viewport_units_alone() {
+        // `50vw` is half the window whatever the zoom: the window did not
+        // change size, so scaling it too would zoom the page twice.
+        for zoom in [1.0, 2.0] {
+            let mut page = Page::new(
+                "<html><body><div id='half'></div></body></html>",
+                "body { margin: 0 } #half { width: 50vw; height: 10px }",
+                800.0,
+                600.0,
+            );
+            page.set_zoom(zoom);
+            assert_eq!(
+                rect_of(&page, "half").width,
+                400.0,
+                "at zoom {zoom} a vw length still measures against the window"
+            );
+        }
+    }
+
+    #[test]
+    fn zoom_compounds_em_only_once() {
+        // `em` resolves against a font size that zoom has already scaled, so
+        // scaling it again would square the zoom on every nested element.
+        let mut page = Page::new(
+            "<html><body><div id='outer'><div id='inner'>x</div></div></body></html>",
+            "body { margin: 0; font-size: 10px } #outer { font-size: 2em } \
+             #inner { font-size: 2em }",
+            800.0,
+            600.0,
+        );
+        page.set_zoom(2.0);
+
+        let inner = page.arena.find_by_id("inner").unwrap();
+        // 10px base × zoom 2 = 20, then 2em twice = 80.
+        assert_eq!(page.styles.get(&inner).unwrap().font_size, 80.0);
     }
 
     #[test]

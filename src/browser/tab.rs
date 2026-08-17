@@ -13,6 +13,8 @@ pub struct Tab {
     pub url: String,
     pub page: Option<Page>,
     pub scroll_offset: (f32, f32),
+    /// Page zoom for this tab, 1.0 being 100%.
+    pub zoom: f32,
     pub is_loading: bool,
     pub history: Vec<String>,
     pub history_index: usize,
@@ -116,6 +118,7 @@ impl TabManager {
                 url: String::new(),
                 page: None,
                 scroll_offset: (0.0, 0.0),
+                zoom: 1.0,
                 is_loading: false,
                 history: Vec::new(),
                 history_index: 0,

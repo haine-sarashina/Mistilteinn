@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod security;
 
 use thiserror::Error;
 
@@ -10,6 +11,16 @@ pub enum NetworkError {
     Timeout,
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
+    /// The server's certificate could not be verified.
+    ///
+    /// Separate from [`NetworkError::Http`] because it is the one failure the
+    /// user can knowingly override, and the one that must never be retried
+    /// over plaintext.
+    #[error("certificate error for {host}: {detail}")]
+    Certificate { host: String, detail: String },
+    /// A security policy refused the request before it was made.
+    #[error("blocked: {0}")]
+    Blocked(String),
     /// The server answered, but with nothing to render.
     ///
     /// Kept separate from [`NetworkError::Http`] because it is not a transport
@@ -31,6 +42,11 @@ const MAX_TOTAL_IMPORTS: usize = 50;
 /// How much of the body the meta-charset prescan looks at, per the HTML spec.
 const CHARSET_PRESCAN_BYTES: usize = 1024;
 
+/// The scheme of pages the browser itself produces, as opposed to pages it
+/// fetched. They are a separate origin from any site, and some of them can act
+/// on the user's behalf, so a site must never be able to navigate to one.
+pub const INTERNAL_SCHEME: &str = "mistilteinn://";
+
 /// Result of a network fetch, including the resolved (post-redirect) URL.
 pub struct FetchResult {
     pub content: String,
@@ -39,6 +55,9 @@ pub struct FetchResult {
     pub final_url: String,
     /// The encoding the body was decoded with, for logging and diagnostics.
     pub encoding: &'static str,
+    /// The `Content-Security-Policy` headers the document was served with.
+    /// A document may send several, and all of them apply.
+    pub csp: Vec<String>,
 }
 
 /// Decode a response body the way a browser does.
@@ -130,7 +149,7 @@ fn prescan_meta_charset(bytes: &[u8]) -> Option<String> {
 /// Attributes are parsed rather than searched for, because `charset` also
 /// occurs *inside* the value of `content="text/html; charset=euc-jp"` — a
 /// substring search would read the wrong one and stop at the wrong delimiter.
-fn tag_attributes(tag: &str) -> Vec<(String, String)> {
+pub(crate) fn tag_attributes(tag: &str) -> Vec<(String, String)> {
     let mut attrs = Vec::new();
     let bytes: Vec<char> = tag.chars().collect();
     let mut i = 0usize;
@@ -187,12 +206,24 @@ fn tag_attributes(tag: &str) -> Vec<(String, String)> {
 /// If an HTTPS request times out or fails to connect, automatically falls back to HTTP
 /// to resolve domains that redirect via port 80 (e.g. apple.co.jp -> https://www.apple.com/jp/).
 pub async fn fetch(url: &str) -> Result<FetchResult, NetworkError> {
-    let client = http_client();
+    let client = client_for(url);
     let request = || client.get(url).timeout(std::time::Duration::from_secs(12));
 
     match request().send().await {
         Ok(response) => into_fetch_result(response).await,
         Err(e) => {
+            // A certificate failure is reported, never worked around. Retrying
+            // over HTTP would answer "this connection cannot be trusted" by
+            // dropping the encryption altogether, and would do it silently.
+            if security::is_certificate_error(&e) {
+                let host = security::host_of(url).unwrap_or_else(|| url.to_string());
+                log::warn!("certificate error for {host}: {e}");
+                return Err(NetworkError::Certificate {
+                    host,
+                    detail: e.to_string(),
+                });
+            }
+
             if url.starts_with("https://") {
                 let http_url = format!("http://{}", &url[8..]);
                 log::info!(
@@ -250,6 +281,14 @@ async fn into_fetch_result(response: reqwest::Response) -> Result<FetchResult, N
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_string());
 
+    let csp: Vec<String> = response
+        .headers()
+        .get_all("content-security-policy")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(|v| v.to_string())
+        .collect();
+
     // Take the raw bytes rather than `Response::text()`: the encoding may only
     // be declared in a `<meta>` tag, which reqwest does not look at.
     let bytes = response.bytes().await?;
@@ -272,6 +311,7 @@ async fn into_fetch_result(response: reqwest::Response) -> Result<FetchResult, N
         content,
         final_url,
         encoding,
+        csp,
     })
 }
 
@@ -281,7 +321,14 @@ async fn into_fetch_result(response: reqwest::Response) -> Result<FetchResult, N
 /// - If it starts with "/", prepend the scheme + host from the base URL.
 /// - Otherwise, append to the base URL's directory.
 pub fn resolve_url(base_url: &str, href: &str) -> String {
-    if href.starts_with("data:") || href.starts_with("http://") || href.starts_with("https://") {
+    if href.starts_with("data:")
+        || href.starts_with("http://")
+        || href.starts_with("https://")
+        // An internal page is an absolute reference too. Resolving it as a
+        // relative path would hand the browser's own pages to whatever site
+        // happened to be open.
+        || href.starts_with(INTERNAL_SCHEME)
+    {
         return href.to_string();
     }
 
@@ -450,6 +497,72 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 /// The shared client. See [`HTTP_CLIENT`].
 pub fn http_client() -> &'static reqwest::Client {
     &HTTP_CLIENT
+}
+
+/// The client used for hosts the user has granted a certificate exception to.
+///
+/// It shares the cookie jar with [`HTTP_CLIENT`] — it is the same browsing
+/// session — and differs only in accepting a certificate that could not be
+/// verified. It is reached solely through [`client_for`], which requires an
+/// exception the user granted on the warning page for that exact host.
+static INSECURE_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .cookie_provider(COOKIE_JAR.clone())
+        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build the certificate-exception HTTP client")
+});
+
+/// The client to send this request with: the verifying one, unless the user has
+/// explicitly accepted this host's certificate.
+fn client_for(url: &str) -> &'static reqwest::Client {
+    match security::host_of(url) {
+        Some(host) if security::has_cert_exception(&host) => {
+            log::warn!("{host}: proceeding with an unverified certificate at the user's request");
+            &INSECURE_CLIENT
+        }
+        _ => &HTTP_CLIENT,
+    }
+}
+
+/// Fetch a subresource that the CORS rules apply to, such as a web font.
+///
+/// Sends the document's `Origin` and refuses a cross-origin response the server
+/// did not agree to share. A font is the case that matters here: browsers fetch
+/// them in CORS mode precisely so a site cannot quietly read a font file it was
+/// not given permission to.
+pub async fn fetch_cors(
+    url: &str,
+    document_url: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, NetworkError> {
+    if url.starts_with("data:") {
+        return fetch_image(url).await;
+    }
+
+    let mut request = client_for(url).get(url).timeout(timeout);
+    if let Some(origin) = security::Origin::parse(document_url) {
+        request = request.header(reqwest::header::ORIGIN, origin.serialize());
+    }
+
+    let response = request.send().await?;
+    let allow_origin = response
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let final_url = response.url().to_string();
+
+    if !security::cors_allows(document_url, &final_url, allow_origin.as_deref()) {
+        return Err(NetworkError::Blocked(format!(
+            "{final_url} was refused by CORS (Access-Control-Allow-Origin: {})",
+            allow_origin.as_deref().unwrap_or("absent")
+        )));
+    }
+
+    Ok(response.bytes().await?.to_vec())
 }
 
 /// A body obtained either from the network or from the HTTP cache.
@@ -733,8 +846,17 @@ pub async fn resolve_imports(
 pub async fn fetch_external_css(
     base_url: &str,
     html_content: &str,
+    csp: &security::Csp,
 ) -> Result<String, NetworkError> {
-    let inline_css = extract_css(html_content);
+    // An inline `<style>` block is inline content in the CSP sense, so a
+    // policy without `'unsafe-inline'` drops it exactly as it drops an inline
+    // script.
+    let inline_css = if csp.allows_inline(security::ResourceKind::Style) {
+        extract_css(html_content)
+    } else {
+        log::warn!("inline <style> blocked by this page's Content-Security-Policy");
+        String::new()
+    };
     let external_hrefs = extract_external_css_urls(html_content);
 
     if external_hrefs.is_empty() {
@@ -761,10 +883,22 @@ pub async fn fetch_external_css(
         limited_hrefs.len()
     );
 
-    // Resolve all relative URLs against the base URL
+    // Resolve all relative URLs against the base URL, then put each through
+    // the page's own policy and the mixed-content rules. A stylesheet can
+    // rewrite the whole page, so an insecure one is dropped rather than
+    // upgraded and hoped for.
     let resolved_urls: Vec<String> = limited_hrefs
         .iter()
         .map(|href| resolve_url(base_url, href))
+        .filter_map(|url| {
+            match security::check_subresource(base_url, csp, &url, security::ResourceKind::Style) {
+                security::SubresourceDecision::Load(url) => Some(url),
+                security::SubresourceDecision::Block(reason) => {
+                    log::warn!("stylesheet blocked: {reason}");
+                    None
+                }
+            }
+        })
         .collect();
 
     // Fetch all external stylesheets concurrently using join_all
@@ -1056,6 +1190,7 @@ mod tests {
             content: "hello".to_string(),
             final_url: "https://example.com".to_string(),
             encoding: "UTF-8",
+            csp: Vec::new(),
         };
         assert_eq!(fr.content, "hello");
         assert_eq!(fr.final_url, "https://example.com");
@@ -1213,7 +1348,8 @@ mod tests {
             <style>body { margin: 0; }</style>
         </head><body></body></html>"#;
 
-        let result = fetch_external_css("https://example.com", html).await;
+        let result =
+            fetch_external_css("https://example.com", html, &security::Csp::default()).await;
         assert!(result.is_ok());
         let css = result.unwrap();
         assert!(css.contains("margin: 0"));
@@ -1223,7 +1359,8 @@ mod tests {
     async fn test_fetch_external_css_empty_graceful() {
         let html = r#"<!DOCTYPE html><html><head></head><body></body></html>"#;
 
-        let result = fetch_external_css("https://example.com", html).await;
+        let result =
+            fetch_external_css("https://example.com", html, &security::Csp::default()).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }

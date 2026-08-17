@@ -47,6 +47,56 @@ const FIND_BAR_WIDTH: f32 = 320.0;
 /// The internal page listing saved bookmarks.
 const BOOKMARKS_URL: &str = "mistilteinn://bookmarks";
 
+/// The internal URL that grants a certificate exception and retries.
+///
+/// Reachable only from the warning page's own link, so an exception is always
+/// the answer to a warning the user has just read.
+const PROCEED_INSECURE_URL: &str = "mistilteinn://proceed-insecure?url=";
+
+/// The interstitial shown when a server's certificate cannot be verified.
+///
+/// A warning rather than an error page: the connection worked, but nothing
+/// proves the server is who it claims to be, so the page's job is to say what
+/// is wrong and make continuing a deliberate act rather than a click-through.
+fn certificate_warning_page(url: &str, host: &str, detail: &str) -> String {
+    let escaped_detail = detail
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>この接続ではプライバシーが保護されません</title>
+<style>
+  body {{ background-color: #202124; color: #e8eaed; margin: 0; padding: 80px 48px;
+         font-family: -apple-system, "Segoe UI", Roboto, sans-serif; line-height: 1.6; }}
+  .container {{ max-width: 600px; margin: 0 auto; }}
+  .icon {{ font-size: 52px; margin-bottom: 20px; color: #f28b82; }}
+  h1 {{ font-size: 24px; font-weight: 500; margin: 0 0 16px 0; }}
+  p {{ font-size: 15px; color: #9aa0a6; margin: 0 0 16px 0; }}
+  .host {{ color: #e8eaed; font-weight: 600; }}
+  .error-code {{ font-family: monospace; font-size: 12px; color: #5f6368; margin: 24px 0 32px 0; }}
+  .btn {{ display: inline-block; padding: 8px 24px; font-size: 14px; font-weight: 500;
+         text-decoration: none; border-radius: 100px; background-color: #8ab4f8;
+         color: #202124; margin-right: 12px; }}
+  .btn-danger {{ display: inline-block; padding: 7px 23px; font-size: 13px;
+         text-decoration: none; border-radius: 100px; background-color: transparent;
+         color: #f28b82; border: 1px solid #5f6368; }}
+</style></head>
+<body><div class="container">
+  <div class="icon">⚠</div>
+  <h1>この接続ではプライバシーが保護されません</h1>
+  <p><span class="host">{host}</span> の証明書を検証できませんでした。
+     この接続の相手が本当に {host} である保証はなく、通信内容が読み取られている可能性があります。</p>
+  <p>証明書の有効期限切れ、自己署名証明書、ホスト名の不一致などが原因です。</p>
+  <div class="error-code">ERR_CERT_AUTHORITY_INVALID — {escaped_detail}</div>
+  <div>
+    <a href="{BOOKMARKS_URL}" class="btn">安全な場所に戻る</a>
+    <a href="{PROCEED_INSECURE_URL}{url}" class="btn-danger">{host} にアクセスする（安全ではありません）</a>
+  </div>
+</div></body></html>"#
+    )
+}
+
 /// The zoom levels Ctrl+`+` / Ctrl+`-` step through.
 const ZOOM_LEVELS: [f32; 13] = [
     0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 3.0,
@@ -1439,6 +1489,23 @@ impl MistilteinnApp {
     fn load_url_internal(&mut self, url: &str, push_history: bool) {
         let trimmed = url.trim();
 
+        // Proceeding past a certificate warning: record the exception for that
+        // one host and try again. Only the warning page links here, so this is
+        // always the user answering a warning they have just read.
+        if let Some(target) = trimmed.strip_prefix(PROCEED_INSECURE_URL) {
+            let target = target.to_string();
+            match crate::network::security::host_of(&target) {
+                Some(host) => {
+                    log::warn!("user accepted the unverified certificate for {host}");
+                    crate::network::security::add_cert_exception(&host);
+                    self.address_input = target.clone();
+                    self.load_url_internal(&target, push_history);
+                }
+                None => log::warn!("no host to grant a certificate exception to in {target}"),
+            }
+            return;
+        }
+
         // Internal pages are built here rather than fetched. They are rendered
         // by the same engine as any other document.
         if trimmed.eq_ignore_ascii_case(BOOKMARKS_URL) {
@@ -1451,6 +1518,7 @@ impl MistilteinnApp {
             }
             self.address_input = BOOKMARKS_URL.to_string();
             self.load_page(&html, "");
+            self.mark_page_internal(true);
             return;
         }
 
@@ -1485,6 +1553,20 @@ impl MistilteinnApp {
         // Fetch HTML
         let fetch_result = match crate::network::fetch(url).await {
             Ok(r) => r,
+            Err(crate::network::NetworkError::Certificate { host, detail }) => {
+                // A certificate that cannot be verified is not a page-load
+                // failure to be reported in passing: it is a warning the user
+                // has to answer, so it gets an interstitial of its own.
+                log::error!("certificate error for {host}: {detail}");
+                let page = certificate_warning_page(url, &host, &detail);
+                self.load_page_async(&page, "", Some(url)).await;
+                // The warning is the browser speaking, not the site: its
+                // "proceed" link is a privileged navigation the site itself
+                // must not be able to make.
+                self.mark_page_internal(true);
+                self.tab_manager.set_active_tab_loading(false);
+                return;
+            }
             Err(e) => {
                 log::error!("Failed to fetch {}: {:?}", url, e);
                 let err_str = format!("{:?}", e);
@@ -1634,6 +1716,7 @@ impl MistilteinnApp {
                 let error_css = "body { margin: 0; padding: 60px 48px; background-color: #202124; color: #e8eaed; }";
                 self.load_page_async(&error_html, error_css, Some(url))
                     .await;
+                self.mark_page_internal(true);
                 self.tab_manager.set_active_tab_loading(false);
                 return;
             }
@@ -1655,8 +1738,19 @@ impl MistilteinnApp {
             tab.url = final_url.clone();
         }
 
+        // The page's own security policy governs everything loaded below, so
+        // it is assembled before anything else is fetched. A document may
+        // declare policies in headers and in a `<meta>` tag, and all of them
+        // apply.
+        let mut policies = fetch_result.csp;
+        policies.extend(crate::network::security::meta_csp(&html));
+        let csp = crate::network::security::Csp::parse(&policies);
+        if !csp.is_empty() {
+            log::info!("{final_url} declares a Content-Security-Policy");
+        }
+
         // Fetch all CSS (inline + external stylesheets) concurrently
-        let css = crate::network::fetch_external_css(&final_url, &html)
+        let css = crate::network::fetch_external_css(&final_url, &html, &csp)
             .await
             .unwrap_or_else(|e| {
                 log::warn!("Failed to fetch external CSS: {:?}", e);
@@ -1670,8 +1764,9 @@ impl MistilteinnApp {
             css
         };
 
-        self.load_page_async(&html, &final_css, Some(&final_url))
+        self.load_page_with_csp(&html, &final_css, Some(&final_url), &csp)
             .await;
+        self.mark_page_internal(false);
         self.tab_manager.set_active_tab_loading(false);
     }
 
@@ -1681,11 +1776,17 @@ impl MistilteinnApp {
     /// the first entry the shaper can actually load wins. `local(...)` entries
     /// need no download, so they end the search only if the system already has
     /// that family; otherwise the search moves on to the next source.
+    ///
+    /// Fonts are fetched in CORS mode, as browsers do: a font file is only
+    /// usable if the server that holds it agreed to share it across origins.
     async fn load_web_fonts(
         font_faces: &[crate::css::parser::FontFaceRule],
         resolve: &impl Fn(&str) -> String,
+        document_url: &str,
+        csp: &crate::network::security::Csp,
     ) {
         use crate::css::parser::FontFaceSource;
+        use crate::network::security::{ResourceKind, SubresourceDecision, check_subresource};
         use crate::render::font_data;
 
         for face in font_faces {
@@ -1705,9 +1806,27 @@ impl MistilteinnApp {
                 }
 
                 let resolved = resolve(url);
-                let Ok(bytes) = crate::network::fetch_image(&resolved).await else {
-                    log::warn!("failed to fetch web font {resolved}");
-                    continue;
+                let resolved =
+                    match check_subresource(document_url, csp, &resolved, ResourceKind::Font) {
+                        SubresourceDecision::Load(url) => url,
+                        SubresourceDecision::Block(reason) => {
+                            log::warn!("web font blocked: {reason}");
+                            continue;
+                        }
+                    };
+
+                let bytes = match crate::network::fetch_cors(
+                    &resolved,
+                    document_url,
+                    std::time::Duration::from_secs(15),
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        log::warn!("failed to fetch web font {resolved}: {e}");
+                        continue;
+                    }
                 };
 
                 match font_data::to_sfnt(bytes) {
@@ -1729,10 +1848,33 @@ impl MistilteinnApp {
         css_source: &str,
         base_url: Option<&str>,
     ) {
+        self.load_page_with_csp(
+            html_source,
+            css_source,
+            base_url,
+            &crate::network::security::Csp::default(),
+        )
+        .await;
+    }
+
+    /// [`Self::load_page_async`], under the document's security policy.
+    ///
+    /// Every subresource — image, background, font — is put through the policy
+    /// and the mixed-content rules before it is requested, so a blocked one
+    /// costs no request at all.
+    pub async fn load_page_with_csp(
+        &mut self,
+        html_source: &str,
+        css_source: &str,
+        base_url: Option<&str>,
+        csp: &crate::network::security::Csp,
+    ) {
+        use crate::network::security::{ResourceKind, SubresourceDecision, check_subresource};
+
         let w = self.window_width() as f32 - TAB_BAR_WIDTH as f32;
         let h = self.window_height() as f32 - ADDRESS_BAR_HEIGHT as f32;
 
-        let mut new_page = crate::page::Page::new(html_source, css_source, w, h);
+        let mut new_page = crate::page::Page::new_with_csp(html_source, css_source, w, h, csp);
         if let Some(url) = &base_url {
             new_page.page_url = url.to_string();
         }
@@ -1755,9 +1897,25 @@ impl MistilteinnApp {
             }
         };
 
+        // An image that the page's policy forbids, or that would arrive in
+        // plaintext on a secure page, is filtered out here — before a request
+        // exists to be blocked later.
+        let document_url = base_url.unwrap_or("").to_string();
+        let allowed_image = |url: String| -> Option<String> {
+            match check_subresource(&document_url, csp, &url, ResourceKind::Image) {
+                SubresourceDecision::Load(url) => Some(url),
+                SubresourceDecision::Block(reason) => {
+                    log::warn!("image blocked: {reason}");
+                    None
+                }
+            }
+        };
+
         let mut resolved_images: Vec<(String, f32, f32)> = image_nodes
             .iter()
-            .map(|img| (resolve(&img.src), img.width, img.height))
+            .filter_map(|img| {
+                allowed_image(resolve(&img.src)).map(|url| (url, img.width, img.height))
+            })
             .collect();
 
         // CSS background images go through the same fetch and cache as <img>.
@@ -1765,7 +1923,9 @@ impl MistilteinnApp {
         // to rasterize at a sensible resolution.
         for deco in crate::layout::collect_decorations(&new_page.layout_root) {
             if let Some(ref src) = deco.background_image {
-                let url = resolve(src);
+                let Some(url) = allowed_image(resolve(src)) else {
+                    continue;
+                };
                 if !resolved_images
                     .iter()
                     .any(|(existing, _, _)| existing == &url)
@@ -1780,7 +1940,13 @@ impl MistilteinnApp {
         // process-wide, so leaving them would let one page's fonts leak into
         // the next.
         crate::render::text::clear_web_fonts();
-        Self::load_web_fonts(&new_page.stylesheet.font_faces, &resolve).await;
+        Self::load_web_fonts(
+            &new_page.stylesheet.font_faces,
+            &resolve,
+            &document_url,
+            csp,
+        )
+        .await;
 
         // Fetch all images concurrently with throttling
         use futures::StreamExt;
@@ -2557,6 +2723,29 @@ impl MistilteinnApp {
 
     /// Sets the winit window cursor icon from a computed CSS `cursor`.
     #[allow(deprecated)]
+    /// Record whether the document now showing came from the browser itself.
+    fn mark_page_internal(&mut self, internal: bool) {
+        if let Some(tab) = self.tab_manager.active_tab_mut() {
+            tab.is_internal_page = internal;
+        }
+    }
+
+    /// Whether a navigation to `url` is allowed to start from the current page.
+    ///
+    /// The browser's own pages are a different origin from any site, and some
+    /// of them act on the user's behalf — the certificate warning's "proceed"
+    /// link grants an exception. A site that could link to one would be
+    /// pressing that button itself, so only a page the browser produced, or
+    /// the address bar, may reach them.
+    fn may_navigate_to(&self, url: &str) -> bool {
+        if !url.starts_with(crate::network::INTERNAL_SCHEME) {
+            return true;
+        }
+        self.tab_manager
+            .active_tab()
+            .is_some_and(|tab| tab.is_internal_page)
+    }
+
     /// Save or unsave the page in the active tab.
     fn toggle_bookmark(&mut self) {
         let Some(tab) = self.tab_manager.active_tab() else {
@@ -3203,6 +3392,13 @@ impl ApplicationHandler for MistilteinnApp {
                                                 log::info!("Jumped to anchor #{target_id}");
                                             }
                                         } else if let Some(target_url) = link_to_navigate {
+                                            if !self.may_navigate_to(&target_url) {
+                                                log::warn!(
+                                                    "refused a link to the browser's own page: {target_url}"
+                                                );
+                                                self.recompose();
+                                                return;
+                                            }
                                             log::info!(
                                                 "Clicked link, navigating to: {}",
                                                 target_url
@@ -3874,6 +4070,58 @@ mod tests {
         }
         let max_y = app.max_scroll(1280, 800).1;
         assert_eq!(app.tab_manager.get_active_tab_scroll().unwrap().1, max_y);
+    }
+
+    #[test]
+    fn a_site_cannot_navigate_to_the_browsers_own_pages() {
+        // The certificate warning's "proceed" link grants an exception to a
+        // host; a page that could link to it would be pressing that button on
+        // the user's behalf.
+        let mut app = app_with_page(crate::page::Page::new(
+            "<html><body></body></html>",
+            "",
+            1080.0,
+            760.0,
+        ));
+
+        app.mark_page_internal(false);
+        assert!(!app.may_navigate_to(BOOKMARKS_URL));
+        assert!(!app.may_navigate_to(&format!("{PROCEED_INSECURE_URL}https://evil.example/")));
+        assert!(
+            app.may_navigate_to("https://example.com/"),
+            "ordinary links are unaffected"
+        );
+
+        app.mark_page_internal(true);
+        assert!(
+            app.may_navigate_to(BOOKMARKS_URL),
+            "the browser's own pages may link to each other"
+        );
+    }
+
+    #[test]
+    fn an_internal_url_is_not_resolved_as_a_relative_path() {
+        // The warning page is shown at the failed site's URL, so its own
+        // "proceed" link would otherwise be resolved against that site.
+        assert_eq!(
+            crate::network::resolve_url("https://untrusted.example/page", BOOKMARKS_URL),
+            BOOKMARKS_URL
+        );
+    }
+
+    #[test]
+    fn the_certificate_warning_names_the_host_and_offers_a_way_out() {
+        let page = certificate_warning_page(
+            "https://untrusted.example/",
+            "untrusted.example",
+            "invalid peer certificate: UnknownIssuer",
+        );
+        assert!(page.contains("untrusted.example"));
+        assert!(page.contains("ERR_CERT_AUTHORITY_INVALID"));
+        assert!(
+            page.contains(&format!("{PROCEED_INSECURE_URL}https://untrusted.example/")),
+            "the proceed link carries the URL to retry"
+        );
     }
 
     #[test]

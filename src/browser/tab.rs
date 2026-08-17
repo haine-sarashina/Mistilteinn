@@ -15,6 +15,11 @@ pub struct Tab {
     pub scroll_offset: (f32, f32),
     /// Page zoom for this tab, 1.0 being 100%.
     pub zoom: f32,
+    /// Whether the document showing here was produced by the browser itself
+    /// rather than fetched. Only such a page may navigate to an internal URL:
+    /// some of them act on the user's behalf, and a site must not be able to
+    /// drive them by linking to one.
+    pub is_internal_page: bool,
     pub is_loading: bool,
     pub history: Vec<String>,
     pub history_index: usize,
@@ -119,6 +124,7 @@ impl TabManager {
                 page: None,
                 scroll_offset: (0.0, 0.0),
                 zoom: 1.0,
+                is_internal_page: false,
                 is_loading: false,
                 history: Vec::new(),
                 history_index: 0,

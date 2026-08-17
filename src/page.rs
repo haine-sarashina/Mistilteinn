@@ -73,6 +73,29 @@ impl Page {
 impl Page {
     /// Run the full pipeline: parse HTML + CSS, compute styles, build and measure layout tree.
     pub fn new(html_source: &str, css_source: &str, view_width: f32, view_height: f32) -> Self {
+        Self::new_with_csp(
+            html_source,
+            css_source,
+            view_width,
+            view_height,
+            &crate::network::security::Csp::default(),
+        )
+    }
+
+    /// Build a page under the given Content-Security-Policy.
+    ///
+    /// The policy has to be known here rather than applied afterwards: this is
+    /// where the document's inline scripts run, and refusing to run them is the
+    /// most common thing a CSP is set up to do.
+    pub fn new_with_csp(
+        html_source: &str,
+        css_source: &str,
+        view_width: f32,
+        view_height: f32,
+        csp: &crate::network::security::Csp,
+    ) -> Self {
+        use crate::network::security::ResourceKind;
+
         // Stage 1: Parse HTML into DOM arena
         let arena = html::parse_html(html_source);
         let title = arena
@@ -85,8 +108,15 @@ impl Page {
         // listeners that have to survive to be called later.
         let mut js_context = crate::js::init_js_engine_with_arena(arena.clone());
         let scripts = arena.extract_scripts();
-        for script in scripts {
-            crate::js::execute_script(&mut js_context, &script);
+        if csp.allows_inline(ResourceKind::Script) {
+            for script in scripts {
+                crate::js::execute_script(&mut js_context, &script);
+            }
+        } else if !scripts.is_empty() {
+            log::warn!(
+                "{} inline script(s) blocked by this page's Content-Security-Policy",
+                scripts.len()
+            );
         }
 
         // Stage 2: Parse CSS into author stylesheet
@@ -838,6 +868,48 @@ mod tests {
         assert!(
             (center_x - (400.0 - w) / 2.0).abs() < 1.0,
             "center should split the free space: x={center_x}, width={w}"
+        );
+    }
+
+    /// A page whose inline script rewrites an element, built under `policy`.
+    fn scripted_page(policy: &[&str]) -> Page {
+        let html = "<html><body><div id='greeting'>before</div>\
+                    <script>document.getElementById('greeting').textContent = 'after';</script>\
+                    </body></html>";
+        let policies: Vec<String> = policy.iter().map(|p| p.to_string()).collect();
+        Page::new_with_csp(
+            html,
+            "",
+            800.0,
+            600.0,
+            &crate::network::security::Csp::parse(&policies),
+        )
+    }
+
+    fn greeting(page: &Page) -> String {
+        let id = page.arena.find_by_id("greeting").unwrap();
+        page.arena.get_text_content(id)
+    }
+
+    #[test]
+    fn a_page_with_no_policy_runs_its_inline_scripts() {
+        assert_eq!(greeting(&scripted_page(&[])), "after");
+    }
+
+    #[test]
+    fn a_policy_without_unsafe_inline_stops_an_inline_script_running() {
+        // Blocking inline script is the single most common thing a CSP is set
+        // up to do, and this engine does run inline scripts — so the policy has
+        // to be known before the document is built, not applied afterwards.
+        assert_eq!(greeting(&scripted_page(&["script-src 'self'"])), "before");
+        assert_eq!(greeting(&scripted_page(&["default-src 'none'"])), "before");
+    }
+
+    #[test]
+    fn a_policy_that_permits_inline_script_lets_it_run() {
+        assert_eq!(
+            greeting(&scripted_page(&["script-src 'self' 'unsafe-inline'"])),
+            "after"
         );
     }
 

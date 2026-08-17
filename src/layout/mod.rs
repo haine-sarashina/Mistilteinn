@@ -1573,10 +1573,14 @@ fn compute_block_children(
             let child_height =
                 child_content_height + pad_top + pad_bottom + border_top + border_bottom;
 
-            let mut child_width = if let Some(ew) = c.explicit_width {
-                ew.min(available_width - margin_left - margin_right)
-            } else {
-                available_width - margin_left - margin_right
+            // A specified width is used as specified. CSS does not shrink it to
+            // fit the containing block — the box overflows instead, and only
+            // `max-width` may cut it down. Clamping it here made a box narrower
+            // than the content sized from that same width, which is how a
+            // Wikipedia image frame ended up narrower than the image in it.
+            let mut child_width = match c.explicit_width {
+                Some(ew) => ew,
+                None => available_width - margin_left - margin_right,
             };
 
             if let Some(max_w) = c.max_width {
@@ -1631,7 +1635,12 @@ fn compute_block_children(
                     available_width,
                 );
                 child_x = cx + margin_left;
-                child_width = (cw - margin_left - margin_right).min(child_width);
+                // Only an auto width gives way to a float. A specified width
+                // stays as specified and overflows if it must — narrowing it
+                // here is what left an image frame narrower than its image.
+                if c.explicit_width.is_none() {
+                    child_width = (cw - margin_left - margin_right).min(child_width);
+                }
             }
 
             parent.children[i].rect = Rect::new(child_x, child_y, child_width, child_height);

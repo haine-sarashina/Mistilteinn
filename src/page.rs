@@ -611,6 +611,80 @@ mod tests {
         found
     }
 
+    /// The rect of the element with the given id.
+    fn rect_of(page: &Page, id: &str) -> Rect {
+        let dom_id = page.arena.find_by_id(id).expect("element is in the DOM");
+        crate::layout::find_layout_rect_by_dom_id(&page.layout_root, dom_id)
+            .expect("element is laid out")
+    }
+
+    #[test]
+    fn a_specified_width_is_not_shrunk_to_the_containing_block() {
+        // CSS uses a specified width as specified; the box overflows rather than
+        // shrinking. Clamping it left a bordered box narrower than the content
+        // sized from that same width — a frame narrower than its image.
+        let page = Page::new(
+            "<html><body><div class='outer'><div id='wide'></div></div></body></html>",
+            "body { margin: 0 } .outer { width: 200px } \
+             #wide { width: 500px; border: 1px solid black }",
+            800.0,
+            600.0,
+        );
+        assert_eq!(rect_of(&page, "wide").width, 500.0);
+    }
+
+    #[test]
+    fn max_width_still_cuts_a_specified_width_down() {
+        // Removing the containing-block clamp must not remove the one clamp CSS
+        // does apply.
+        let page = Page::new(
+            "<html><body><div id='capped'></div></body></html>",
+            "body { margin: 0 } #capped { width: 500px; max-width: 300px }",
+            800.0,
+            600.0,
+        );
+        assert_eq!(rect_of(&page, "capped").width, 300.0);
+    }
+
+    #[test]
+    fn a_box_with_a_specified_width_does_not_give_way_to_a_float() {
+        // Narrowing a block to sit beside a float is for auto widths. A
+        // specified width stays specified — this is the path the Wikipedia
+        // image frame went through, since `display: flex` establishes a BFC.
+        let page = Page::new(
+            "<html><body>\
+             <div class='f'></div><div id='flex'></div>\
+             </body></html>",
+            "body { margin: 0 } .f { float: left; width: 300px; height: 100px } \
+             #flex { display: flex; width: 600px; border: 1px solid black }",
+            800.0,
+            600.0,
+        );
+        assert_eq!(
+            rect_of(&page, "flex").width,
+            600.0,
+            "the specified width survives the float narrowing"
+        );
+    }
+
+    #[test]
+    fn an_auto_width_block_is_left_to_the_float_logic() {
+        // The narrowing guard keys off `explicit_width`, so an auto-width box
+        // must reach the float code exactly as before. Asserting the width here
+        // would pin unrelated float behaviour, so this only pins that no width
+        // was invented for it.
+        let page = Page::new(
+            "<html><body><div class='f'></div><div id='auto'></div></body></html>",
+            "body { margin: 0 } .f { float: left; width: 300px; height: 100px } \
+             #auto { display: flex; height: 50px }",
+            800.0,
+            600.0,
+        );
+        let dom_id = page.arena.find_by_id("auto").unwrap();
+        assert_eq!(page.styles.get(&dom_id).unwrap().explicit_width, None);
+        assert!(rect_of(&page, "auto").width > 0.0);
+    }
+
     #[test]
     fn an_inline_block_shrinks_to_fit_instead_of_collapsing_to_a_pixel() {
         // An inline-block's rect is empty when inline box collection reads it,

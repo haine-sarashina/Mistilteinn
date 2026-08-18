@@ -301,6 +301,66 @@ fn fit_label(
     "…".to_string()
 }
 
+/// Move the page's rectangles onto the screen and cut them to its pane.
+///
+/// The cut is what keeps the page inside the middle pane. These go to the GPU
+/// after the chrome, so anything sticking out is drawn over it: a box wider
+/// than the window painted across the bookmark pane, and scrolling sideways
+/// dragged the page over the tab bar. The composite bitmap has always been
+/// trimmed the same way.
+fn page_rects_on_screen(
+    rects: Vec<(crate::layout::Rect, Option<[u8; 4]>)>,
+    scroll: (f32, f32),
+    content_area: crate::layout::Rect,
+) -> Vec<(crate::layout::Rect, Option<[u8; 4]>)> {
+    rects
+        .into_iter()
+        .filter_map(|(r, colour)| {
+            let on_screen = crate::layout::Rect::new(
+                r.x - scroll.0 + content_area.x,
+                r.y - scroll.1 + content_area.y,
+                r.width,
+                r.height,
+            );
+            on_screen
+                .intersect(&content_area)
+                .map(|visible| (visible, colour))
+        })
+        .collect()
+}
+
+/// Shorten a label to fit `max_width`, keeping its end rather than its start.
+///
+/// What the address bar needs while it is being typed into: the caret is at
+/// the end, so that is the part that has to stay on screen.
+fn fit_label_from_end(
+    text_renderer: &mut TextRenderer,
+    label: &str,
+    font_size: f32,
+    max_width: f32,
+) -> String {
+    if max_width <= 0.0 || label.is_empty() {
+        return String::new();
+    }
+    if text_renderer.measure(label, font_size, "sans-serif").0 <= max_width {
+        return label.to_string();
+    }
+
+    let chars: Vec<char> = label.chars().collect();
+    let mut keep = chars.len().saturating_sub(1);
+    while keep > 0 {
+        let candidate: String =
+            "…".to_string() + &chars[chars.len() - keep..].iter().collect::<String>();
+        if text_renderer.measure(&candidate, font_size, "sans-serif").0 <= max_width {
+            return candidate;
+        }
+        // Drop several characters at a time to start with: a long URL in a
+        // narrow bar would otherwise be measured hundreds of times a frame.
+        keep -= if keep > 32 { 8 } else { 1 };
+    }
+    "…".to_string()
+}
+
 /// The coordinate of a point along one axis.
 fn along(axis: Axis, x: f32, y: f32) -> f32 {
     match axis {
@@ -847,14 +907,17 @@ impl MistilteinnApp {
                         } else {
                             &tab.title
                         };
+                        let width =
+                            TAB_BAR_WIDTH as f32 - TAB_BUTTON_X - TAB_BUTTON_RIGHT_MARGIN - 30.0;
+                        let title = fit_label(text_renderer, title, 13.0, width);
                         text_renderer.rasterize_to_bitmap(
-                            title,
+                            &title,
                             13.0,
                             "sans-serif",
                             text_color,
                             TAB_BUTTON_X + 12.0,
                             y + 11.0,
-                            TAB_BAR_WIDTH as f32 - TAB_BUTTON_X - TAB_BUTTON_RIGHT_MARGIN - 30.0,
+                            width,
                             buffer,
                             win_w,
                             win_h,
@@ -885,14 +948,16 @@ impl MistilteinnApp {
                 } else {
                     &tab.title
                 };
+                let width = TAB_BAR_WIDTH as f32 - TAB_BUTTON_X - TAB_BUTTON_RIGHT_MARGIN - 30.0;
+                let title = fit_label(text_renderer, title, 13.0, width);
                 text_renderer.rasterize_to_bitmap(
-                    title,
+                    &title,
                     13.0,
                     "sans-serif",
                     text_color,
                     TAB_BUTTON_X + 12.0,
                     y + 11.0,
-                    TAB_BAR_WIDTH as f32 - TAB_BUTTON_X - TAB_BUTTON_RIGHT_MARGIN - 30.0,
+                    width,
                     buffer,
                     win_w,
                     win_h,
@@ -1002,6 +1067,17 @@ impl MistilteinnApp {
             [0.8, 0.8, 0.8, 1.0]
         };
 
+        // The rasterizer wraps rather than clips, and the address bar is one
+        // line tall: a URL too long for the box was drawn a second time across
+        // the first. Narrowing the window made every long URL unreadable.
+        let available = addr_box.width - 20.0;
+        let display_text = if self.is_address_focused {
+            // Keep the end, where the caret is, rather than the start.
+            fit_label_from_end(text_renderer, &display_text, 16.0, available)
+        } else {
+            fit_label(text_renderer, &display_text, 16.0, available)
+        };
+
         text_renderer.rasterize_to_bitmap(
             &display_text,
             16.0,
@@ -1009,7 +1085,7 @@ impl MistilteinnApp {
             addr_color,
             addr_box_x + 10.0,
             10.0,
-            addr_box.width - 20.0,
+            available,
             buffer,
             win_w,
             win_h,
@@ -1093,7 +1169,7 @@ impl MistilteinnApp {
                 "右上のボタンで現在のページを保存",
                 12.0,
                 "sans-serif",
-                [0.55, 0.55, 0.6, 1.0],
+                [0.72, 0.72, 0.78, 1.0],
                 pane.x + 12.0,
                 pane.y + BOOKMARK_HEADER_HEIGHT + 8.0,
                 pane.width - 24.0,
@@ -1225,31 +1301,32 @@ impl MistilteinnApp {
         // Collect render rectangles from layout tree and convert to clip space
         let rects = page.collect_rects();
 
-        // Shift page content by chrome offset and apply scroll, then convert to clip space
-        let mut page_clip_rects: Vec<(RectClip, Option<[u8; 4]>)> = Vec::new();
-        for (mut r, c) in rects.into_iter() {
-            // Apply scroll offset by shifting rect position
-            r.x -= scroll_offset.0;
-            r.y -= scroll_offset.1;
+        // Shift page content by chrome offset and apply scroll, then cut it to
+        // the middle pane and convert to clip space.
+        //
+        // The cut is what keeps the page inside its own pane. These rectangles
+        // go to the GPU after the chrome, so anything sticking out of the page
+        // area is drawn over the chrome: a box wider than the window painted
+        // over the bookmark pane, and scrolling sideways dragged the page
+        // across the tab bar. The composite bitmap has always been trimmed the
+        // same way, a few steps further down.
+        let content_area = crate::layout::Rect::new(
+            TAB_BAR_WIDTH as f32,
+            ADDRESS_BAR_HEIGHT as f32,
+            content_width,
+            (win_h as f32 - ADDRESS_BAR_HEIGHT as f32).max(0.0),
+        );
 
-            // Shift to account for tab bar width and address bar height
-            let final_x = r.x + TAB_BAR_WIDTH as f32;
-            let final_y = r.y + ADDRESS_BAR_HEIGHT as f32;
-
-            if r.width > 0.0 && r.height > 0.0 {
-                page_clip_rects.push((
-                    layout_to_clip(
-                        final_x,
-                        final_y,
-                        r.width,
-                        r.height,
-                        win_w as f32,
-                        win_h as f32,
-                    ),
-                    c,
-                ));
-            }
-        }
+        let page_clip_rects: Vec<(RectClip, Option<[u8; 4]>)> =
+            page_rects_on_screen(rects, scroll_offset, content_area)
+                .into_iter()
+                .map(|(r, c)| {
+                    (
+                        layout_to_clip(r.x, r.y, r.width, r.height, win_w as f32, win_h as f32),
+                        c,
+                    )
+                })
+                .collect();
 
         // Merge chrome rects + page rects into single buffer for GPU upload
         let mut all_rects: Vec<RectClip> = chrome_rects;
@@ -4435,6 +4512,100 @@ mod tests {
         app_with_page(page)
     }
 
+    /// The middle pane of a 1280x800 window with the bookmark pane open.
+    fn content_area() -> crate::layout::Rect {
+        let app = MistilteinnApp::new(None);
+        let (win_w, win_h) = TEST_WINDOW;
+        crate::layout::Rect::new(
+            TAB_BAR_WIDTH as f32,
+            ADDRESS_BAR_HEIGHT as f32,
+            app.content_width(win_w),
+            win_h as f32 - ADDRESS_BAR_HEIGHT as f32,
+        )
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> crate::layout::Rect {
+        crate::layout::Rect::new(x, y, w, h)
+    }
+
+    #[test]
+    fn a_page_box_is_placed_below_and_right_of_the_chrome() {
+        let area = content_area();
+        let placed =
+            page_rects_on_screen(vec![(rect(0.0, 0.0, 100.0, 50.0), None)], (0.0, 0.0), area);
+        assert_eq!(placed.len(), 1);
+        assert_eq!((placed[0].0.x, placed[0].0.y), (area.x, area.y));
+    }
+
+    #[test]
+    fn a_box_wider_than_the_page_area_is_cut_at_the_bookmark_pane() {
+        // This is what broke on resize: the page's rectangles go to the GPU
+        // after the chrome, so an over-wide one painted across the pane.
+        let area = content_area();
+        let placed = page_rects_on_screen(
+            vec![(rect(0.0, 0.0, 5000.0, 50.0), Some([255, 255, 255, 255]))],
+            (0.0, 0.0),
+            area,
+        );
+        assert_eq!(placed[0].0.right(), area.right());
+        assert!(
+            placed[0].0.right() < TEST_WINDOW.0 as f32,
+            "the page must stop before the window edge while the pane is open"
+        );
+    }
+
+    #[test]
+    fn scrolling_sideways_does_not_drag_the_page_over_the_tab_bar() {
+        let area = content_area();
+        let placed = page_rects_on_screen(
+            vec![(rect(0.0, 0.0, 400.0, 50.0), None)],
+            (300.0, 0.0),
+            area,
+        );
+        assert_eq!(placed[0].0.x, area.x, "cut at the tab bar, not before it");
+        assert_eq!(placed[0].0.width, 100.0, "only the part still on screen");
+    }
+
+    #[test]
+    fn scrolling_down_does_not_drag_the_page_over_the_address_bar() {
+        let area = content_area();
+        let placed = page_rects_on_screen(
+            vec![(rect(0.0, 0.0, 100.0, 400.0), None)],
+            (0.0, 300.0),
+            area,
+        );
+        assert_eq!(placed[0].0.y, area.y);
+        assert_eq!(placed[0].0.height, 100.0);
+    }
+
+    #[test]
+    fn a_box_scrolled_out_of_view_is_dropped_rather_than_drawn_somewhere_else() {
+        let area = content_area();
+        let placed = page_rects_on_screen(
+            vec![(rect(0.0, 0.0, 100.0, 50.0), None)],
+            (0.0, 5000.0),
+            area,
+        );
+        assert!(placed.is_empty());
+    }
+
+    #[test]
+    fn closing_the_bookmark_pane_gives_the_page_the_width_back() {
+        let mut app = MistilteinnApp::new(None);
+        app.bookmark_pane_open = false;
+        let (win_w, win_h) = TEST_WINDOW;
+        let area = crate::layout::Rect::new(
+            TAB_BAR_WIDTH as f32,
+            ADDRESS_BAR_HEIGHT as f32,
+            app.content_width(win_w),
+            win_h as f32 - ADDRESS_BAR_HEIGHT as f32,
+        );
+
+        let placed =
+            page_rects_on_screen(vec![(rect(0.0, 0.0, 5000.0, 50.0), None)], (0.0, 0.0), area);
+        assert_eq!(placed[0].0.right(), win_w as f32);
+    }
+
     #[test]
     fn test_scrollbar_metrics_no_page() {
         let app = MistilteinnApp::new(None);
@@ -4774,6 +4945,43 @@ mod tests {
         assert!(fitted.chars().count() < long.chars().count());
         assert!(fitted.ends_with('…'));
         assert!(renderer.measure(&fitted, 12.0, "sans-serif").0 <= 80.0);
+    }
+
+    #[test]
+    fn a_url_too_long_for_the_address_bar_is_cut_rather_than_wrapped() {
+        // The address bar is one line tall and the rasterizer wraps, so a long
+        // URL was drawn a second time across the first. Narrowing the window
+        // made every long URL unreadable.
+        let mut renderer = TextRenderer::new();
+        let url = "https://ja.wikipedia.org/wiki/%E3%83%A1%E3%82%A4%E3%83%B3%E3%83%9A";
+
+        let fitted = fit_label(&mut renderer, url, 16.0, 200.0);
+        assert!(renderer.measure(&fitted, 16.0, "sans-serif").0 <= 200.0);
+        assert!(fitted.starts_with("https://"), "the host stays readable");
+    }
+
+    #[test]
+    fn a_url_being_typed_keeps_its_end_where_the_caret_is() {
+        let mut renderer = TextRenderer::new();
+        let url = "https://example.com/a/very/long/path/that/is/being/typed/right/now";
+
+        let fitted = fit_label_from_end(&mut renderer, url, 16.0, 160.0);
+        assert!(renderer.measure(&fitted, 16.0, "sans-serif").0 <= 160.0);
+        assert!(fitted.starts_with('…'));
+        assert!(fitted.ends_with("now"), "the caret end is what is kept");
+    }
+
+    #[test]
+    fn a_short_url_is_shown_whole_from_either_end() {
+        let mut renderer = TextRenderer::new();
+        assert_eq!(
+            fit_label(&mut renderer, "a.example", 16.0, 400.0),
+            "a.example"
+        );
+        assert_eq!(
+            fit_label_from_end(&mut renderer, "a.example", 16.0, 400.0),
+            "a.example"
+        );
     }
 
     #[test]

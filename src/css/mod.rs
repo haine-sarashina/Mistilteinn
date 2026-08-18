@@ -1479,8 +1479,328 @@ pub struct ComputedValues {
     /// `content` — what a `::before` or `::after` puts on the page. Empty on
     /// an ordinary element, which generates nothing.
     pub content: Content,
+    /// `transform` — how the box is moved, scaled or turned when it is painted.
+    pub transform: Transform,
+    /// `transform-origin` — the point that is done about.
+    pub transform_origin: TransformOrigin,
     // CSS Custom Properties (CSS variables --*)
     pub custom_properties: rustc_hash::FxHashMap<String, String>,
+}
+
+/// A `transform` function, before it is resolved against a box.
+///
+/// Kept as written rather than folded into a matrix straight away: a
+/// percentage translate is a fraction of the box's own size, which is not
+/// known until the box has been laid out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TransformFn {
+    Translate {
+        x: LengthOrPercent,
+        y: LengthOrPercent,
+    },
+    Scale {
+        x: f32,
+        y: f32,
+    },
+    Rotate {
+        radians: f32,
+    },
+    /// `matrix(a, b, c, d, e, f)`, and anything else that reduces to one.
+    Matrix([f32; 6]),
+}
+
+/// A length that may be written as a percentage of something.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LengthOrPercent {
+    pub px: f32,
+    /// A fraction, so `50%` is 0.5.
+    pub percent: f32,
+}
+
+impl LengthOrPercent {
+    /// Resolve against the length a percentage refers to.
+    pub fn resolve(&self, basis: f32) -> f32 {
+        self.px + self.percent * basis
+    }
+
+    fn parse(token: &str, ctx: LengthContext) -> Option<Self> {
+        let token = token.trim();
+        if let Some(percent) = token.strip_suffix('%') {
+            return percent.trim().parse::<f32>().ok().map(|p| Self {
+                px: 0.0,
+                percent: p / 100.0,
+            });
+        }
+        parse_length_ctx(token, ctx).map(|px| Self { px, percent: 0.0 })
+    }
+}
+
+/// An affine transform, as the painter needs it.
+///
+/// The same six numbers CSS and SVG use: `x' = a*x + c*y + e`,
+/// `y' = b*x + d*y + f`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Matrix {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+
+impl Default for Matrix {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl Matrix {
+    pub const IDENTITY: Self = Self {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
+
+    /// `self` followed by `other`.
+    pub fn then(&self, other: &Matrix) -> Matrix {
+        Matrix {
+            a: self.a * other.a + self.b * other.c,
+            b: self.a * other.b + self.b * other.d,
+            c: self.c * other.a + self.d * other.c,
+            d: self.c * other.b + self.d * other.d,
+            e: self.e * other.a + self.f * other.c + other.e,
+            f: self.e * other.b + self.f * other.d + other.f,
+        }
+    }
+
+    /// Where this transform sends a point.
+    pub fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+
+    pub fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+
+    /// Whether this only moves and scales, leaving the axes where they are.
+    ///
+    /// The compositor paints axis-aligned rectangles and upright glyphs, so a
+    /// rotation or a skew is not something it can carry out.
+    pub fn is_axis_aligned(&self) -> bool {
+        self.b.abs() < 1e-4 && self.c.abs() < 1e-4
+    }
+}
+
+/// The computed `transform` property.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Transform {
+    functions: Vec<TransformFn>,
+}
+
+/// The point a transform is applied about — the computed `transform-origin`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransformOrigin {
+    pub x: LengthOrPercent,
+    pub y: LengthOrPercent,
+}
+
+impl Default for TransformOrigin {
+    /// The centre of the box, as CSS says.
+    fn default() -> Self {
+        Self {
+            x: LengthOrPercent {
+                px: 0.0,
+                percent: 0.5,
+            },
+            y: LengthOrPercent {
+                px: 0.0,
+                percent: 0.5,
+            },
+        }
+    }
+}
+
+impl TransformOrigin {
+    fn parse(value: &str, ctx: LengthContext) -> Self {
+        let mut origin = Self::default();
+        let fraction = |percent: f32| LengthOrPercent { px: 0.0, percent };
+        let mut positional = Vec::new();
+
+        for token in value.split_whitespace() {
+            match token.to_ascii_lowercase().as_str() {
+                "left" => origin.x = fraction(0.0),
+                "right" => origin.x = fraction(1.0),
+                "top" => origin.y = fraction(0.0),
+                "bottom" => origin.y = fraction(1.0),
+                // `center` alone means both axes; beside another keyword it
+                // only fills the axis that keyword did not.
+                "center" => {}
+                other => {
+                    if let Some(length) = LengthOrPercent::parse(other, ctx) {
+                        positional.push(length);
+                    }
+                }
+            }
+        }
+        if let Some(x) = positional.first() {
+            origin.x = *x;
+        }
+        if let Some(y) = positional.get(1) {
+            origin.y = *y;
+        }
+        origin
+    }
+}
+
+impl Transform {
+    pub fn is_none(&self) -> bool {
+        self.functions.is_empty()
+    }
+
+    /// Parse a `transform` value.
+    pub fn parse(value: &str, ctx: LengthContext) -> Self {
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("none") {
+            return Self::default();
+        }
+
+        let mut functions = Vec::new();
+        let mut rest = value;
+        while let Some(open) = rest.find('(') {
+            let name = rest[..open].trim().to_ascii_lowercase();
+            let Some(close) = rest[open..].find(')') else {
+                break;
+            };
+            let args: Vec<&str> = rest[open + 1..open + close]
+                .split(',')
+                .map(str::trim)
+                .collect();
+            rest = &rest[open + close + 1..];
+
+            let number = |index: usize| -> Option<f32> {
+                args.get(index).and_then(|a| a.parse::<f32>().ok())
+            };
+            let length = |index: usize| -> Option<LengthOrPercent> {
+                args.get(index).and_then(|a| LengthOrPercent::parse(a, ctx))
+            };
+
+            let parsed = match name.as_str() {
+                "translate" => length(0).map(|x| TransformFn::Translate {
+                    x,
+                    y: length(1).unwrap_or_default(),
+                }),
+                "translatex" => length(0).map(|x| TransformFn::Translate {
+                    x,
+                    y: LengthOrPercent::default(),
+                }),
+                "translatey" => length(0).map(|y| TransformFn::Translate {
+                    x: LengthOrPercent::default(),
+                    y,
+                }),
+                "scale" => number(0).map(|x| TransformFn::Scale {
+                    x,
+                    // `scale(2)` scales both axes.
+                    y: number(1).unwrap_or(x),
+                }),
+                "scalex" => number(0).map(|x| TransformFn::Scale { x, y: 1.0 }),
+                "scaley" => number(0).map(|y| TransformFn::Scale { x: 1.0, y }),
+                "rotate" => parse_angle(args.first().copied().unwrap_or(""))
+                    .map(|radians| TransformFn::Rotate { radians }),
+                "matrix" => {
+                    let values: Vec<f32> = (0..6).filter_map(number).collect();
+                    (values.len() == 6).then(|| {
+                        TransformFn::Matrix([
+                            values[0], values[1], values[2], values[3], values[4], values[5],
+                        ])
+                    })
+                }
+                // 3D transforms, skew and perspective are not modelled; an
+                // unrecognised function leaves the rest of the list intact.
+                _ => None,
+            };
+            functions.extend(parsed);
+        }
+
+        Self { functions }
+    }
+
+    /// The matrix this comes to for a box of the given size.
+    ///
+    /// Percentages resolve against the box, and the whole thing happens about
+    /// `origin` — which is why the box has to be known first.
+    pub fn resolve(&self, width: f32, height: f32, origin: TransformOrigin) -> Matrix {
+        if self.functions.is_empty() {
+            return Matrix::IDENTITY;
+        }
+
+        let mut matrix = Matrix::IDENTITY;
+        // CSS applies the right-most function to the point first, as though
+        // each function nested inside the one to its left. Composing "this
+        // step, then everything gathered so far" while reading left to right
+        // builds exactly that.
+        for function in self.functions.iter() {
+            let step = match *function {
+                TransformFn::Translate { x, y } => Matrix {
+                    e: x.resolve(width),
+                    f: y.resolve(height),
+                    ..Matrix::IDENTITY
+                },
+                TransformFn::Scale { x, y } => Matrix {
+                    a: x,
+                    d: y,
+                    ..Matrix::IDENTITY
+                },
+                TransformFn::Rotate { radians } => Matrix {
+                    a: radians.cos(),
+                    b: radians.sin(),
+                    c: -radians.sin(),
+                    d: radians.cos(),
+                    ..Matrix::IDENTITY
+                },
+                TransformFn::Matrix([a, b, c, d, e, f]) => Matrix { a, b, c, d, e, f },
+            };
+            matrix = step.then(&matrix);
+        }
+
+        // Move the point everything turns about to the origin, transform, and
+        // move it back.
+        let (ox, oy) = (origin.x.resolve(width), origin.y.resolve(height));
+        let to_origin = Matrix {
+            e: -ox,
+            f: -oy,
+            ..Matrix::IDENTITY
+        };
+        let back = Matrix {
+            e: ox,
+            f: oy,
+            ..Matrix::IDENTITY
+        };
+        to_origin.then(&matrix).then(&back)
+    }
+}
+
+/// Parse a CSS angle into radians.
+fn parse_angle(token: &str) -> Option<f32> {
+    let token = token.trim().to_ascii_lowercase();
+    let (number, factor) = if let Some(n) = token.strip_suffix("deg") {
+        (n, std::f32::consts::PI / 180.0)
+    } else if let Some(n) = token.strip_suffix("rad") {
+        (n, 1.0)
+    } else if let Some(n) = token.strip_suffix("turn") {
+        (n, std::f32::consts::TAU)
+    } else if let Some(n) = token.strip_suffix("grad") {
+        (n, std::f32::consts::PI / 200.0)
+    } else {
+        (token.as_str(), std::f32::consts::PI / 180.0)
+    };
+    number.trim().parse::<f32>().ok().map(|n| n * factor)
 }
 
 /// The `content` property: what a generated box puts on the page.
@@ -1913,6 +2233,8 @@ impl Default for ComputedValues {
             cursor: Cursor::Auto,
             z_index: None,
             content: Content::default(),
+            transform: Transform::default(),
+            transform_origin: TransformOrigin::default(),
             custom_properties: rustc_hash::FxHashMap::default(),
         }
     }
@@ -2580,6 +2902,12 @@ impl ComputedValues {
             }
             "content" => {
                 self.content = Content::parse(val);
+            }
+            "transform" => {
+                self.transform = Transform::parse(val, ctx);
+            }
+            "transform-origin" => {
+                self.transform_origin = TransformOrigin::parse(val, ctx);
             }
             "z-index" => {
                 // `auto` (and anything unparseable) leaves the element in
@@ -3624,6 +3952,147 @@ pub fn merge_stylesheets_with_author(
         media_rules: author.media_rules.clone(),
         // The UA sheet declares no web fonts.
         font_faces: author.font_faces.clone(),
+    }
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+
+    fn transform(value: &str) -> Transform {
+        Transform::parse(value, LengthContext::default())
+    }
+
+    /// The matrix a value comes to for a 100x50 box, about its default centre.
+    fn matrix(value: &str) -> Matrix {
+        transform(value).resolve(100.0, 50.0, TransformOrigin::default())
+    }
+
+    #[test]
+    fn none_and_nonsense_leave_the_box_alone() {
+        assert!(transform("none").is_none());
+        assert!(transform("").is_none());
+        assert!(transform("wobble(3)").is_none());
+        assert!(matrix("none").is_identity());
+    }
+
+    #[test]
+    fn a_translation_moves_the_box_by_the_length_given() {
+        let m = matrix("translate(10px, -4px)");
+        assert_eq!(m.apply(0.0, 0.0), (10.0, -4.0));
+        assert_eq!(matrix("translateX(7px)").apply(0.0, 0.0), (7.0, 0.0));
+        assert_eq!(matrix("translateY(7px)").apply(0.0, 0.0), (0.0, 7.0));
+    }
+
+    #[test]
+    fn a_percentage_translation_is_a_fraction_of_the_box_itself() {
+        // `translate(-50%, -50%)` is how a page centres something, and it can
+        // only be resolved once the box has a size.
+        let m = matrix("translate(-50%, -50%)");
+        assert_eq!(m.apply(0.0, 0.0), (-50.0, -25.0));
+    }
+
+    #[test]
+    fn a_single_scale_argument_scales_both_axes() {
+        let m = matrix("scale(2)");
+        assert_eq!((m.a, m.d), (2.0, 2.0));
+        let m = matrix("scale(2, 3)");
+        assert_eq!((m.a, m.d), (2.0, 3.0));
+    }
+
+    #[test]
+    fn scaling_happens_about_the_centre_of_the_box_by_default() {
+        // The centre stays put and the edges move outwards, which is what
+        // makes a hover-grow effect grow in place.
+        let m = matrix("scale(2)");
+        assert_eq!(m.apply(50.0, 25.0), (50.0, 25.0), "the centre is fixed");
+        assert_eq!(m.apply(0.0, 0.0), (-50.0, -25.0), "the corner moves out");
+    }
+
+    #[test]
+    fn transform_origin_moves_the_point_it_all_happens_about() {
+        let origin = TransformOrigin {
+            x: LengthOrPercent::default(),
+            y: LengthOrPercent::default(),
+        };
+        let m = transform("scale(2)").resolve(100.0, 50.0, origin);
+        assert_eq!(m.apply(0.0, 0.0), (0.0, 0.0), "the top left is fixed now");
+        assert_eq!(m.apply(100.0, 50.0), (200.0, 100.0));
+    }
+
+    #[test]
+    fn transform_origin_keywords_name_the_corners() {
+        let ctx = LengthContext::default();
+        let top_left = TransformOrigin::parse("left top", ctx);
+        assert_eq!(top_left.x.percent, 0.0);
+        assert_eq!(top_left.y.percent, 0.0);
+
+        let bottom_right = TransformOrigin::parse("right bottom", ctx);
+        assert_eq!(bottom_right.x.percent, 1.0);
+        assert_eq!(bottom_right.y.percent, 1.0);
+
+        let default = TransformOrigin::default();
+        assert_eq!((default.x.percent, default.y.percent), (0.5, 0.5));
+    }
+
+    #[test]
+    fn a_list_of_functions_applies_right_to_left() {
+        // `translate(10px) scale(2)` scales first and then moves, so the point
+        // at the box's centre lands 10px along rather than 20.
+        let m = transform("translate(10px, 0) scale(2)").resolve(
+            100.0,
+            50.0,
+            TransformOrigin {
+                x: LengthOrPercent::default(),
+                y: LengthOrPercent::default(),
+            },
+        );
+        assert_eq!(m.apply(0.0, 0.0), (10.0, 0.0));
+        assert_eq!(m.apply(10.0, 0.0), (30.0, 0.0));
+    }
+
+    #[test]
+    fn a_rotation_is_parsed_in_whatever_unit_it_is_written() {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        for value in ["rotate(90deg)", "rotate(1.5708rad)", "rotate(0.25turn)"] {
+            let m = matrix(value);
+            assert!(
+                (m.b - quarter.sin()).abs() < 1e-3,
+                "{value} should be a quarter turn, got {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rotation_is_recognised_as_something_the_painter_cannot_do() {
+        // The compositor draws axis-aligned rectangles and upright glyphs.
+        assert!(!matrix("rotate(45deg)").is_axis_aligned());
+        assert!(matrix("scale(2) translate(4px)").is_axis_aligned());
+    }
+
+    #[test]
+    fn a_matrix_is_taken_as_written() {
+        let m = matrix("matrix(2, 0, 0, 3, 10, 20)");
+        assert_eq!((m.a, m.b, m.c, m.d), (2.0, 0.0, 0.0, 3.0));
+        // The origin bracketing still applies, so the centre stays put.
+        assert_eq!(m.apply(50.0, 25.0), (50.0 + 10.0, 25.0 + 20.0));
+    }
+
+    #[test]
+    fn the_property_reaches_computed_values() {
+        let computed = ComputedValues::default().from_declaration(&Declaration {
+            property: "transform".to_string(),
+            value: "translate(5px, 6px)".to_string(),
+            important: false,
+        });
+        assert!(!computed.transform.is_none());
+        assert_eq!(
+            computed
+                .transform
+                .resolve(10.0, 10.0, TransformOrigin::default())
+                .apply(0.0, 0.0),
+            (5.0, 6.0)
+        );
     }
 }
 

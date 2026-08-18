@@ -1076,6 +1076,146 @@ mod tests {
         assert!(texts(&page).starts_with('B'), "got {:?}", texts(&page));
     }
 
+    /// A page with one 100x50 box, styled by `css`.
+    fn transformed(css: &str) -> Page {
+        Page::new(
+            "<html><body><div id='box'>text</div></body></html>",
+            &format!(
+                "body {{ margin: 0 }} \
+                 #box {{ width: 100px; height: 50px; background-color: blue }} {css}"
+            ),
+            800.0,
+            600.0,
+        )
+    }
+
+    /// Where the blue box is actually painted, which is not where it was laid
+    /// out once a transform is involved.
+    fn painted_box(page: &Page) -> crate::layout::VisualDecoration {
+        crate::layout::build_display_list(&page.layout_root)
+            .into_iter()
+            .find_map(|entry| match entry.item {
+                crate::layout::PaintItem::Decoration(d)
+                    if d.background_color == Some([0, 0, 255, 255]) =>
+                {
+                    Some(d)
+                }
+                _ => None,
+            })
+            .expect("the box paints a background")
+    }
+
+    #[test]
+    fn an_elements_text_is_drawn_at_the_size_and_colour_the_element_says() {
+        // A text node has no style of its own, and taking the initial values
+        // for it meant every run came out 16px black: a heading was drawn at
+        // body size while the heading box knew its own size perfectly well.
+        let page = Page::new(
+            "<html><body><h1>Title</h1><p id='p'>para</p></body></html>",
+            "body { margin: 0 } #p { font-size: 30px; color: red }",
+            800.0,
+            600.0,
+        );
+        let runs = crate::layout::collect_text_nodes(&page.layout_root);
+
+        let heading = runs.iter().find(|r| r.text == "Title").expect("h1 text");
+        assert!(
+            heading.font_size > 16.0,
+            "the UA sheet makes an h1 2em, so its text is bigger than body text: {}",
+            heading.font_size
+        );
+
+        let para = runs.iter().find(|r| r.text == "para").expect("p text");
+        assert_eq!(para.font_size, 30.0);
+        assert_eq!(para.color, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_translated_box_paints_where_it_was_moved_to() {
+        let painted = painted_box(&transformed("#box { transform: translate(30px, 12px) }"));
+        assert_eq!((painted.x, painted.y), (30.0, 12.0));
+    }
+
+    #[test]
+    fn a_transform_does_not_move_the_box_in_the_flow() {
+        // A transform is a painting effect: the space the box took is still
+        // taken, and its neighbours do not move.
+        let page = Page::new(
+            "<html><body><div id='moved'></div><p id='after'>下</p></body></html>",
+            "body { margin: 0 } p { margin: 0 } \
+             #moved { width: 100px; height: 50px; transform: translate(0, 200px) }",
+            800.0,
+            600.0,
+        );
+        assert_eq!(
+            rect_of(&page, "after").y,
+            50.0,
+            "the paragraph follows the box's laid-out position, not its painted one"
+        );
+    }
+
+    #[test]
+    fn a_scaled_box_grows_about_its_centre() {
+        let painted = painted_box(&transformed("#box { transform: scale(2) }"));
+        assert_eq!((painted.width, painted.height), (200.0, 100.0));
+        assert_eq!(
+            (painted.x, painted.y),
+            (-50.0, -25.0),
+            "growing about the centre pushes the corner out by half"
+        );
+    }
+
+    #[test]
+    fn the_text_inside_a_transformed_box_travels_with_it() {
+        // The subtree moves as one; text left behind would sit outside the
+        // background it belongs to.
+        let page = transformed("#box { transform: translate(40px, 0) }");
+        let run = crate::layout::collect_text_nodes(&page.layout_root)
+            .into_iter()
+            .find(|r| r.text == "text");
+        let plain = run.expect("the text is laid out").x;
+
+        let moved = crate::layout::build_display_list(&page.layout_root)
+            .into_iter()
+            .find_map(|entry| match entry.item {
+                crate::layout::PaintItem::Text(t) if t.text == "text" => Some(t.x),
+                _ => None,
+            })
+            .expect("the text is painted");
+        assert_eq!(moved - plain, 40.0);
+    }
+
+    #[test]
+    fn scaled_text_is_drawn_at_the_scaled_size() {
+        let page = transformed("#box { font-size: 10px; transform: scale(3) }");
+        let painted = crate::layout::build_display_list(&page.layout_root)
+            .into_iter()
+            .find_map(|entry| match entry.item {
+                crate::layout::PaintItem::Text(t) if t.text == "text" => Some(t),
+                _ => None,
+            })
+            .expect("the text is painted");
+        assert_eq!(painted.font_size, 30.0);
+    }
+
+    #[test]
+    fn a_rotation_paints_the_box_where_it_was_laid_out() {
+        // Known limitation, pinned so it is a decision rather than a surprise:
+        // the compositor cannot draw a turned rectangle, so the box is painted
+        // untransformed instead of vanishing.
+        let painted = painted_box(&transformed("#box { transform: rotate(30deg) }"));
+        assert_eq!((painted.x, painted.y), (0.0, 0.0));
+        assert_eq!((painted.width, painted.height), (100.0, 50.0));
+    }
+
+    #[test]
+    fn an_untransformed_page_paints_exactly_as_before() {
+        let page = transformed("");
+        let painted = painted_box(&page);
+        assert_eq!((painted.x, painted.y), (0.0, 0.0));
+        assert_eq!((painted.width, painted.height), (100.0, 50.0));
+    }
+
     /// A page with one image, whose decoded size is already known.
     fn page_with_decoded_image(markup: &str, css: &str, natural: (u32, u32)) -> Page {
         let mut page = Page::new(

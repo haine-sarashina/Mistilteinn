@@ -269,6 +269,10 @@ pub struct LayoutNode {
     pub cursor: crate::css::Cursor,
     /// `z-index`; `None` is `auto`, which sorts as 0 alongside its siblings.
     pub z_index: Option<i32>,
+    /// `transform` — applied when the box is painted, not when it is laid out.
+    pub transform: crate::css::Transform,
+    /// `transform-origin` — the point the transform happens about.
+    pub transform_origin: crate::css::TransformOrigin,
     pub is_line_break: bool,
 }
 
@@ -308,6 +312,8 @@ impl LayoutNode {
             line_boxes: None,
             overflow: Overflow::Visible,
             position: PositionType::Static,
+            transform: crate::css::Transform::default(),
+            transform_origin: crate::css::TransformOrigin::default(),
             offsets: [None, None, None, None],
             absolute_children: Vec::new(),
             font_size: 16.0,
@@ -532,6 +538,8 @@ where
     root_layout.column_gap = root_styles.column_gap;
     root_layout.overflow = root_styles.overflow_x;
     root_layout.position = root_styles.position;
+    root_layout.transform = root_styles.transform.clone();
+    root_layout.transform_origin = root_styles.transform_origin;
     root_layout.offsets = [
         root_styles.offset_top,
         root_styles.offset_right,
@@ -607,7 +615,14 @@ fn build_layout_children<N, F>(
     for &child_id in child_ids {
         if let Some(node) = get_node(child_id) {
             let tag = node.tag_name().to_lowercase();
-            let child_styles = styles.get(&child_id).cloned().unwrap_or_default();
+            // A text node has no style of its own — the box around it is what
+            // says how its text looks. Falling back to the initial values made
+            // every run 16px black, so a heading's own text was drawn at body
+            // size while the heading box knew better.
+            let child_styles = match styles.get(&child_id) {
+                Some(style) => style.clone(),
+                None => inherited_text_style(parent),
+            };
 
             let class_str = node.get_attr("class").unwrap_or_default().to_lowercase();
             let is_skip_or_hidden = class_str.contains("gb_a")
@@ -712,6 +727,8 @@ fn build_layout_children<N, F>(
                     layout_node.visibility = child_styles.visibility;
                     layout_node.cursor = child_styles.cursor;
                     layout_node.z_index = child_styles.z_index;
+                    layout_node.transform = child_styles.transform.clone();
+                    layout_node.transform_origin = child_styles.transform_origin;
                     layout_node.text_align = child_styles.text_align;
                     layout_node.direction = child_styles.direction;
 
@@ -880,6 +897,8 @@ fn build_layout_children<N, F>(
                     layout_node.visibility = child_styles.visibility;
                     layout_node.cursor = child_styles.cursor;
                     layout_node.z_index = child_styles.z_index;
+                    layout_node.transform = child_styles.transform.clone();
+                    layout_node.transform_origin = child_styles.transform_origin;
                     layout_node.text_align = child_styles.text_align;
                     layout_node.direction = child_styles.direction;
 
@@ -3920,6 +3939,25 @@ pub fn break_into_lines(
     line_boxes
 }
 
+/// The style a text node takes from the box it sits in.
+///
+/// Only the properties that decide how text is drawn are carried across;
+/// everything else stays at its initial value, since a text node has no box of
+/// its own to apply them to.
+fn inherited_text_style(parent: &LayoutNode) -> ComputedValues {
+    ComputedValues {
+        font_size: parent.font_size,
+        font_family: parent.font_family.clone(),
+        color: parent.color,
+        text_style: parent.text_style,
+        text_align: parent.text_align,
+        direction: parent.direction,
+        visibility: parent.visibility,
+        cursor: parent.cursor,
+        ..ComputedValues::default()
+    }
+}
+
 /// Attach the boxes `::before` and `::after` generate to their element.
 ///
 /// The pseudo-element's style was computed alongside its element's and stored
@@ -4005,6 +4043,8 @@ fn generated_box(style: &ComputedValues, text: String) -> LayoutNode {
     node.direction = style.direction;
     node.position = style.position;
     node.z_index = style.z_index;
+    node.transform = style.transform.clone();
+    node.transform_origin = style.transform_origin;
     node
 }
 
@@ -4310,7 +4350,7 @@ fn descendant_clip(node: &LayoutNode, inherited: Option<Rect>) -> Option<Rect> {
 /// `filter` and friends also do so in a real browser, but none of them are
 /// implemented here yet.
 fn establishes_stacking_context(node: &LayoutNode) -> bool {
-    node.position != PositionType::Static && node.z_index.is_some()
+    (node.position != PositionType::Static && node.z_index.is_some()) || !node.transform.is_none()
 }
 
 /// Whether this box takes part in the positioned layers rather than the
@@ -4485,21 +4525,107 @@ fn paint_stacking_context_in(
     view: &StickyView,
     out: &mut Vec<DisplayItem>,
 ) {
-    // A sticky context paints where the scroll has pushed it, content and all:
-    // the whole subtree moves as one, so its text stays inside its background.
-    if root.position == PositionType::Sticky {
-        let (dx, dy) = sticky_offset(root, containing, view);
-        if dx != 0.0 || dy != 0.0 {
-            let start = out.len();
-            paint_stacking_context_inner(root, clip, view, out);
-            for entry in &mut out[start..] {
-                translate_display_item(entry, dx, dy);
-            }
-            return;
-        }
+    // Two things can move a box after it has been laid out: a scroll that has
+    // carried a sticky box past its inset, and a `transform`. Both move the
+    // whole subtree as one — the text has to travel with the background it
+    // sits on — so both are done by painting the subtree and then moving what
+    // came out.
+    let (dx, dy) = if root.position == PositionType::Sticky {
+        sticky_offset(root, containing, view)
+    } else {
+        (0.0, 0.0)
+    };
+    let matrix = paint_matrix(root);
+
+    if dx == 0.0 && dy == 0.0 && matrix.is_identity() {
+        paint_stacking_context_inner(root, clip, view, out);
+        return;
     }
 
+    let start = out.len();
     paint_stacking_context_inner(root, clip, view, out);
+    for entry in &mut out[start..] {
+        if !matrix.is_identity() {
+            transform_display_item(entry, &matrix);
+        }
+        if dx != 0.0 || dy != 0.0 {
+            translate_display_item(entry, dx, dy);
+        }
+    }
+}
+
+/// The transform to paint this box's subtree through, in page coordinates.
+///
+/// `Transform::resolve` works in the box's own coordinates, so it is bracketed
+/// by a move to the box and back. A rotation or a skew comes back as the
+/// identity: this compositor paints axis-aligned rectangles and upright glyphs,
+/// so it cannot carry one out, and painting the box where it was laid out is
+/// closer to the truth than not painting it at all.
+fn paint_matrix(node: &LayoutNode) -> crate::css::Matrix {
+    use crate::css::Matrix;
+
+    if node.transform.is_none() {
+        return Matrix::IDENTITY;
+    }
+    let local = node
+        .transform
+        .resolve(node.rect.width, node.rect.height, node.transform_origin);
+    if !local.is_axis_aligned() {
+        return Matrix::IDENTITY;
+    }
+
+    let to_box = Matrix {
+        e: -node.rect.x,
+        f: -node.rect.y,
+        ..Matrix::IDENTITY
+    };
+    let back = Matrix {
+        e: node.rect.x,
+        f: node.rect.y,
+        ..Matrix::IDENTITY
+    };
+    to_box.then(&local).then(&back)
+}
+
+/// Move an already-collected paint item through `matrix`.
+///
+/// Only translation and scale reach here, so an item's box stays a box: its
+/// corner moves and its extent scales. Text scales with it, font size and all,
+/// which is what makes a scaled heading come out as one rather than as the
+/// same letters in a bigger box.
+fn transform_display_item(entry: &mut DisplayItem, matrix: &crate::css::Matrix) {
+    let (sx, sy) = (matrix.a, matrix.d);
+    match &mut entry.item {
+        PaintItem::Decoration(d) => {
+            let (x, y) = matrix.apply(d.x, d.y);
+            d.x = x;
+            d.y = y;
+            d.width *= sx;
+            d.height *= sy;
+            for width in d.border_width.iter_mut() {
+                *width *= sy.abs().max(sx.abs());
+            }
+            d.border_radius *= sy.abs().max(sx.abs());
+        }
+        PaintItem::Text(t) => {
+            let (x, y) = matrix.apply(t.x, t.y);
+            t.x = x;
+            t.y = y;
+            t.width *= sx;
+            t.font_size *= sy;
+        }
+        PaintItem::Image(i) => {
+            let (x, y) = matrix.apply(i.x, i.y);
+            i.x = x;
+            i.y = y;
+            i.width *= sx;
+            i.height *= sy;
+        }
+    }
+    if let Some(clip) = &mut entry.clip {
+        let (x, y) = matrix.apply(clip.x, clip.y);
+        *clip = Rect::new(x, y, clip.width * sx, clip.height * sy);
+    }
 }
 
 fn paint_stacking_context_inner(
@@ -4590,7 +4716,10 @@ fn collect_into_layers<'a>(
         return;
     }
 
-    if is_positioned(node) {
+    // A transformed box paints as a unit in the positioned layers, as CSS
+    // says — and that is also the only path that applies its transform, since
+    // it is the subtree walk that carries one.
+    if is_positioned(node) || !node.transform.is_none() {
         // Painted later in its own layer; the clip it inherited travels with it.
         let z = if establishes_stacking_context(node) {
             node.z_index.unwrap_or(0)

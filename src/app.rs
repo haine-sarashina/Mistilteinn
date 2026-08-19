@@ -59,6 +59,11 @@ const FIND_BAR_HEIGHT: f32 = 30.0;
 /// Width of the in-page find bar.
 const FIND_BAR_WIDTH: f32 = 320.0;
 
+/// A notification toast's size and the gap between stacked ones.
+const TOAST_WIDTH: f32 = 300.0;
+const TOAST_HEIGHT: f32 = 68.0;
+const TOAST_GAP: f32 = 8.0;
+
 /// The internal page listing saved bookmarks.
 const BOOKMARKS_URL: &str = "mistilteinn://bookmarks";
 
@@ -118,6 +123,17 @@ const ZOOM_LEVELS: [f32; 13] = [
 ];
 
 /// Where the find bar sits: top right of the content area, as in Chrome.
+/// Where the `index`th toast sits, counting up from the bottom-right corner.
+fn toast_geometry(win_w: u32, win_h: u32, index: usize) -> crate::layout::Rect {
+    let from_bottom = (index as f32 + 1.0) * (TOAST_HEIGHT + TOAST_GAP);
+    crate::layout::Rect::new(
+        win_w as f32 - TOAST_WIDTH - TOAST_GAP,
+        win_h as f32 - from_bottom,
+        TOAST_WIDTH,
+        TOAST_HEIGHT,
+    )
+}
+
 fn find_bar_geometry(win_w: u32) -> crate::layout::Rect {
     let width = FIND_BAR_WIDTH.min((win_w as f32 - TAB_BAR_WIDTH as f32 - 20.0).max(120.0));
     crate::layout::Rect::new(
@@ -203,6 +219,8 @@ pub struct MistilteinnApp {
     bookmarks: crate::browser::bookmarks::BookmarkStore,
     /// Every origin's `localStorage`, shared by every tab showing that origin.
     local_storage: crate::browser::storage::LocalStorageStore,
+    /// The notifications a page has raised, stacked in the window's corner.
+    toasts: crate::browser::notifications::ToastStack,
     /// Whether the bookmark pane on the right is shown.
     bookmark_pane_open: bool,
     /// Bookmark folders the user has closed, by host.
@@ -487,6 +505,7 @@ impl MistilteinnApp {
             last_scroll_step: None,
             bookmarks: crate::browser::bookmarks::BookmarkStore::load(),
             local_storage: crate::browser::storage::LocalStorageStore::load(),
+            toasts: crate::browser::notifications::ToastStack::default(),
             bookmark_pane_open: true,
             collapsed_bookmark_folders: std::collections::HashSet::new(),
             bookmark_scroll: 0.0,
@@ -1696,6 +1715,10 @@ impl MistilteinnApp {
         if self.find_bar.active {
             self.draw_find_bar(&mut text_renderer, &mut composite_buffer, win_w, win_h);
         }
+
+        // Notifications sit on top of everything, including the find bar: they
+        // are the browser speaking, not the page.
+        self.draw_toasts(&mut text_renderer, &mut composite_buffer, win_w, win_h);
 
         // Upload the composite bitmap to GPU
         if let Some(ref mut renderer) = self.renderer {
@@ -3699,6 +3722,102 @@ impl MistilteinnApp {
     }
 
     /// Draw the find bar itself, at the top right of the content area.
+    /// Take down the toast under the pointer, if there is one.
+    ///
+    /// Returns whether one was there, so the click does not also land on
+    /// whatever the toast was covering.
+    fn dismiss_toast_at(&mut self, x: f32, y: f32) -> bool {
+        let (win_w, win_h) = self.window_size();
+        let count = self.toasts.visible().len();
+        for index in 0..count {
+            let box_ = toast_geometry(win_w, win_h, index);
+            if x >= box_.x && x <= box_.right() && y >= box_.y && y <= box_.bottom() {
+                // The stack is drawn newest-first from the bottom, so the
+                // index on screen counts back from the end of the list.
+                self.toasts.dismiss(count - 1 - index);
+                self.recompose();
+                if let Some(ref renderer) = self.renderer {
+                    renderer.window().request_redraw();
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Draw the notifications a page has raised, stacked above one another.
+    ///
+    /// Each shows who it is from: a notification the reader did not go looking
+    /// for has to say which site is talking, or it is just an anonymous box.
+    fn draw_toasts(
+        &self,
+        text_renderer: &mut TextRenderer,
+        buffer: &mut [u8],
+        win_w: u32,
+        win_h: u32,
+    ) {
+        let now = std::time::Instant::now();
+        for (index, toast) in self.toasts.visible().iter().rev().enumerate() {
+            let box_ = toast_geometry(win_w, win_h, index);
+            if box_.y < 0.0 {
+                break;
+            }
+            // The last fifth of a toast's life is spent fading out, so it
+            // leaves rather than vanishing.
+            let fade = ((1.0 - toast.age(now)) / 0.2).clamp(0.0, 1.0);
+            let alpha = |value: u8| (value as f32 * fade) as u8;
+
+            crate::render::draw_rounded_rect_fill(
+                buffer,
+                win_w,
+                win_h,
+                box_.x,
+                box_.y,
+                box_.width,
+                box_.height,
+                6.0,
+                [32, 33, 36, alpha(240)],
+            );
+
+            text_renderer.rasterize_to_bitmap(
+                &toast.notification.title,
+                13.0,
+                "sans-serif",
+                [0.92, 0.93, 0.94, fade],
+                box_.x + 12.0,
+                box_.y + 10.0,
+                box_.width - 24.0,
+                buffer,
+                win_w,
+                win_h,
+            );
+            text_renderer.rasterize_to_bitmap(
+                &toast.notification.body,
+                12.0,
+                "sans-serif",
+                [0.75, 0.76, 0.78, fade],
+                box_.x + 12.0,
+                box_.y + 29.0,
+                box_.width - 24.0,
+                buffer,
+                win_w,
+                win_h,
+            );
+            text_renderer.rasterize_to_bitmap(
+                &toast.notification.origin,
+                11.0,
+                "sans-serif",
+                [0.55, 0.56, 0.6, fade],
+                box_.x + 12.0,
+                box_.y + 48.0,
+                box_.width - 24.0,
+                buffer,
+                win_w,
+                win_h,
+            );
+        }
+    }
+
     fn draw_find_bar(
         &self,
         text_renderer: &mut TextRenderer,
@@ -3925,6 +4044,14 @@ impl ApplicationHandler for MistilteinnApp {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let (cx, cy) = self.cursor_pos;
+
+                // A toast sits over everything, so it gets the click first.
+                if button == MouseButton::Left
+                    && state == ElementState::Pressed
+                    && self.dismiss_toast_at(cx, cy)
+                {
+                    return;
+                }
 
                 match button {
                     MouseButton::Left => {
@@ -4474,6 +4601,14 @@ impl ApplicationHandler for MistilteinnApp {
                 // counters and touches the disk only when one has moved.
                 self.local_storage.save_if_changed();
 
+                // A notification is raised from inside the JavaScript engine,
+                // which has no way to reach the window; this is where what was
+                // raised becomes something on screen, and where one that has
+                // been up long enough comes down.
+                if self.toasts.update(std::time::Instant::now()) {
+                    self.recompose();
+                }
+
                 if let Some(ref mut renderer) = self.renderer
                     && let Err(e) = renderer.render()
                 {
@@ -4912,6 +5047,41 @@ mod tests {
             list.is_empty(),
             "a page that frames itself must not be followed forever"
         );
+    }
+
+    #[test]
+    fn a_toast_is_clicked_away_where_it_is_drawn() {
+        use crate::browser::notifications::{Notification, raise, take_pending};
+
+        let _ = take_pending();
+        let mut app = app_with_page(crate::page::Page::new("<html></html>", "", 100.0, 100.0));
+        raise(Notification {
+            title: "Hello".to_string(),
+            body: "body".to_string(),
+            origin: "https://example.com".to_string(),
+        });
+        app.toasts.update(std::time::Instant::now());
+        assert_eq!(app.toasts.visible().len(), 1);
+
+        let (win_w, win_h) = TEST_WINDOW;
+        let box_ = toast_geometry(win_w, win_h, 0);
+        assert!(
+            !app.dismiss_toast_at(box_.x - 20.0, box_.y - 20.0),
+            "a click beside it is not a click on it"
+        );
+        assert!(app.dismiss_toast_at(box_.x + 10.0, box_.y + 10.0));
+        assert!(app.toasts.visible().is_empty());
+    }
+
+    #[test]
+    fn toasts_stack_upwards_from_the_corner() {
+        let (win_w, win_h) = TEST_WINDOW;
+        let first = toast_geometry(win_w, win_h, 0);
+        let second = toast_geometry(win_w, win_h, 1);
+        assert!(second.y < first.y, "the second sits above the first");
+        assert_eq!(first.x, second.x);
+        assert!(first.bottom() <= win_h as f32);
+        assert!(first.right() <= win_w as f32);
     }
 
     /// An app with one active tab showing `page`.

@@ -1,5 +1,6 @@
 pub mod canvas;
 pub mod dom;
+pub mod navigator;
 pub mod storage;
 
 use boa_engine::{Context, Source};
@@ -24,6 +25,9 @@ pub fn init_js_engine_with_arena(arena: dom::SharedArena) -> Context {
     dom::init_event_support(&mut context);
     if let Err(e) = storage::install(&mut context) {
         error!("Failed to install Web Storage bindings: {}", e);
+    }
+    if let Err(e) = navigator::install(&mut context) {
+        error!("Failed to install navigator bindings: {}", e);
     }
     info!("Initialized Boa JavaScript engine with DOM arena.");
     context
@@ -89,6 +93,11 @@ pub fn execute_script(context: &mut Context, script_content: &str) {
             log::debug!("Script execution notice (non-fatal): {}", err);
         }
     }
+
+    // A resolved promise does not call `.then` until the job queue is drained,
+    // and every API that answers with a promise — permissions, the clipboard —
+    // would otherwise look to the page as though it had never replied.
+    context.run_jobs();
 }
 
 #[cfg(test)]

@@ -514,6 +514,11 @@ impl Page {
     /// about to run script has to claim them first.
     fn make_active(&self) {
         crate::js::dom::set_active_arena(Some(self.arena.clone()));
+        // Permission decisions belong to an origin, so the store has to know
+        // whose script is about to run.
+        crate::browser::permissions::set_active_origin(&crate::browser::storage::storage_origin(
+            &self.page_url,
+        ));
         crate::js::canvas::set_active_canvases(Some(self.canvases.clone()));
         crate::js::storage::set_active_storage(Some(self.storage.clone()));
     }

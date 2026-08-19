@@ -223,6 +223,8 @@ pub struct MistilteinnApp {
     toasts: crate::browser::notifications::ToastStack,
     /// The drag in progress, if the reader has one under the pointer.
     drag: crate::browser::dragdrop::DragState,
+    /// The WebSocket connections the active page has open.
+    sockets: crate::network::websocket::SocketManager,
     /// Files the window manager has handed us, waiting to be delivered to the
     /// page as one drop rather than one per file.
     pending_file_drops: Vec<std::path::PathBuf>,
@@ -512,6 +514,7 @@ impl MistilteinnApp {
             local_storage: crate::browser::storage::LocalStorageStore::load(),
             toasts: crate::browser::notifications::ToastStack::default(),
             drag: crate::browser::dragdrop::DragState::default(),
+            sockets: crate::network::websocket::SocketManager::new(),
             pending_file_drops: Vec::new(),
             bookmark_pane_open: true,
             collapsed_bookmark_folders: std::collections::HashSet::new(),
@@ -2457,6 +2460,10 @@ impl MistilteinnApp {
             new_page.recompute_with_hover(&[]);
         }
 
+        // The page being replaced takes its sockets with it: a connection
+        // belongs to the document that opened it.
+        self.close_page_sockets();
+
         // Embedded documents come last: each is a page in its own right, and
         // laying one out needs the box it sits in, which only exists once the
         // parent has been measured with its own pictures in place.
@@ -3729,6 +3736,51 @@ impl MistilteinnApp {
     }
 
     /// Draw the find bar itself, at the top right of the content area.
+    /// Carry the active page's WebSockets forward by one frame.
+    ///
+    /// Three things cross here, all of them between the window thread and the
+    /// runtime: what a script asked for, what a socket had to say, and the
+    /// state each socket is now in. Doing it on the frame clock rather than
+    /// from the socket task is what keeps a message from arriving in the middle
+    /// of a script that is already running.
+    ///
+    /// Returns whether anything happened worth repainting for.
+    fn pump_sockets(&mut self) -> bool {
+        use crate::js::websocket as bindings;
+
+        let Some(runtime) = self.tokio_rt.as_ref().map(|rt| rt.handle().clone()) else {
+            return false;
+        };
+
+        let mut changed = false;
+        for wanted in bindings::take_requested() {
+            log::info!("opening WebSocket to {}", wanted.url);
+            self.sockets.open(wanted.id, &wanted.url, &runtime);
+            changed = true;
+        }
+        for (id, frame) in bindings::take_outgoing() {
+            self.sockets.send(id, &frame);
+        }
+        for id in bindings::take_closing() {
+            self.sockets.close(id);
+        }
+
+        for (id, event) in self.sockets.drain() {
+            bindings::set_ready_state(id, self.sockets.ready_state(id));
+            if let Some(page) = self.tab_manager.get_active_tab_page_mut() {
+                page.deliver_socket_event(id, &event);
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    /// Drop every socket the page being left had open.
+    fn close_page_sockets(&mut self) {
+        self.sockets.close_all();
+        crate::js::websocket::reset();
+    }
+
     /// The layout-space point a window position falls on in the page.
     fn page_point(&self, x: f32, y: f32) -> (f32, f32) {
         let scroll = self
@@ -4807,6 +4859,10 @@ impl ApplicationHandler for MistilteinnApp {
                 }
 
                 if self.deliver_file_drops() {
+                    self.recompose();
+                }
+
+                if self.pump_sockets() {
                     self.recompose();
                 }
 

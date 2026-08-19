@@ -510,6 +510,18 @@ impl Page {
         );
     }
 
+    /// Hand one WebSocket event to whichever handler the page registered.
+    pub fn deliver_socket_event(
+        &mut self,
+        id: crate::network::websocket::SocketId,
+        event: &crate::network::websocket::SocketEvent,
+    ) {
+        self.make_active();
+        crate::js::websocket::deliver(&mut self.js_context, id, event);
+        // A handler is script like any other and may have changed the DOM.
+        self.recompute_with_hover(&[]);
+    }
+
     /// The document embedded in a given element, if one has been loaded.
     pub fn frame(&self, dom_node_id: u32) -> Option<&Page> {
         self.frames.get(&dom_node_id).map(|page| page.as_ref())
@@ -539,6 +551,7 @@ impl Page {
         ));
         crate::js::canvas::set_active_canvases(Some(self.canvases.clone()));
         crate::js::storage::set_active_storage(Some(self.storage.clone()));
+        crate::js::websocket::set_page_url(&self.page_url);
     }
 
     /// The surface of every canvas that has been drawn on, by DOM node id.

@@ -36,6 +36,9 @@ reqwest = { version = "0.12", features = ["cookies", "json", "stream"] }
 # Character encodings for non-UTF-8 pages (Shift_JIS, EUC-JP, …)
 encoding_rs = "0.8"
 tokio = { version = "1", features = ["full"] }
+# WebSocket client. Native TLS to match the HTTP client, so one trust store
+# serves both rather than two disagreeing about the same certificate.
+tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
 futures = "0.3"
 
 # Image loading

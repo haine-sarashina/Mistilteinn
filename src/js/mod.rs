@@ -3,6 +3,7 @@ pub mod dom;
 pub mod dragdrop;
 pub mod navigator;
 pub mod storage;
+pub mod websocket;
 
 use boa_engine::{Context, Source};
 use log::{error, info};
@@ -32,6 +33,9 @@ pub fn init_js_engine_with_arena(arena: dom::SharedArena) -> Context {
     }
     if let Err(e) = dragdrop::install(&mut context) {
         error!("Failed to install drag and drop bindings: {}", e);
+    }
+    if let Err(e) = websocket::install(&mut context) {
+        error!("Failed to install WebSocket bindings: {}", e);
     }
     info!("Initialized Boa JavaScript engine with DOM arena.");
     context

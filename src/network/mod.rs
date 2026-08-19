@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod security;
+pub mod websocket;
 
 use thiserror::Error;
 

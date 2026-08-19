@@ -201,6 +201,8 @@ pub struct MistilteinnApp {
     last_scroll_step: Option<std::time::Instant>,
     /// The user's saved pages.
     bookmarks: crate::browser::bookmarks::BookmarkStore,
+    /// Every origin's `localStorage`, shared by every tab showing that origin.
+    local_storage: crate::browser::storage::LocalStorageStore,
     /// Whether the bookmark pane on the right is shown.
     bookmark_pane_open: bool,
     /// Bookmark folders the user has closed, by host.
@@ -308,6 +310,26 @@ fn fit_label(
     "…".to_string()
 }
 
+/// A page title reduced to something a filesystem will accept.
+fn safe_file_name(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || r#"\/:*?"<>|"#.contains(ch) {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_matches('.').trim();
+    if cleaned.is_empty() {
+        "page".to_string()
+    } else {
+        cleaned.chars().take(80).collect()
+    }
+}
+
 /// Append the paint order of every document `page` embeds, moved into place.
 ///
 /// A frame's layout is in its own coordinates, with the origin at its top-left,
@@ -352,15 +374,6 @@ fn intersect_rect(a: crate::layout::Rect, b: crate::layout::Rect) -> crate::layo
     let right = a.right().min(b.right());
     let bottom = a.bottom().min(b.bottom());
     crate::layout::Rect::new(x, y, (right - x).max(0.0), (bottom - y).max(0.0))
-}
-
-/// The smallest rectangle containing both.
-fn union_rect(a: crate::layout::Rect, b: crate::layout::Rect) -> crate::layout::Rect {
-    let x = a.x.min(b.x);
-    let y = a.y.min(b.y);
-    let right = a.right().max(b.right());
-    let bottom = a.bottom().max(b.bottom());
-    crate::layout::Rect::new(x, y, right - x, bottom - y)
 }
 
 /// Move the page's rectangles onto the screen and cut them to its pane.
@@ -473,6 +486,7 @@ impl MistilteinnApp {
             scroll_target: (0.0, 0.0),
             last_scroll_step: None,
             bookmarks: crate::browser::bookmarks::BookmarkStore::load(),
+            local_storage: crate::browser::storage::LocalStorageStore::load(),
             bookmark_pane_open: true,
             collapsed_bookmark_folders: std::collections::HashSet::new(),
             bookmark_scroll: 0.0,
@@ -1441,250 +1455,28 @@ impl MistilteinnApp {
                 crate::network::resolve_url(&page_base_url, src)
             }
         };
-        let lookup_image = |src: &str| {
+        let lookup_image = |src: &str| -> Option<&crate::page::CachedImage> {
             page.image_cache
                 .get(&resolve_src(src))
                 .or_else(|| page.image_cache.get(src))
         };
 
+        // Layout (0, 0) goes to the corner of the content pane, less however
+        // far the page has scrolled.
+        let origin = (
+            TAB_BAR_WIDTH as f32 - scroll_offset.0,
+            ADDRESS_BAR_HEIGHT as f32 - scroll_offset.1,
+        );
+        crate::render::painter::paint_page(
+            &display_list,
+            &lookup_image,
+            &mut composite_buffer,
+            win_w,
+            win_h,
+            origin,
+        );
+
         let mut text_renderer = TextRenderer::new();
-
-        // Screen coordinates for a layout rect.
-        let to_screen_rect = |r: crate::layout::Rect| {
-            crate::layout::Rect::new(
-                r.x - scroll_offset.0 + TAB_BAR_WIDTH as f32,
-                r.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32,
-                r.width,
-                r.height,
-            )
-        };
-
-        // Paint one display item onto whichever buffer is being built: the page
-        // itself, or the scratch layer a filtered subtree is drawn into first.
-        let mut paint_entry = |target: &mut [u8], entry: &crate::layout::DisplayItem| {
-            // An `overflow` clip on an ancestor keeps this item inside that
-            // box. The bounds handed to the scissor may be generous — being too
-            // large only means more area is correctly restored.
-            let clip = entry.clip.map(to_screen_rect);
-            let bounds = to_screen_rect(crate::layout::paint_bounds(&entry.item));
-
-            crate::render::with_scissor(
-                target,
-                win_w,
-                win_h,
-                bounds,
-                clip,
-                |composite_buffer: &mut [u8]| {
-                    match &entry.item {
-                        crate::layout::PaintItem::Decoration(deco) => {
-                            let dx = deco.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
-                            let dy = deco.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
-
-                            if let Some(bg) = deco.background_color {
-                                if deco.border_radius > 0.0 {
-                                    crate::render::draw_rounded_rect_fill(
-                                        composite_buffer,
-                                        win_w,
-                                        win_h,
-                                        dx,
-                                        dy,
-                                        deco.width,
-                                        deco.height,
-                                        deco.border_radius,
-                                        bg,
-                                    );
-                                } else {
-                                    crate::render::draw_solid_rect(
-                                        composite_buffer,
-                                        win_w,
-                                        win_h,
-                                        dx,
-                                        dy,
-                                        deco.width,
-                                        deco.height,
-                                        bg,
-                                    );
-                                }
-                            }
-
-                            // The image paints over the background colour and under the border.
-                            if let Some(ref src) = deco.background_image {
-                                if let Some(cached) = lookup_image(src) {
-                                    crate::render::draw_background_image(
-                                        &cached.rgba,
-                                        cached.width,
-                                        cached.height,
-                                        composite_buffer,
-                                        win_w,
-                                        win_h,
-                                        dx,
-                                        dy,
-                                        deco.width,
-                                        deco.height,
-                                        deco.background_size,
-                                        deco.background_position,
-                                        deco.background_repeat,
-                                    );
-                                }
-                            }
-
-                            crate::render::draw_rect_borders(
-                                composite_buffer,
-                                win_w,
-                                win_h,
-                                dx,
-                                dy,
-                                deco.width,
-                                deco.height,
-                                deco.border_width,
-                                deco.border_color,
-                                deco.border_style,
-                            );
-                        }
-
-                        crate::layout::PaintItem::Text(text_info) => {
-                            let color_f32: [f32; 4] = [
-                                text_info.color[0] as f32 / 255.0,
-                                text_info.color[1] as f32 / 255.0,
-                                text_info.color[2] as f32 / 255.0,
-                                text_info.color[3] as f32 / 255.0,
-                            ];
-
-                            // Apply scroll offset and shift by chrome dimensions
-                            let text_x = text_info.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
-                            let text_y = text_info.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
-
-                            text_renderer.rasterize_to_bitmap_styled(
-                                &text_info.text,
-                                text_info.font_size,
-                                &text_info.font_family,
-                                color_f32,
-                                text_x,
-                                text_y,
-                                text_info.width,
-                                text_info.text_style,
-                                composite_buffer,
-                                win_w,
-                                win_h,
-                            );
-                        }
-
-                        crate::layout::PaintItem::Image(img_info) => {
-                            // Skip unpositioned or collapsed small icons at (0, 0).
-                            let collapsed_icon = img_info.x <= 0.0
-                                && img_info.y <= 0.0
-                                && img_info.width < 32.0
-                                && img_info.height < 32.0;
-                            let Some(cached) =
-                                lookup_image(&img_info.src).filter(|_| !collapsed_icon)
-                            else {
-                                return;
-                            };
-                            let img_x = img_info.x - scroll_offset.0 + TAB_BAR_WIDTH as f32;
-                            let img_y = img_info.y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32;
-                            let target_w = if img_info.width >= 4.0 {
-                                img_info.width
-                            } else {
-                                cached.width as f32
-                            };
-                            let target_h = if img_info.height >= 4.0 {
-                                img_info.height
-                            } else {
-                                cached.height as f32
-                            };
-                            if target_w >= 4.0 && target_h >= 4.0 {
-                                crate::render::composite_image_scaled(
-                                    &cached.rgba,
-                                    cached.width,
-                                    cached.height,
-                                    composite_buffer,
-                                    win_w,
-                                    win_h,
-                                    img_x,
-                                    img_y,
-                                    target_w,
-                                    target_h,
-                                );
-                            }
-                        }
-                    }
-                },
-            );
-        };
-
-        // Walk the display list, painting straight onto the page except where a
-        // `filter` claims a run of items. Those go onto a scratch layer of their
-        // own, are put through the filter, and are composited back — which is
-        // what makes the filter apply to the subtree as one picture rather than
-        // to each box separately.
-        let mut filter_scratch: Vec<u8> = Vec::new();
-        let mut index = 0;
-        while index < display_list.len() {
-            let Some(filter) = display_list[index].filter.clone() else {
-                paint_entry(&mut composite_buffer, &display_list[index]);
-                index += 1;
-                continue;
-            };
-
-            let end = display_list[index..]
-                .iter()
-                .position(|entry| {
-                    !entry
-                        .filter
-                        .as_ref()
-                        .is_some_and(|other| std::rc::Rc::ptr_eq(other, &filter))
-                })
-                .map(|offset| index + offset)
-                .unwrap_or(display_list.len());
-            let group = &display_list[index..end];
-            index = end;
-
-            // The area to filter is everything the group paints, grown by how
-            // far a blur or a shadow can carry paint outside it.
-            let mut region: Option<crate::layout::Rect> = None;
-            for entry in group {
-                let bounds = to_screen_rect(crate::layout::paint_bounds(&entry.item));
-                region = Some(match region {
-                    None => bounds,
-                    Some(current) => union_rect(current, bounds),
-                });
-            }
-            let Some(region) = region else { continue };
-            let region = crate::render::filter::Region {
-                x: region.x.floor() as i32,
-                y: region.y.floor() as i32,
-                width: region.width.ceil() as i32,
-                height: region.height.ceil() as i32,
-            }
-            .inflate(filter.outset())
-            .clamp_to(win_w, win_h);
-            if region.is_empty() {
-                continue;
-            }
-
-            if filter_scratch.is_empty() {
-                filter_scratch = vec![0u8; (win_w * win_h * 4) as usize];
-            } else {
-                crate::render::filter::clear_region(&mut filter_scratch, win_w, win_h, region);
-            }
-            for entry in group {
-                paint_entry(&mut filter_scratch, entry);
-            }
-            crate::render::filter::apply(
-                &mut filter_scratch,
-                win_w,
-                win_h,
-                region,
-                filter.functions(),
-            );
-            crate::render::filter::composite_region(
-                &mut composite_buffer,
-                &filter_scratch,
-                win_w,
-                win_h,
-                region,
-            );
-        }
 
         // Highlight focused page input with blue outline
         if let Some(focused_dom_id) = self.focused_page_input {
@@ -1929,6 +1721,9 @@ impl MistilteinnApp {
         self.scroll_target = (0.0, 0.0);
         self.tab_manager.set_active_tab_page(new_page);
         self.refresh_find_matches();
+        // The page's own scripts have run by now, so anything they saved is
+        // written out before the browser can be closed on top of it.
+        self.local_storage.save_if_changed();
         self.recompose();
 
         if let Some(ref mut renderer) = self.renderer {
@@ -2644,6 +2439,9 @@ impl MistilteinnApp {
         self.scroll_target = (0.0, 0.0);
         self.tab_manager.set_active_tab_page(new_page);
         self.refresh_find_matches();
+        // The page's own scripts have run by now, so anything they saved is
+        // written out before the browser can be closed on top of it.
+        self.local_storage.save_if_changed();
         self.recompose();
 
         if let Some(ref mut renderer) = self.renderer {
@@ -3464,6 +3262,183 @@ impl MistilteinnApp {
     ///
     /// The page's area changes width, so the document has to be laid out again
     /// — the pane takes its space from the page rather than covering it.
+    /// Print the page to a PDF file the reader chooses.
+    ///
+    /// The page is laid out again at the paper's width rather than the window's
+    /// — otherwise a wide window would print a wide page cropped at the margin
+    /// — and then painted in sheet-sized strips by the same painter that draws
+    /// it on screen, so what comes out is what was on the screen.
+    fn print_active_page(&mut self) {
+        use crate::browser::print::{A4_HEIGHT_PX, A4_WIDTH_PX, Sheet, sheet_count, sheets_to_pdf};
+
+        let Some(page) = self.tab_manager.get_active_tab_page_mut() else {
+            return;
+        };
+
+        // Laying out for paper changes the page, so the window's own layout is
+        // rebuilt afterwards.
+        let (window_width, window_height) = (page.view_width, page.view_height);
+        page.view_width = A4_WIDTH_PX as f32;
+        page.view_height = A4_HEIGHT_PX as f32;
+        page.recompute_with_hover(&[]);
+
+        let content_height = crate::layout::content_extent(&page.layout_root).1;
+        let sheets_needed = sheet_count(content_height, A4_HEIGHT_PX);
+
+        let display_list = crate::layout::build_display_list_with_scroll(
+            &page.layout_root,
+            (0.0, 0.0),
+            (A4_WIDTH_PX as f32, content_height.max(A4_HEIGHT_PX as f32)),
+        );
+        let page_base_url = page.base_url();
+        let resolve_src = |src: &str| -> String {
+            if page_base_url.is_empty() {
+                src.to_string()
+            } else {
+                crate::network::resolve_url(&page_base_url, src)
+            }
+        };
+        let lookup_image = |src: &str| -> Option<&crate::page::CachedImage> {
+            page.image_cache
+                .get(&resolve_src(src))
+                .or_else(|| page.image_cache.get(src))
+        };
+
+        let mut sheets = Vec::with_capacity(sheets_needed);
+        for index in 0..sheets_needed {
+            let mut pixels = vec![0u8; (A4_WIDTH_PX * A4_HEIGHT_PX * 4) as usize];
+            crate::render::painter::paint_page(
+                &display_list,
+                &lookup_image,
+                &mut pixels,
+                A4_WIDTH_PX,
+                A4_HEIGHT_PX,
+                (0.0, -((index * A4_HEIGHT_PX as usize) as f32)),
+            );
+            sheets.push(Sheet {
+                width: A4_WIDTH_PX,
+                height: A4_HEIGHT_PX,
+                pixels,
+            });
+        }
+
+        let title = page.title.clone();
+        let pdf = sheets_to_pdf(&sheets);
+
+        // Put the page back the way the window had it before anything else
+        // reads the layout tree.
+        let Some(page) = self.tab_manager.get_active_tab_page_mut() else {
+            return;
+        };
+        page.view_width = window_width;
+        page.view_height = window_height;
+        page.recompute_with_hover(&[]);
+        self.recompose();
+
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("{}.pdf", safe_file_name(&title)))
+            .add_filter("PDF", &["pdf"])
+            .save_file()
+        else {
+            log::info!("printing cancelled");
+            return;
+        };
+        match std::fs::write(&path, &pdf) {
+            Ok(()) => log::info!("printed {} sheet(s) to {}", sheets.len(), path.display()),
+            Err(error) => log::error!("could not write {}: {error}", path.display()),
+        }
+    }
+
+    /// Copy whatever the keyboard is pointing at, cutting it when asked.
+    ///
+    /// There is no text selection yet, in the chrome or in the page, so the
+    /// unit of a copy is the whole field the caret is in — and with nothing
+    /// focused, the address of the page being read, which is what a reader
+    /// pressing Ctrl+C on a page almost always wants.
+    fn copy_to_clipboard(&mut self, cut: bool) {
+        let copied = if self.find_bar.active {
+            let text = self.find_bar.query.clone();
+            if cut {
+                self.find_bar.query.clear();
+                self.refresh_find_matches();
+            }
+            text
+        } else if self.is_address_focused {
+            let text = self.address_input.clone();
+            if cut {
+                self.address_input.clear();
+                self.address_cursor = 0;
+            }
+            text
+        } else if let Some(input_node_id) = self.focused_page_input {
+            let Some(page) = self.tab_manager.get_active_tab_page_mut() else {
+                return;
+            };
+            let text = page
+                .arena
+                .get_attribute(input_node_id, "value")
+                .unwrap_or_default();
+            if cut {
+                page.set_input_value_and_recompute(input_node_id, "");
+            }
+            text
+        } else {
+            // Nothing is focused: a cut would have nothing to take away, so
+            // this stays a copy whichever key was pressed.
+            self.tab_manager
+                .active_tab()
+                .map(|tab| tab.url.clone())
+                .unwrap_or_default()
+        };
+
+        if copied.is_empty() {
+            return;
+        }
+        crate::browser::clipboard::write_text(&copied);
+        self.recompose();
+        if let Some(ref renderer) = self.renderer {
+            renderer.window().request_redraw();
+        }
+    }
+
+    /// Paste the clipboard into whichever field the keyboard is pointing at.
+    fn paste_from_clipboard(&mut self) {
+        let Some(text) = crate::browser::clipboard::read_text() else {
+            return;
+        };
+        let text = crate::browser::clipboard::as_single_line(&text);
+        if text.is_empty() {
+            return;
+        }
+
+        if self.find_bar.active {
+            self.find_bar.query.push_str(&text);
+            self.refresh_find_matches();
+            self.scroll_to_current_match();
+        } else if self.is_address_focused {
+            let at = self.address_cursor.min(self.address_input.len());
+            self.address_input.insert_str(at, &text);
+            self.address_cursor = at + text.len();
+        } else if let Some(input_node_id) = self.focused_page_input {
+            let Some(page) = self.tab_manager.get_active_tab_page_mut() else {
+                return;
+            };
+            let mut value = page
+                .arena
+                .get_attribute(input_node_id, "value")
+                .unwrap_or_default();
+            value.push_str(&text);
+            page.set_input_value_and_recompute(input_node_id, &value);
+        } else {
+            return;
+        }
+
+        self.recompose();
+        if let Some(ref renderer) = self.renderer {
+            renderer.window().request_redraw();
+        }
+    }
+
     fn toggle_bookmark_pane(&mut self) {
         self.bookmark_pane_open = !self.bookmark_pane_open;
         self.relayout_active_page();
@@ -4493,6 +4468,12 @@ impl ApplicationHandler for MistilteinnApp {
                     self.recompose();
                 }
 
+                // A script can save into `localStorage` at any moment — from a
+                // click handler, a timer, a load event — so the check for
+                // anything new happens on the frame clock. It compares revision
+                // counters and touches the disk only when one has moved.
+                self.local_storage.save_if_changed();
+
                 if let Some(ref mut renderer) = self.renderer
                     && let Err(e) = renderer.render()
                 {
@@ -4597,22 +4578,18 @@ impl ApplicationHandler for MistilteinnApp {
                             }
                             PhysicalKey::Code(KeyCode::Digit0)
                             | PhysicalKey::Code(KeyCode::Numpad0) => self.adjust_zoom(None),
+                            PhysicalKey::Code(KeyCode::KeyC) => {
+                                self.copy_to_clipboard(false);
+                            }
+                            PhysicalKey::Code(KeyCode::KeyX) => {
+                                self.copy_to_clipboard(true);
+                            }
                             PhysicalKey::Code(KeyCode::KeyV) => {
-                                // Ctrl+V: paste into address bar
-                                if self.is_address_focused {
-                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                        if let Ok(text) = clipboard.get_text() {
-                                            let cleaned_text = text.trim();
-                                            self.address_input
-                                                .insert_str(self.address_cursor, cleaned_text);
-                                            self.address_cursor += cleaned_text.len();
-                                            self.recompose();
-                                            if let Some(ref renderer) = self.renderer {
-                                                renderer.window().request_redraw();
-                                            }
-                                        }
-                                    }
-                                }
+                                self.paste_from_clipboard();
+                            }
+                            PhysicalKey::Code(KeyCode::KeyP) => {
+                                // Ctrl+P: print the page to a PDF file.
+                                self.print_active_page();
                             }
                             _ => {}
                         }

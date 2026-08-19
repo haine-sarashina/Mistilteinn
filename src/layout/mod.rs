@@ -4550,6 +4550,15 @@ pub struct DisplayItem {
     pub filter: Option<std::rc::Rc<crate::css::Filter>>,
 }
 
+/// The smallest rectangle containing both.
+pub fn union_rect(a: Rect, b: Rect) -> Rect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = a.right().max(b.right());
+    let bottom = a.bottom().max(b.bottom());
+    Rect::new(x, y, right - x, bottom - y)
+}
+
 /// The area a paint item can touch, in layout coordinates.
 ///
 /// Text is given room on every side: the position it carries is a baseline

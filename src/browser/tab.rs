@@ -25,6 +25,12 @@ pub struct Tab {
     pub history_index: usize,
     /// Which group this tab belongs to, if any.
     pub group_id: Option<GroupId>,
+    /// This tab's `sessionStorage`, one area per origin it has visited.
+    ///
+    /// It belongs to the tab rather than to the browser: that is the whole
+    /// difference between the two storages, and it is why closing a tab is
+    /// what forgets what was in it.
+    pub session_storage: super::storage::SessionStorageStore,
 }
 
 impl std::fmt::Debug for Tab {
@@ -132,6 +138,7 @@ impl TabManager {
                 history: Vec::new(),
                 history_index: 0,
                 group_id: None,
+                session_storage: super::storage::SessionStorageStore::default(),
             },
         );
 

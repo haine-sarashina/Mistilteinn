@@ -10,6 +10,7 @@ pub mod filter;
 /// 3. For each frame: clear → draw rectangles → draw text → present
 pub mod font_data;
 pub mod icons;
+pub mod painter;
 pub mod text;
 
 use crate::css::{

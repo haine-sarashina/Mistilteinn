@@ -133,7 +133,52 @@ pub fn init_dom_bindings_with_arena(context: &mut Context, arena: SharedArena) -
     );
 
     // 2. `document` object with `getElementById`, `querySelector`, `title`
+    //
+    // `body` is an accessor rather than a stored value: the element object
+    // wraps a node id, and reading it has to go to the arena that is active
+    // now rather than the one that was active when `document` was built.
+    let realm = context.realm().clone();
+    let body_getter = NativeFunction::from_fn_ptr(|_this, _args, ctx| {
+        let Some(node_id) = with_active_arena(|arena| arena.find_by_tag("body")).flatten() else {
+            return Ok(JsValue::null());
+        };
+        Ok(JsValue::new(create_element_object(ctx, node_id)?))
+    })
+    .to_js_function(&realm);
+    let head_getter = NativeFunction::from_fn_ptr(|_this, _args, ctx| {
+        let Some(node_id) = with_active_arena(|arena| arena.find_by_tag("head")).flatten() else {
+            return Ok(JsValue::null());
+        };
+        Ok(JsValue::new(create_element_object(ctx, node_id)?))
+    })
+    .to_js_function(&realm);
+    let element_getter = NativeFunction::from_fn_ptr(|_this, _args, ctx| {
+        let Some(node_id) = with_active_arena(|arena| arena.find_by_tag("html")).flatten() else {
+            return Ok(JsValue::null());
+        };
+        Ok(JsValue::new(create_element_object(ctx, node_id)?))
+    })
+    .to_js_function(&realm);
+
     let document = ObjectInitializer::new(context)
+        .accessor(
+            js_string!("body"),
+            Some(body_getter),
+            None,
+            boa_engine::property::Attribute::all(),
+        )
+        .accessor(
+            js_string!("head"),
+            Some(head_getter),
+            None,
+            boa_engine::property::Attribute::all(),
+        )
+        .accessor(
+            js_string!("documentElement"),
+            Some(element_getter),
+            None,
+            boa_engine::property::Attribute::all(),
+        )
         .function(
             NativeFunction::from_fn_ptr(|_this, args, ctx| {
                 let Some(id_val) = args.get(0).map(|a| a.display().to_string()) else {
@@ -300,6 +345,19 @@ pub fn init_dom_bindings_with_arena(context: &mut Context, arena: SharedArena) -
     );
 
     Ok(())
+}
+
+/// Put a property on the `window` object.
+///
+/// Some globals live in two places at once: `localStorage` is reachable both
+/// bare and through `window`, and a script may use either.
+pub fn set_window_property(context: &mut Context, name: &str, value: JsValue) {
+    let Ok(window) = context.global_object().get(js_string!("window"), context) else {
+        return;
+    };
+    if let Some(window) = window.as_object() {
+        let _ = window.set(js_string!(name.to_string()), value, false, context);
+    }
 }
 
 /// Helper to extract clean string value from JsValue (unquoted).

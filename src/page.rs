@@ -71,6 +71,11 @@ pub struct Page {
     /// tree and scripts — laid out at the size of the box it sits in and
     /// painted inside it.
     frames: rustc_hash::FxHashMap<u32, Box<Page>>,
+    /// The `localStorage` and `sessionStorage` areas of this page's origin.
+    ///
+    /// Handed in rather than created here: two tabs on one site share their
+    /// local area, and what a page saves has to outlive it.
+    storage: crate::browser::storage::PageStorage,
     /// The hover path the styles were last computed with, so a frame driven by
     /// an animation does not silently drop `:hover`.
     last_hover: Vec<u32>,
@@ -204,6 +209,29 @@ impl Page {
         view_height: f32,
         csp: &crate::network::security::Csp,
     ) -> Self {
+        Self::new_with_storage(
+            html_source,
+            css_source,
+            view_width,
+            view_height,
+            csp,
+            crate::browser::storage::PageStorage::default(),
+        )
+    }
+
+    /// [`Self::new_with_csp`], with the storage areas of the page's origin.
+    ///
+    /// The areas have to arrive before the pipeline runs: this document's
+    /// inline scripts execute during parsing, and one of the first things a
+    /// page does is read what it saved last time.
+    pub fn new_with_storage(
+        html_source: &str,
+        css_source: &str,
+        view_width: f32,
+        view_height: f32,
+        csp: &crate::network::security::Csp,
+        storage: crate::browser::storage::PageStorage,
+    ) -> Self {
         use crate::network::security::ResourceKind;
 
         // Stage 1: Parse HTML into DOM arena
@@ -219,6 +247,7 @@ impl Page {
         let mut js_context = crate::js::init_js_engine_with_arena(arena.clone());
         let canvases: crate::js::canvas::SharedCanvases = Default::default();
         crate::js::canvas::set_active_canvases(Some(canvases.clone()));
+        crate::js::storage::set_active_storage(Some(storage.clone()));
         let mut blocked = 0usize;
         for (script, nonce) in arena.extract_scripts_with_nonce() {
             if csp.allows_inline_with_nonce(ResourceKind::Script, nonce.as_deref()) {
@@ -324,6 +353,7 @@ impl Page {
             last_hover: Vec::new(),
             canvases,
             frames: rustc_hash::FxHashMap::default(),
+            storage,
         };
 
         // The document exists now, so anything waiting on it can run. This
@@ -485,6 +515,7 @@ impl Page {
     fn make_active(&self) {
         crate::js::dom::set_active_arena(Some(self.arena.clone()));
         crate::js::canvas::set_active_canvases(Some(self.canvases.clone()));
+        crate::js::storage::set_active_storage(Some(self.storage.clone()));
     }
 
     /// The surface of every canvas that has been drawn on, by DOM node id.

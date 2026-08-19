@@ -1,5 +1,6 @@
 pub mod canvas;
 pub mod dom;
+pub mod storage;
 
 use boa_engine::{Context, Source};
 use log::{error, info};
@@ -21,6 +22,9 @@ pub fn init_js_engine_with_arena(arena: dom::SharedArena) -> Context {
         error!("Failed to initialize DOM bindings with arena: {}", e);
     }
     dom::init_event_support(&mut context);
+    if let Err(e) = storage::install(&mut context) {
+        error!("Failed to install Web Storage bindings: {}", e);
+    }
     info!("Initialized Boa JavaScript engine with DOM arena.");
     context
 }

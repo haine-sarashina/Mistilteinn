@@ -221,6 +221,11 @@ pub struct MistilteinnApp {
     local_storage: crate::browser::storage::LocalStorageStore,
     /// The notifications a page has raised, stacked in the window's corner.
     toasts: crate::browser::notifications::ToastStack,
+    /// The drag in progress, if the reader has one under the pointer.
+    drag: crate::browser::dragdrop::DragState,
+    /// Files the window manager has handed us, waiting to be delivered to the
+    /// page as one drop rather than one per file.
+    pending_file_drops: Vec<std::path::PathBuf>,
     /// Whether the bookmark pane on the right is shown.
     bookmark_pane_open: bool,
     /// Bookmark folders the user has closed, by host.
@@ -506,6 +511,8 @@ impl MistilteinnApp {
             bookmarks: crate::browser::bookmarks::BookmarkStore::load(),
             local_storage: crate::browser::storage::LocalStorageStore::load(),
             toasts: crate::browser::notifications::ToastStack::default(),
+            drag: crate::browser::dragdrop::DragState::default(),
+            pending_file_drops: Vec::new(),
             bookmark_pane_open: true,
             collapsed_bookmark_folders: std::collections::HashSet::new(),
             bookmark_scroll: 0.0,
@@ -3722,6 +3729,178 @@ impl MistilteinnApp {
     }
 
     /// Draw the find bar itself, at the top right of the content area.
+    /// The layout-space point a window position falls on in the page.
+    fn page_point(&self, x: f32, y: f32) -> (f32, f32) {
+        let scroll = self
+            .tab_manager
+            .get_active_tab_scroll()
+            .unwrap_or((0.0, 0.0));
+        (
+            x - TAB_BAR_WIDTH as f32 + scroll.0,
+            y - ADDRESS_BAR_HEIGHT as f32 + scroll.1,
+        )
+    }
+
+    /// The chain of DOM nodes under a window position.
+    fn dom_path_at(&self, x: f32, y: f32) -> Vec<u32> {
+        let (page_x, page_y) = self.page_point(x, y);
+        match self.tab_manager.get_active_tab_page() {
+            Some(page) => crate::layout::hit_test_dom_path(&page.layout_root, page_x, page_y),
+            None => Vec::new(),
+        }
+    }
+
+    /// The innermost element in `path` that the markup says may be dragged.
+    ///
+    /// A drag starts from the element carrying `draggable`, not from whatever
+    /// happens to be inside it, so the search runs from the leaf outwards.
+    fn draggable_in(&self, path: &[u32]) -> Option<u32> {
+        let page = self.tab_manager.get_active_tab_page()?;
+        path.iter().rev().copied().find(|&node_id| {
+            page.arena
+                .get_attribute(node_id, "draggable")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+        })
+    }
+
+    /// The event detail a pointer-driven event carries.
+    fn pointer_detail(&self, x: f32, y: f32) -> String {
+        let (page_x, page_y) = self.page_point(x, y);
+        format!(
+            "{{clientX: {:.1}, clientY: {:.1}, pageX: {:.1}, pageY: {:.1}}}",
+            x - TAB_BAR_WIDTH as f32,
+            y - ADDRESS_BAR_HEIGHT as f32,
+            page_x,
+            page_y
+        )
+    }
+
+    /// Note a press that could become a drag.
+    fn note_drag_candidate(&mut self, x: f32, y: f32) {
+        let path = self.dom_path_at(x, y);
+        self.drag.reset();
+        self.drag.candidate = self.draggable_in(&path);
+        self.drag.pressed_at = (x, y);
+    }
+
+    /// Carry a drag forward as the pointer moves, starting one if the press has
+    /// travelled far enough.
+    ///
+    /// Returns whether anything happened that the window has to repaint for.
+    fn advance_drag(&mut self, x: f32, y: f32) -> bool {
+        use crate::browser::dragdrop;
+
+        if !self.drag.active {
+            let Some(source) = self.drag.candidate else {
+                return false;
+            };
+            if !dragdrop::past_threshold(self.drag.pressed_at, (x, y)) {
+                return false;
+            }
+            dragdrop::begin(Vec::new());
+            self.drag.active = true;
+            self.drag.source = Some(source);
+            let detail = self.pointer_detail(x, y);
+            if let Some(page) = self.tab_manager.get_active_tab_page_mut() {
+                page.dispatch_event_along_with_detail(&[source], "dragstart", &detail);
+            }
+        }
+
+        let path = self.dom_path_at(x, y);
+        let over = path.last().copied();
+        let detail = self.pointer_detail(x, y);
+
+        if over != self.drag.over {
+            let leaving = self.drag.over;
+            if let Some(page) = self.tab_manager.get_active_tab_page_mut() {
+                if let Some(leaving) = leaving {
+                    page.dispatch_event_along_with_detail(&[leaving], "dragleave", &detail);
+                }
+                if let Some(entering) = over {
+                    page.dispatch_event_along_with_detail(&[entering], "dragenter", &detail);
+                }
+            }
+            self.drag.over = over;
+        }
+
+        // HTML's rule: a target accepts a drop by cancelling `dragover`. A page
+        // that forgets to is exactly the page that never receives one.
+        let accepted = match self.tab_manager.get_active_tab_page_mut() {
+            Some(page) => {
+                page.dispatch_event_along_with_detail(&path, "dragover", &detail)
+                    .default_prevented
+            }
+            None => false,
+        };
+        self.drag.will_accept = accepted;
+
+        if let Some(source) = self.drag.source
+            && let Some(page) = self.tab_manager.get_active_tab_page_mut()
+        {
+            page.dispatch_event_along_with_detail(&[source], "drag", &detail);
+        }
+        true
+    }
+
+    /// Finish a drag where the pointer was let go.
+    fn finish_drag(&mut self, x: f32, y: f32) {
+        use crate::browser::dragdrop;
+
+        if !self.drag.active {
+            self.drag.reset();
+            return;
+        }
+        let detail = self.pointer_detail(x, y);
+        let path = self.dom_path_at(x, y);
+        let source = self.drag.source;
+        let accepted = self.drag.will_accept;
+
+        if let Some(page) = self.tab_manager.get_active_tab_page_mut() {
+            if accepted {
+                page.dispatch_event_along_with_detail(&path, "drop", &detail);
+            }
+            if let Some(source) = source {
+                page.dispatch_event_along_with_detail(&[source], "dragend", &detail);
+            }
+        }
+
+        dragdrop::end();
+        self.drag.reset();
+        self.recompose();
+    }
+
+    /// Deliver files the window manager handed us to the page under the pointer.
+    ///
+    /// One drop, however many files: winit reports them one at a time, and a
+    /// page expecting `e.dataTransfer.files` expects the whole set at once.
+    fn deliver_file_drops(&mut self) -> bool {
+        use crate::browser::dragdrop;
+
+        if self.pending_file_drops.is_empty() {
+            return false;
+        }
+        let files = std::mem::take(&mut self.pending_file_drops);
+        log::info!("{} file(s) dropped onto the page", files.len());
+        dragdrop::begin(files);
+
+        let (x, y) = self.cursor_pos;
+        let detail = self.pointer_detail(x, y);
+        let path = self.dom_path_at(x, y);
+        if let Some(page) = self.tab_manager.get_active_tab_page_mut() {
+            page.dispatch_event_along_with_detail(&path, "dragenter", &detail);
+            let accepted = page
+                .dispatch_event_along_with_detail(&path, "dragover", &detail)
+                .default_prevented;
+            if accepted {
+                page.dispatch_event_along_with_detail(&path, "drop", &detail);
+            } else {
+                log::info!("the page did not accept the drop");
+            }
+        }
+        dragdrop::end();
+        true
+    }
+
     /// Take down the toast under the pointer, if there is one.
     ///
     /// Returns whether one was there, so the click does not also land on
@@ -4210,6 +4389,11 @@ impl ApplicationHandler for MistilteinnApp {
 
                                     // Check page content area for input focus or link click
                                     if self.is_in_content_area(cx, cy) {
+                                        // A press on a draggable element may become a
+                                        // drag, which is only known once the pointer
+                                        // moves; noting it costs nothing if it does not.
+                                        self.note_drag_candidate(cx, cy);
+
                                         let mut link_to_navigate: Option<String> = None;
                                         let mut anchor_jump_target: Option<String> = None;
 
@@ -4226,7 +4410,6 @@ impl ApplicationHandler for MistilteinnApp {
                                                     content_x,
                                                     content_y,
                                                 );
-
                                                 // Page script sees the click first, and may
                                                 // call preventDefault() to keep us from
                                                 // following the link under it. A handler can
@@ -4352,6 +4535,8 @@ impl ApplicationHandler for MistilteinnApp {
                                 self.is_dragging_scrollbar = false;
                                 self.recompose();
                             }
+                            // Letting go is what turns a drag into a drop.
+                            self.finish_drag(cx, cy);
                         }
                     }
                     MouseButton::Right => {
@@ -4397,6 +4582,18 @@ impl ApplicationHandler for MistilteinnApp {
                 let cx = position.x as f32;
                 let cy = position.y as f32;
                 self.cursor_pos = (cx, cy);
+
+                // A press on a draggable element becomes a drag once the
+                // pointer has travelled; from then on the move belongs to the
+                // drag rather than to hovering.
+                if (self.drag.candidate.is_some() || self.drag.active) && self.advance_drag(cx, cy)
+                {
+                    self.recompose();
+                    if let Some(ref renderer) = self.renderer {
+                        renderer.window().request_redraw();
+                    }
+                    return;
+                }
 
                 // Handle scrollbar dragging
                 if self.is_dragging_scrollbar {
@@ -4606,6 +4803,10 @@ impl ApplicationHandler for MistilteinnApp {
                 // raised becomes something on screen, and where one that has
                 // been up long enough comes down.
                 if self.toasts.update(std::time::Instant::now()) {
+                    self.recompose();
+                }
+
+                if self.deliver_file_drops() {
                     self.recompose();
                 }
 
@@ -4880,6 +5081,15 @@ impl ApplicationHandler for MistilteinnApp {
                     }
                 }
             }
+            WindowEvent::DroppedFile(path) => {
+                // The window manager reports one file at a time; they are
+                // gathered and delivered together on the next frame, because a
+                // page reading `dataTransfer.files` expects the whole set.
+                self.pending_file_drops.push(path);
+                if let Some(ref renderer) = self.renderer {
+                    renderer.window().request_redraw();
+                }
+            }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 if self.find_bar.active {
                     self.find_bar.query.push_str(&text);
@@ -5046,6 +5256,173 @@ mod tests {
         assert!(
             list.is_empty(),
             "a page that frames itself must not be followed forever"
+        );
+    }
+
+    /// An app showing a page with a draggable source and a drop target that
+    /// cancels `dragover`, as a real drop target must.
+    fn app_with_a_drag_page() -> MistilteinnApp {
+        let page = crate::page::Page::new(
+            "<html><body>
+                <div id='src' draggable='true'>drag me</div>
+                <div id='target'>drop here</div>
+                <script>
+                  document.getElementById('src').addEventListener('dragstart', function (e) {
+                      e.dataTransfer.setData('text/plain', 'carried');
+                      document.getElementById('src').setAttribute('data-started', 'yes');
+                  });
+                  document.getElementById('target').addEventListener('dragover', function (e) {
+                      e.preventDefault();
+                  });
+                  document.getElementById('target').addEventListener('drop', function (e) {
+                      document.getElementById('target').setAttribute('data-dropped',
+                          e.dataTransfer.getData('text/plain'));
+                  });
+                </script>
+              </body></html>",
+            "#src { display: block; width: 200px; height: 40px; }
+             #target { display: block; width: 200px; height: 40px; }",
+            800.0,
+            600.0,
+        );
+        app_with_page(page)
+    }
+
+    /// A window position inside the laid-out box of `id`.
+    fn window_point_in(app: &MistilteinnApp, id: &str) -> (f32, f32) {
+        let page = app
+            .tab_manager
+            .get_active_tab_page()
+            .expect("the tab has a page");
+        let node = page.arena.find_by_id(id).expect("the element exists");
+        let rect = crate::layout::find_layout_rect_by_dom_id(&page.layout_root, node)
+            .expect("the element is laid out");
+        (
+            rect.x + rect.width / 2.0 + TAB_BAR_WIDTH as f32,
+            rect.y + rect.height / 2.0 + ADDRESS_BAR_HEIGHT as f32,
+        )
+    }
+
+    fn attribute(app: &MistilteinnApp, id: &str, name: &str) -> Option<String> {
+        let page = app.tab_manager.get_active_tab_page()?;
+        let node = page.arena.find_by_id(id)?;
+        page.arena.get_attribute(node, name)
+    }
+
+    #[test]
+    fn a_press_on_a_draggable_element_is_noted_as_one() {
+        let mut app = app_with_a_drag_page();
+        let (x, y) = window_point_in(&app, "src");
+        app.note_drag_candidate(x, y);
+        assert!(app.drag.candidate.is_some());
+
+        let (x, y) = window_point_in(&app, "target");
+        app.note_drag_candidate(x, y);
+        assert!(
+            app.drag.candidate.is_none(),
+            "an element with no draggable attribute is not one"
+        );
+    }
+
+    #[test]
+    fn a_press_that_does_not_move_never_becomes_a_drag() {
+        let mut app = app_with_a_drag_page();
+        let (x, y) = window_point_in(&app, "src");
+        app.note_drag_candidate(x, y);
+        assert!(!app.advance_drag(x + 1.0, y));
+        assert!(!app.drag.active);
+        assert_eq!(attribute(&app, "src", "data-started"), None);
+    }
+
+    #[test]
+    fn dragging_from_a_source_to_a_target_carries_the_parcel() {
+        let mut app = app_with_a_drag_page();
+        let (from_x, from_y) = window_point_in(&app, "src");
+        let (to_x, to_y) = window_point_in(&app, "target");
+
+        app.note_drag_candidate(from_x, from_y);
+        app.advance_drag(from_x + 20.0, from_y);
+        assert!(app.drag.active);
+        assert_eq!(
+            attribute(&app, "src", "data-started"),
+            Some("yes".to_string())
+        );
+
+        app.advance_drag(to_x, to_y);
+        assert!(
+            app.drag.will_accept,
+            "the target cancelled dragover, so it accepts"
+        );
+
+        app.finish_drag(to_x, to_y);
+        assert_eq!(
+            attribute(&app, "target", "data-dropped"),
+            Some("carried".to_string())
+        );
+        assert!(!app.drag.active, "and the drag is over");
+    }
+
+    #[test]
+    fn a_target_that_never_cancels_dragover_gets_no_drop() {
+        let page = crate::page::Page::new(
+            "<html><body>
+                <div id='src' draggable='true'>drag me</div>
+                <div id='target'>inert</div>
+                <script>
+                  document.getElementById('target').addEventListener('drop', function () {
+                      document.getElementById('target').setAttribute('data-dropped', 'yes');
+                  });
+                </script>
+              </body></html>",
+            "#src { display: block; width: 200px; height: 40px; }
+             #target { display: block; width: 200px; height: 40px; }",
+            800.0,
+            600.0,
+        );
+        let mut app = app_with_page(page);
+        let (from_x, from_y) = window_point_in(&app, "src");
+        let (to_x, to_y) = window_point_in(&app, "target");
+
+        app.note_drag_candidate(from_x, from_y);
+        app.advance_drag(from_x + 20.0, from_y);
+        app.advance_drag(to_x, to_y);
+        app.finish_drag(to_x, to_y);
+
+        assert!(!app.drag.will_accept);
+        assert_eq!(attribute(&app, "target", "data-dropped"), None);
+    }
+
+    #[test]
+    fn files_dropped_on_the_window_reach_the_page_as_one_drop() {
+        let page = crate::page::Page::new(
+            "<html><body><div id='target'>drop files</div>
+                <script>
+                  var t = document.getElementById('target');
+                  t.addEventListener('dragover', function (e) { e.preventDefault(); });
+                  t.addEventListener('drop', function (e) {
+                      t.setAttribute('data-files', String(e.dataTransfer.files.length));
+                  });
+                </script>
+              </body></html>",
+            "#target { display: block; width: 400px; height: 200px; }",
+            800.0,
+            600.0,
+        );
+        let mut app = app_with_page(page);
+        app.cursor_pos = window_point_in(&app, "target");
+        app.pending_file_drops = vec![
+            std::path::PathBuf::from("/tmp/one.txt"),
+            std::path::PathBuf::from("/tmp/two.txt"),
+        ];
+
+        assert!(app.deliver_file_drops());
+        assert_eq!(
+            attribute(&app, "target", "data-files"),
+            Some("2".to_string())
+        );
+        assert!(
+            !app.deliver_file_drops(),
+            "and they are delivered only once"
         );
     }
 

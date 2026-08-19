@@ -666,7 +666,10 @@ globalThis.__removeListener = function (nodeId, type, cb) {
 };
 
 /// Fire `type` at one node. Returns how many listeners ran.
-globalThis.__dispatchEvent = function (nodeId, type) {
+///
+/// `detail` carries whatever the browser knows about this particular event —
+/// where the pointer was, which button — and is merged onto the event object.
+globalThis.__dispatchEvent = function (nodeId, type, detail) {
     var t = String(type).toLowerCase();
     var prevented = false;
     var event = {
@@ -679,6 +682,14 @@ globalThis.__dispatchEvent = function (nodeId, type) {
         },
         stopPropagation: function () {},
     };
+    if (detail) {
+        for (var k in detail) { event[k] = detail[k]; }
+    }
+    // Every drag event carries the same parcel, and a handler reaching for it
+    // has to see what the one before it put in.
+    if (t === 'drop' || t.indexOf('drag') === 0) {
+        event.dataTransfer = globalThis.__dataTransfer();
+    }
     var fired = 0;
     // Snapshot the list: a handler may add or remove listeners while running.
     var ls = globalThis.__listeners.slice();

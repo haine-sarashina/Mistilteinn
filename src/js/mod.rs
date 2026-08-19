@@ -1,5 +1,6 @@
 pub mod canvas;
 pub mod dom;
+pub mod dragdrop;
 pub mod navigator;
 pub mod storage;
 
@@ -29,6 +30,9 @@ pub fn init_js_engine_with_arena(arena: dom::SharedArena) -> Context {
     if let Err(e) = navigator::install(&mut context) {
         error!("Failed to install navigator bindings: {}", e);
     }
+    if let Err(e) = dragdrop::install(&mut context) {
+        error!("Failed to install drag and drop bindings: {}", e);
+    }
     info!("Initialized Boa JavaScript engine with DOM arena.");
     context
 }
@@ -51,9 +55,23 @@ impl DispatchOutcome {
 
 /// Fire `event_type` at one DOM node and report what ran.
 pub fn dispatch_event(context: &mut Context, node_id: u32, event_type: &str) -> DispatchOutcome {
+    dispatch_event_with_detail(context, node_id, event_type, "null")
+}
+
+/// [`dispatch_event`], with extra properties merged onto the event object.
+///
+/// `detail` is a JavaScript object literal — `{clientX: 12, clientY: 30}` —
+/// built by the caller, which is the only party that knows what this
+/// particular event was.
+pub fn dispatch_event_with_detail(
+    context: &mut Context,
+    node_id: u32,
+    event_type: &str,
+    detail: &str,
+) -> DispatchOutcome {
     // The flag is reset here rather than in the dispatcher so a caller walking
     // an ancestor chain can read it once at the end.
-    let script = format!("__dispatchEvent({node_id}, {event_type:?})");
+    let script = format!("__dispatchEvent({node_id}, {event_type:?}, {detail})");
     let fired = match context.eval(Source::from_bytes(script.as_bytes())) {
         Ok(value) => value.as_number().unwrap_or(0.0) as usize,
         Err(err) => {

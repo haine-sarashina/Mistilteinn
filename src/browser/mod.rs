@@ -1,5 +1,6 @@
 pub mod bookmarks;
 pub mod clipboard;
+pub mod dragdrop;
 pub mod find;
 pub mod geolocation;
 pub mod notifications;

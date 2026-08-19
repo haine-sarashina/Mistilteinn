@@ -384,12 +384,30 @@ impl Page {
     /// notified first. Layout is recomputed when any handler ran, because a
     /// handler is free to have changed the DOM.
     pub fn dispatch_event_along(&mut self, path: &[u32], event_type: &str) -> DispatchOutcome {
+        self.dispatch_event_along_with_detail(path, event_type, "null")
+    }
+
+    /// [`Self::dispatch_event_along`], with extra properties on the event.
+    ///
+    /// `detail` is a JavaScript object literal the caller builds — the pointer
+    /// position, say — since only the caller knows what this event was.
+    pub fn dispatch_event_along_with_detail(
+        &mut self,
+        path: &[u32],
+        event_type: &str,
+        detail: &str,
+    ) -> DispatchOutcome {
         self.make_active();
         crate::js::reset_default_prevented(&mut self.js_context);
 
         let mut total = DispatchOutcome::default();
         for &node_id in path.iter().rev() {
-            let outcome = crate::js::dispatch_event(&mut self.js_context, node_id, event_type);
+            let outcome = crate::js::dispatch_event_with_detail(
+                &mut self.js_context,
+                node_id,
+                event_type,
+                detail,
+            );
             total.fired += outcome.fired;
             total.default_prevented |= outcome.default_prevented;
         }

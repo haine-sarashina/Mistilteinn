@@ -1,3 +1,4 @@
+pub mod filter;
 /// GPU rendering pipeline using wgpu.
 ///
 /// Renders colored rectangles (layout boxes) and text to the window surface.

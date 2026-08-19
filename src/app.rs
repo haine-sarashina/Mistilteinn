@@ -38,6 +38,13 @@ const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 30.0;
 /// How long the smooth-scroll glide takes to cover ~63% of the remaining
 /// distance. Small enough that scrolling still feels attached to the wheel.
 const SCROLL_GLIDE_TAU: f32 = 0.07;
+
+/// How far the page has to scroll before the lazy-image walk runs again.
+///
+/// The check happens on the frames a glide moves the page, which is most of
+/// them; without a step the whole layout tree would be walked sixty times a
+/// second for a set of images that changes over hundreds of pixels.
+const LAZY_SCAN_STEP: f32 = 200.0;
 /// Below this the glide is over and the offset snaps, so it does not creep
 /// towards its target by ever smaller fractions of a pixel forever.
 const SCROLL_SNAP_DISTANCE: f32 = 0.5;
@@ -299,6 +306,15 @@ fn fit_label(
         keep -= 1;
     }
     "…".to_string()
+}
+
+/// The smallest rectangle containing both.
+fn union_rect(a: crate::layout::Rect, b: crate::layout::Rect) -> crate::layout::Rect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = a.right().max(b.right());
+    let bottom = a.bottom().max(b.bottom());
+    crate::layout::Rect::new(x, y, right - x, bottom - y)
 }
 
 /// Move the page's rectangles onto the screen and cut them to its pane.
@@ -1393,29 +1409,17 @@ impl MistilteinnApp {
             )
         };
 
-        for entry in &display_list {
+        // Paint one display item onto whichever buffer is being built: the page
+        // itself, or the scratch layer a filtered subtree is drawn into first.
+        let mut paint_entry = |target: &mut [u8], entry: &crate::layout::DisplayItem| {
             // An `overflow` clip on an ancestor keeps this item inside that
             // box. The bounds handed to the scissor may be generous — being too
             // large only means more area is correctly restored.
             let clip = entry.clip.map(to_screen_rect);
-            let bounds = match &entry.item {
-                crate::layout::PaintItem::Decoration(d) => {
-                    crate::layout::Rect::new(d.x, d.y, d.width, d.height)
-                }
-                crate::layout::PaintItem::Text(t) => crate::layout::Rect::new(
-                    t.x - t.font_size,
-                    t.y - t.font_size,
-                    t.width + t.font_size * 2.0,
-                    t.font_size * 3.0,
-                ),
-                crate::layout::PaintItem::Image(i) => {
-                    crate::layout::Rect::new(i.x, i.y, i.width.max(1.0), i.height.max(1.0))
-                }
-            };
-            let bounds = to_screen_rect(bounds);
+            let bounds = to_screen_rect(crate::layout::paint_bounds(&entry.item));
 
             crate::render::with_scissor(
-                &mut composite_buffer,
+                target,
                 win_w,
                 win_h,
                 bounds,
@@ -1555,6 +1559,80 @@ impl MistilteinnApp {
                         }
                     }
                 },
+            );
+        };
+
+        // Walk the display list, painting straight onto the page except where a
+        // `filter` claims a run of items. Those go onto a scratch layer of their
+        // own, are put through the filter, and are composited back — which is
+        // what makes the filter apply to the subtree as one picture rather than
+        // to each box separately.
+        let mut filter_scratch: Vec<u8> = Vec::new();
+        let mut index = 0;
+        while index < display_list.len() {
+            let Some(filter) = display_list[index].filter.clone() else {
+                paint_entry(&mut composite_buffer, &display_list[index]);
+                index += 1;
+                continue;
+            };
+
+            let end = display_list[index..]
+                .iter()
+                .position(|entry| {
+                    !entry
+                        .filter
+                        .as_ref()
+                        .is_some_and(|other| std::rc::Rc::ptr_eq(other, &filter))
+                })
+                .map(|offset| index + offset)
+                .unwrap_or(display_list.len());
+            let group = &display_list[index..end];
+            index = end;
+
+            // The area to filter is everything the group paints, grown by how
+            // far a blur or a shadow can carry paint outside it.
+            let mut region: Option<crate::layout::Rect> = None;
+            for entry in group {
+                let bounds = to_screen_rect(crate::layout::paint_bounds(&entry.item));
+                region = Some(match region {
+                    None => bounds,
+                    Some(current) => union_rect(current, bounds),
+                });
+            }
+            let Some(region) = region else { continue };
+            let region = crate::render::filter::Region {
+                x: region.x.floor() as i32,
+                y: region.y.floor() as i32,
+                width: region.width.ceil() as i32,
+                height: region.height.ceil() as i32,
+            }
+            .inflate(filter.outset())
+            .clamp_to(win_w, win_h);
+            if region.is_empty() {
+                continue;
+            }
+
+            if filter_scratch.is_empty() {
+                filter_scratch = vec![0u8; (win_w * win_h * 4) as usize];
+            } else {
+                crate::render::filter::clear_region(&mut filter_scratch, win_w, win_h, region);
+            }
+            for entry in group {
+                paint_entry(&mut filter_scratch, entry);
+            }
+            crate::render::filter::apply(
+                &mut filter_scratch,
+                win_w,
+                win_h,
+                region,
+                filter.functions(),
+            );
+            crate::render::filter::composite_region(
+                &mut composite_buffer,
+                &filter_scratch,
+                win_w,
+                win_h,
+                region,
             );
         }
 
@@ -2090,6 +2168,130 @@ impl MistilteinnApp {
     ///
     /// Fonts are fetched in CORS mode, as browsers do: a font file is only
     /// usable if the server that holds it agreed to share it across origins.
+    /// Fetch and decode a batch of images, several at a time.
+    ///
+    /// The requested size is only consulted for an SVG, which has no pixels of
+    /// its own and has to be rasterised at whatever the box asks for.
+    async fn fetch_images(
+        requests: Vec<(String, f32, f32)>,
+    ) -> Vec<(String, crate::page::CachedImage)> {
+        use futures::StreamExt;
+
+        let results =
+            futures::stream::iter(requests.into_iter().map(|(src, req_w, req_h)| async move {
+                match crate::network::fetch_image(&src).await {
+                    Ok(bytes) => {
+                        if let Ok(img) = image::load_from_memory(&bytes) {
+                            let rgba = img.to_rgba8();
+                            let (iw, ih) = rgba.dimensions();
+                            log::info!("Decoded image: {} ({}x{})", src, iw, ih);
+                            Some((src, rgba.into_raw(), iw, ih))
+                        } else if let Ok(svg_str) = std::str::from_utf8(&bytes) {
+                            if let Some((rgba, iw, ih)) =
+                                crate::render::render_svg_to_rgba(svg_str, req_w, req_h)
+                            {
+                                log::info!("Rendered SVG: {} ({}x{})", src, iw, ih);
+                                Some((src, rgba, iw, ih))
+                            } else {
+                                log::warn!("Failed to render SVG: {}", src);
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                }
+            }))
+            .buffer_unordered(6)
+            .collect::<Vec<_>>()
+            .await;
+
+        results
+            .into_iter()
+            .flatten()
+            .map(|(src, rgba, width, height)| {
+                (
+                    src,
+                    crate::page::CachedImage {
+                        rgba,
+                        width,
+                        height,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Fetch the `loading="lazy"` images the reader has just scrolled near.
+    ///
+    /// Runs from the frame loop, so it does as little as it can: the walk is
+    /// skipped unless the page has moved [`LAZY_SCAN_STEP`] since the last one,
+    /// and a URL already asked for is never asked for again. Returns whether a
+    /// picture arrived, which is the caller's cue to repaint.
+    async fn fetch_lazy_images_in_view(&mut self) -> bool {
+        let (win_w, win_h) = self.window_size();
+        let viewport = crate::layout::Rect::new(
+            0.0,
+            0.0,
+            self.content_width(win_w),
+            win_h as f32 - ADDRESS_BAR_HEIGHT as f32,
+        );
+        let scroll = self
+            .tab_manager
+            .active_tab()
+            .map(|tab| tab.scroll_offset)
+            .unwrap_or((0.0, 0.0));
+
+        let requests = {
+            let Some(page) = self.tab_manager.get_active_tab_page_mut() else {
+                return false;
+            };
+            if (scroll.1 - page.lazy_scan_y).abs() < LAZY_SCAN_STEP {
+                return false;
+            }
+            page.lazy_scan_y = scroll.1;
+
+            let looking_at =
+                crate::layout::Rect::new(scroll.0, scroll.1, viewport.width, viewport.height);
+            let requests: Vec<(String, f32, f32)> = page.pending_image_requests(looking_at);
+            page.mark_images_requested(requests.iter().map(|(url, _, _)| url.clone()));
+            requests
+        };
+
+        if requests.is_empty() {
+            return false;
+        }
+        log::info!(
+            "lazy loading {} image(s) scrolled into view",
+            requests.len()
+        );
+
+        let fetched = Self::fetch_images(requests).await;
+        if fetched.is_empty() {
+            return false;
+        }
+        let Some(page) = self.tab_manager.get_active_tab_page_mut() else {
+            return false;
+        };
+        for (src, image) in fetched {
+            page.image_cache.insert(src, image);
+        }
+        // The boxes were laid out at whatever size the markup claimed — often
+        // none at all — so the arrival of a picture moves everything after it.
+        page.recompute_with_hover(&[]);
+        true
+    }
+
+    /// [`Self::fetch_lazy_images_in_view`], driven from the synchronous frame
+    /// loop the way page loads are.
+    fn load_lazy_images_for_scroll(&mut self) -> bool {
+        let Some(handle) = self.tokio_rt.as_ref().map(|rt| rt.handle().clone()) else {
+            return false;
+        };
+        handle.block_on(self.fetch_lazy_images_in_view())
+    }
+
     async fn load_web_fonts(
         font_faces: &[crate::css::parser::FontFaceRule],
         resolve: &impl Fn(&str) -> String,
@@ -2180,8 +2382,6 @@ impl MistilteinnApp {
         base_url: Option<&str>,
         csp: &crate::network::security::Csp,
     ) {
-        use crate::network::security::{ResourceKind, SubresourceDecision, check_subresource};
-
         let w = self.content_width(self.window_width());
         let h = self.window_height() as f32 - ADDRESS_BAR_HEIGHT as f32;
 
@@ -2196,9 +2396,10 @@ impl MistilteinnApp {
             new_page.set_zoom(zoom);
         }
 
-        let image_nodes = crate::layout::collect_image_nodes(&new_page.layout_root);
-        // Resolve against <base href> when the document declares one; it is
-        // only knowable now that the HTML has been parsed.
+        // Resolving against `<base href>`, filtering by the page's policy, and
+        // leaving `loading="lazy"` images below the fold for later all belong
+        // to the page rather than to this load: the same walk runs again every
+        // time the reader scrolls.
         let effective_base = new_page.base_url();
         let resolve = |src: &str| -> String {
             if effective_base.is_empty() {
@@ -2207,44 +2408,10 @@ impl MistilteinnApp {
                 crate::network::resolve_url(&effective_base, src)
             }
         };
-
-        // An image that the page's policy forbids, or that would arrive in
-        // plaintext on a secure page, is filtered out here — before a request
-        // exists to be blocked later.
         let document_url = base_url.unwrap_or("").to_string();
-        let allowed_image = |url: String| -> Option<String> {
-            match check_subresource(&document_url, csp, &url, ResourceKind::Image) {
-                SubresourceDecision::Load(url) => Some(url),
-                SubresourceDecision::Block(reason) => {
-                    log::warn!("image blocked: {reason}");
-                    None
-                }
-            }
-        };
-
-        let mut resolved_images: Vec<(String, f32, f32)> = image_nodes
-            .iter()
-            .filter_map(|img| {
-                allowed_image(resolve(&img.src)).map(|url| (url, img.width, img.height))
-            })
-            .collect();
-
-        // CSS background images go through the same fetch and cache as <img>.
-        // The requested size is the box they fill, which is what an SVG needs
-        // to rasterize at a sensible resolution.
-        for deco in crate::layout::collect_decorations(&new_page.layout_root) {
-            if let Some(ref src) = deco.background_image {
-                let Some(url) = allowed_image(resolve(src)) else {
-                    continue;
-                };
-                if !resolved_images
-                    .iter()
-                    .any(|(existing, _, _)| existing == &url)
-                {
-                    resolved_images.push((url, deco.width, deco.height));
-                }
-            }
-        }
+        let resolved_images =
+            new_page.pending_image_requests(crate::layout::Rect::new(0.0, 0.0, w, h));
+        new_page.mark_images_requested(resolved_images.iter().map(|(url, _, _)| url.clone()));
 
         // Download the page's @font-face files before anything is measured
         // with them. The previous page's fonts go first — they are registered
@@ -2259,49 +2426,8 @@ impl MistilteinnApp {
         )
         .await;
 
-        // Fetch all images concurrently with throttling
-        use futures::StreamExt;
-        let results = futures::stream::iter(resolved_images.into_iter().map(
-            |(src, req_w, req_h)| async move {
-                match crate::network::fetch_image(&src).await {
-                    Ok(bytes) => {
-                        if let Ok(img) = image::load_from_memory(&bytes) {
-                            let rgba = img.to_rgba8();
-                            let (iw, ih) = rgba.dimensions();
-                            log::info!("Decoded image: {} ({}x{})", src, iw, ih);
-                            Some((src, rgba.into_raw(), iw, ih))
-                        } else if let Ok(svg_str) = std::str::from_utf8(&bytes) {
-                            if let Some((rgba, iw, ih)) =
-                                crate::render::render_svg_to_rgba(svg_str, req_w, req_h)
-                            {
-                                log::info!("Rendered SVG: {} ({}x{})", src, iw, ih);
-                                Some((src, rgba, iw, ih))
-                            } else {
-                                log::warn!("Failed to render SVG: {}", src);
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    Err(_) => None,
-                }
-            },
-        ))
-        .buffer_unordered(6)
-        .collect::<Vec<_>>()
-        .await;
-
-        for result in results.into_iter().flatten() {
-            let (src, rgba, width, height) = result;
-            new_page.image_cache.insert(
-                src,
-                crate::page::CachedImage {
-                    rgba,
-                    width,
-                    height,
-                },
-            );
+        for (src, image) in Self::fetch_images(resolved_images).await {
+            new_page.image_cache.insert(src, image);
         }
 
         // The first layout ran before any of this page's assets existed: text
@@ -4148,6 +4274,23 @@ impl ApplicationHandler for MistilteinnApp {
                 // clock, so it is where an animation gets its time from.
                 let (win_w, win_h) = self.window_size();
                 if self.step_scroll(win_w, win_h) {
+                    // Scrolling is what brings a `loading="lazy"` image into
+                    // range, so this is where one is noticed and fetched.
+                    self.load_lazy_images_for_scroll();
+                    self.recompose();
+                }
+
+                // A `transition` or `@keyframes` animation is a value that
+                // depends on the time, so the page has to be laid out again
+                // for every frame one is running.
+                if self
+                    .tab_manager
+                    .get_active_tab_page()
+                    .is_some_and(|page| page.animations_running())
+                {
+                    if let Some(page) = self.tab_manager.get_active_tab_page_mut() {
+                        page.advance_animations();
+                    }
                     self.recompose();
                 }
 

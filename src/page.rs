@@ -37,11 +37,108 @@ pub struct Page {
     /// reflows into the window rather than being scaled as a picture.
     pub zoom: f32,
     pub image_cache: FxHashMap<String, CachedImage>,
+    /// Every image URL already asked for, whether or not one arrived.
+    ///
+    /// A `loading="lazy"` image is fetched when the reader scrolls near it,
+    /// which is a check that runs every frame the page moves; without this, a
+    /// picture that 404s would be requested again on each of them.
+    pub requested_images: rustc_hash::FxHashSet<String>,
+    /// Where the page was scrolled to when the lazy-image walk last ran, so
+    /// the walk is not repeated for a scroll that cannot have changed its
+    /// answer. Starts far away, so the first check always runs.
+    pub lazy_scan_y: f32,
+    /// The policy this document was loaded under, kept so subresources fetched
+    /// later — a lazy image, say — are held to the same rules as the ones
+    /// fetched during load.
+    pub csp: crate::network::security::Csp,
     /// Merged (UA + author) stylesheet for style recomputation (e.g., :hover).
     pub stylesheet: crate::css::parser::Stylesheet,
     /// The page's JavaScript context, kept alive past the initial script run so
     /// registered event listeners can still be called.
     js_context: boa_engine::Context,
+    /// The transitions and `@keyframes` animations this page has running.
+    pub animator: crate::animator::Animator,
+    /// The hover path the styles were last computed with, so a frame driven by
+    /// an animation does not silently drop `:hover`.
+    last_hover: Vec<u32>,
+}
+
+/// How far outside the viewport a `loading="lazy"` image is still worth
+/// fetching.
+///
+/// A reader scrolling steadily should not have to watch a picture arrive after
+/// it is already on screen, so the fetch starts while it is still below the
+/// fold.
+pub const LAZY_LOAD_MARGIN: f32 = 600.0;
+
+impl Page {
+    /// The subresources this page wants but has not asked for yet.
+    ///
+    /// `viewport` is the part of the document the reader can see, in layout
+    /// coordinates. A `loading="lazy"` image outside it — and outside
+    /// [`LAZY_LOAD_MARGIN`] around it — is left for a later call, which is what
+    /// makes the attribute mean anything: on a long page it is the difference
+    /// between a few requests and a few hundred.
+    ///
+    /// Each entry is (url, requested width, requested height); the size matters
+    /// to an SVG, which has no pixels of its own to be rasterised at.
+    pub fn pending_image_requests(&self, viewport: Rect) -> Vec<(String, f32, f32)> {
+        use crate::network::security::{ResourceKind, SubresourceDecision, check_subresource};
+
+        let base = self.base_url();
+        let resolve = |src: &str| -> String {
+            if base.is_empty() {
+                src.to_string()
+            } else {
+                crate::network::resolve_url(&base, src)
+            }
+        };
+
+        let mut requests: Vec<(String, f32, f32)> = Vec::new();
+        let want = |src: &str, width: f32, height: f32, requests: &mut Vec<_>| {
+            let url = resolve(src);
+            if self.image_cache.contains_key(&url) || self.requested_images.contains(&url) {
+                return;
+            }
+            match check_subresource(&self.page_url, &self.csp, &url, ResourceKind::Image) {
+                SubresourceDecision::Load(url) => {
+                    if !requests.iter().any(|(existing, _, _)| existing == &url) {
+                        requests.push((url, width, height));
+                    }
+                }
+                SubresourceDecision::Block(reason) => log::warn!("image blocked: {reason}"),
+            }
+        };
+
+        for image in crate::layout::collect_image_nodes(&self.layout_root) {
+            if image.lazy && !within_reach(viewport, image.y, image.height) {
+                continue;
+            }
+            want(&image.src, image.width, image.height, &mut requests);
+        }
+
+        // A CSS background goes through the same fetch and cache as an `<img>`.
+        // There is no `loading` attribute to defer one, so they are all wanted
+        // straight away.
+        for decoration in crate::layout::collect_decorations(&self.layout_root) {
+            if let Some(ref src) = decoration.background_image {
+                want(src, decoration.width, decoration.height, &mut requests);
+            }
+        }
+
+        requests
+    }
+
+    /// Note that these URLs have been asked for, so they are not asked for again.
+    pub fn mark_images_requested(&mut self, urls: impl IntoIterator<Item = String>) {
+        self.requested_images.extend(urls);
+    }
+}
+
+/// Whether a box spanning `y..y + height` is close enough to `viewport` that a
+/// lazy image inside it should be fetched now.
+fn within_reach(viewport: Rect, y: f32, height: f32) -> bool {
+    y < viewport.bottom() + LAZY_LOAD_MARGIN && y + height.max(1.0) > viewport.y - LAZY_LOAD_MARGIN
 }
 
 impl Page {
@@ -127,7 +224,22 @@ impl Page {
         let stylesheet = css::merge_stylesheets_with_author(&ua_stylesheet, &author_stylesheet);
 
         // Stage 3: Compute styles for every element node
-        let styles = css::compute_styles_for_tree(&arena, &stylesheet, (view_width, view_height));
+        let mut styles =
+            css::compute_styles_for_tree(&arena, &stylesheet, (view_width, view_height));
+
+        // Stage 3.5: Let the clock have its say. An animation with no delay is
+        // already showing its first frame by the time the page is laid out, so
+        // the values it sets have to be in place before anything is measured.
+        let mut animator = crate::animator::Animator::new();
+        animator.apply(
+            &mut styles,
+            &stylesheet.keyframes,
+            css::LengthContext {
+                viewport_width: view_width,
+                viewport_height: view_height,
+                ..Default::default()
+            },
+        );
 
         // Stage 4: Build layout tree starting from document root (node 0)
         let mut layout_root = crate::layout::build_layout_tree(
@@ -188,8 +300,13 @@ impl Page {
             page_url: String::new(),
             zoom: 1.0,
             image_cache: FxHashMap::default(),
+            requested_images: rustc_hash::FxHashSet::default(),
+            lazy_scan_y: f32::NEG_INFINITY,
+            csp: csp.clone(),
             stylesheet,
             js_context,
+            animator,
+            last_hover: Vec::new(),
         };
 
         // The document exists now, so anything waiting on it can run. This
@@ -257,6 +374,23 @@ impl Page {
             hovered_ids,
             self.zoom,
         );
+        if hovered_ids != self.last_hover.as_slice() {
+            self.last_hover = hovered_ids.to_vec();
+        }
+
+        // The cascade says where each property is heading; this says how far it
+        // has got. It runs before the layout tree is built, so an animated
+        // width is measured at the width it currently has.
+        self.animator.apply(
+            &mut self.styles,
+            &self.stylesheet.keyframes,
+            css::LengthContext {
+                viewport_width: self.view_width,
+                viewport_height: self.view_height,
+                zoom: self.zoom,
+                ..Default::default()
+            },
+        );
 
         // Rebuild layout tree from new computed styles
         let get_node = |id: u32| self.arena.get(DomHandle(NodeId::from_raw(id)));
@@ -311,6 +445,24 @@ impl Page {
         );
     }
 
+    /// Whether this page has an animation or transition still moving.
+    ///
+    /// The frame loop asks every frame; while it is true the page is laid out
+    /// again and repainted, which is what makes an animation run.
+    pub fn animations_running(&self) -> bool {
+        self.animator.is_active()
+    }
+
+    /// Advance every running animation to the current moment and relayout.
+    ///
+    /// The hover path is the one the last recompute used, so an element being
+    /// pointed at does not lose `:hover` on the next animation frame.
+    pub fn advance_animations(&mut self) {
+        let hovered = std::mem::take(&mut self.last_hover);
+        self.recompute_with_hover(&hovered);
+        self.last_hover = hovered;
+    }
+
     /// Collect renderable rectangles with colors from the layout tree.
     pub fn collect_rects(&self) -> Vec<(Rect, Option<[u8; 4]>)> {
         crate::layout::collect_render_rects(&self.layout_root)
@@ -359,6 +511,142 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page with an eager image at the top and a lazy one far below it.
+    fn lazily_loaded_page() -> Page {
+        Page::new(
+            "<html><body>
+                <img src='top.png' width='100' height='100'>
+                <div class='filler'></div>
+                <img src='bottom.png' width='100' height='100' loading='lazy'>
+              </body></html>",
+            ".filler { display: block; height: 3000px; }",
+            800.0,
+            600.0,
+        )
+    }
+
+    #[test]
+    fn a_lazy_image_below_the_fold_is_not_requested_yet() {
+        let page = lazily_loaded_page();
+        let urls: Vec<String> = page
+            .pending_image_requests(Rect::new(0.0, 0.0, 800.0, 600.0))
+            .into_iter()
+            .map(|(url, _, _)| url)
+            .collect();
+        assert!(urls.iter().any(|url| url.contains("top.png")));
+        assert!(
+            !urls.iter().any(|url| url.contains("bottom.png")),
+            "the lazy image is 3000px down, so it can wait: {urls:?}"
+        );
+    }
+
+    #[test]
+    fn scrolling_to_a_lazy_image_asks_for_it() {
+        let page = lazily_loaded_page();
+        let urls: Vec<String> = page
+            .pending_image_requests(Rect::new(0.0, 2800.0, 800.0, 600.0))
+            .into_iter()
+            .map(|(url, _, _)| url)
+            .collect();
+        assert!(
+            urls.iter().any(|url| url.contains("bottom.png")),
+            "got {urls:?}"
+        );
+    }
+
+    #[test]
+    fn an_eager_image_is_requested_wherever_it_sits() {
+        let page = Page::new(
+            "<html><body>
+                <div style='height: 3000px'></div>
+                <img src='deep.png' width='10' height='10'>
+              </body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let urls: Vec<String> = page
+            .pending_image_requests(Rect::new(0.0, 0.0, 800.0, 600.0))
+            .into_iter()
+            .map(|(url, _, _)| url)
+            .collect();
+        assert!(urls.iter().any(|url| url.contains("deep.png")));
+    }
+
+    #[test]
+    fn an_image_already_asked_for_is_not_asked_for_again() {
+        let mut page = lazily_loaded_page();
+        let first = page.pending_image_requests(Rect::new(0.0, 0.0, 800.0, 600.0));
+        assert!(!first.is_empty());
+        page.mark_images_requested(first.into_iter().map(|(url, _, _)| url));
+        assert!(
+            page.pending_image_requests(Rect::new(0.0, 0.0, 800.0, 600.0))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_animation_is_already_showing_its_first_frame_when_the_page_is_laid_out() {
+        let page = Page::new(
+            "<html><body><div id='box'>x</div></body></html>",
+            "@keyframes grow { from { width: 20px } to { width: 400px } }
+             #box { display: block; animation: grow 100s linear infinite; }",
+            800.0,
+            600.0,
+        );
+        let width = find_box_width(&page.layout_root).expect("the box is laid out");
+        assert!(
+            (20.0..40.0).contains(&width),
+            "a hundred-second animation has barely begun: {width}"
+        );
+        assert!(
+            page.animations_running(),
+            "and it keeps the page repainting"
+        );
+    }
+
+    #[test]
+    fn a_page_with_no_animation_does_not_ask_to_be_repainted() {
+        let page = Page::new(
+            "<html><body><div id='box'>x</div></body></html>",
+            "#box { display: block; width: 200px; }",
+            800.0,
+            600.0,
+        );
+        assert!(!page.animations_running());
+    }
+
+    #[test]
+    fn a_transition_eases_a_change_the_cascade_makes() {
+        let mut page = Page::new(
+            "<html><body><div id='box'>x</div></body></html>",
+            "#box { display: block; width: 100px; transition: width 100s linear; }",
+            800.0,
+            600.0,
+        );
+        assert_eq!(find_box_width(&page.layout_root), Some(100.0));
+
+        // A script changing the style is the same kind of change a `:hover`
+        // rule makes: the cascade produces a new value, and the transition is
+        // what stops the box arriving there at once.
+        page.eval_script("document.getElementById('box').style.setProperty('width', '300px')");
+
+        let width = find_box_width(&page.layout_root).expect("the box is laid out");
+        assert!(
+            (100.0..120.0).contains(&width),
+            "the box has set out but not arrived: {width}"
+        );
+        assert!(page.animations_running());
+    }
+
+    /// The laid-out width of the box the animation tests use.
+    fn find_box_width(node: &crate::layout::LayoutNode) -> Option<f32> {
+        if node.dom_node_id.is_some() && node.rect.height > 0.0 && node.explicit_width.is_some() {
+            return Some(node.rect.width);
+        }
+        node.children.iter().find_map(find_box_width)
+    }
 
     #[test]
     fn page_new_parses_and_layouts() {

@@ -469,6 +469,9 @@ pub struct Stylesheet {
     pub imports: Vec<ImportRule>,
     pub media_rules: Vec<MediaRule>,
     pub font_faces: Vec<FontFaceRule>,
+    /// `@keyframes` rules, in source order. Looked up by name when an element
+    /// says `animation-name`.
+    pub keyframes: Vec<crate::css::KeyframesRule>,
 }
 
 /// Parse the body of an `@font-face` block.
@@ -698,6 +701,7 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
     let mut imports = Vec::new();
     let mut media_rules = Vec::new();
     let mut font_faces = Vec::new();
+    let mut keyframes = Vec::new();
     let mut pos = 0;
 
     while pos < source.len() {
@@ -748,11 +752,16 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
                             rules: inner_stylesheet.rules,
                         });
                         font_faces.extend(inner_stylesheet.font_faces);
+                        keyframes.extend(inner_stylesheet.keyframes);
                     } else if prelude
                         .get(..10)
                         .is_some_and(|p| p.eq_ignore_ascii_case("@font-face"))
                     {
                         font_faces.extend(parse_font_face(block_text));
+                    } else if let Some(name) = keyframes_name(prelude) {
+                        keyframes.extend(crate::css::animation::parse_keyframes_block(
+                            &name, block_text,
+                        ));
                     }
                     pos += brace_pos + 1 + block_end + 1;
                 } else {
@@ -802,7 +811,19 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
         imports,
         media_rules,
         font_faces,
+        keyframes,
     }
+}
+
+/// The name an `@keyframes` prelude declares, vendor prefix and all.
+fn keyframes_name(prelude: &str) -> Option<String> {
+    let prelude = prelude.trim();
+    let rest = prelude
+        .strip_prefix("@keyframes")
+        .or_else(|| prelude.strip_prefix("@-webkit-keyframes"))
+        .or_else(|| prelude.strip_prefix("@-moz-keyframes"))?;
+    let name = rest.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Finds the position of the `{` that opens a declaration block.
@@ -1429,6 +1450,41 @@ mod tests {
     #[test]
     fn parse_color_invalid() {
         assert!(crate::css::parse_color_value("invalid").is_none());
+    }
+
+    // -- @keyframes parsing tests --
+
+    #[test]
+    fn keyframes_are_collected_with_their_name() {
+        let ss = parse_stylesheet(
+            "@keyframes slide { from { left: 0px } to { left: 100px } } div { color: red }",
+        );
+        assert_eq!(ss.keyframes.len(), 1);
+        assert_eq!(ss.keyframes[0].name, "slide");
+        assert_eq!(ss.keyframes[0].keyframes.len(), 2);
+        assert_eq!(ss.rules.len(), 1, "the rule after it still parses");
+    }
+
+    #[test]
+    fn a_vendor_prefixed_keyframes_rule_is_read_the_same_way() {
+        let ss = parse_stylesheet("@-webkit-keyframes spin { from { left: 0 } to { left: 9px } }");
+        assert_eq!(ss.keyframes.len(), 1);
+        assert_eq!(ss.keyframes[0].name, "spin");
+    }
+
+    #[test]
+    fn keyframes_inside_a_media_block_are_still_collected() {
+        let ss = parse_stylesheet(
+            "@media screen { @keyframes fade { from { color: red } to { color: blue } } }",
+        );
+        assert_eq!(ss.keyframes.len(), 1);
+        assert_eq!(ss.keyframes[0].name, "fade");
+    }
+
+    #[test]
+    fn an_empty_keyframes_block_is_dropped() {
+        let ss = parse_stylesheet("@keyframes nothing { }");
+        assert!(ss.keyframes.is_empty());
     }
 
     // -- @font-face parsing tests --

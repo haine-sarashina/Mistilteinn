@@ -1,3 +1,4 @@
+pub mod animator;
 pub mod app;
 pub mod browser;
 pub mod css;

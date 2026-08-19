@@ -221,6 +221,9 @@ pub struct LayoutNode {
     pub max_width: Option<f32>,
     /// URL of an image source for <img> tags (None = not an image).
     pub image_src: Option<String>,
+    /// `loading="lazy"` — the picture is not worth fetching until the reader
+    /// scrolls near it.
+    pub lazy_image: bool,
     /// Line boxes for block containers with inline children (None = no inline layout computed yet).
     pub line_boxes: Option<Vec<LineBox>>,
     /// Overflow behavior for clipping/scrolling.
@@ -273,6 +276,9 @@ pub struct LayoutNode {
     pub transform: crate::css::Transform,
     /// `transform-origin` — the point the transform happens about.
     pub transform_origin: crate::css::TransformOrigin,
+    /// `filter` — paint-time effects applied to this box and its descendants
+    /// as one picture.
+    pub filter: crate::css::Filter,
     pub is_line_break: bool,
 }
 
@@ -309,11 +315,13 @@ impl LayoutNode {
             min_width: None,
             max_width: None,
             image_src: None,
+            lazy_image: false,
             line_boxes: None,
             overflow: Overflow::Visible,
             position: PositionType::Static,
             transform: crate::css::Transform::default(),
             transform_origin: crate::css::TransformOrigin::default(),
+            filter: crate::css::Filter::default(),
             offsets: [None, None, None, None],
             absolute_children: Vec::new(),
             font_size: 16.0,
@@ -4045,6 +4053,7 @@ fn generated_box(style: &ComputedValues, text: String) -> LayoutNode {
     node.z_index = style.z_index;
     node.transform = style.transform.clone();
     node.transform_origin = style.transform_origin;
+    node.filter = style.filter.clone();
     node
 }
 
@@ -4071,6 +4080,12 @@ fn apply_img_attributes<N: LayoutDomNode>(
         .width
         .or_else(|| attr_px("width"))
         .unwrap_or(0.0);
+
+    // `loading="lazy"` is the only value that defers; `eager` and anything
+    // unrecognised load straight away, as the HTML spec says.
+    layout_node.lazy_image = node
+        .get_attr("loading")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("lazy"));
 
     layout_node.image_src = node.get_attr("src").or_else(|| {
         node.get_attr("srcset").and_then(|attribute| {
@@ -4312,6 +4327,31 @@ pub struct DisplayItem {
     /// The intersection of every `overflow` clip between the root and this
     /// item, in layout coordinates. `None` means nothing clips it.
     pub clip: Option<Rect>,
+    /// The `filter` this item is painted through.
+    ///
+    /// Every item of one filtered subtree holds the same allocation, which is
+    /// how the painter recognises a group: it draws the run into a buffer of
+    /// its own, filters that, and composites the result. The area to filter is
+    /// the union of the group's own [`paint_bounds`], so nothing here has to be
+    /// kept in step when an ancestor moves the subtree afterwards.
+    pub filter: Option<std::rc::Rc<crate::css::Filter>>,
+}
+
+/// The area a paint item can touch, in layout coordinates.
+///
+/// Text is given room on every side: the position it carries is a baseline
+/// origin, and glyphs reach above and below it.
+pub fn paint_bounds(item: &PaintItem) -> Rect {
+    match item {
+        PaintItem::Decoration(d) => Rect::new(d.x, d.y, d.width, d.height),
+        PaintItem::Text(t) => Rect::new(
+            t.x - t.font_size,
+            t.y - t.font_size,
+            t.width + t.font_size * 2.0,
+            t.font_size * 3.0,
+        ),
+        PaintItem::Image(i) => Rect::new(i.x, i.y, i.width.max(1.0), i.height.max(1.0)),
+    }
 }
 
 /// The rectangle an `overflow` value other than `visible` clips its descendants
@@ -4350,7 +4390,11 @@ fn descendant_clip(node: &LayoutNode, inherited: Option<Rect>) -> Option<Rect> {
 /// `filter` and friends also do so in a real browser, but none of them are
 /// implemented here yet.
 fn establishes_stacking_context(node: &LayoutNode) -> bool {
-    (node.position != PositionType::Static && node.z_index.is_some()) || !node.transform.is_none()
+    (node.position != PositionType::Static && node.z_index.is_some())
+        || !node.transform.is_none()
+        // A filter turns the subtree into one picture before it is composited,
+        // so nothing outside it can paint in between.
+        || !node.filter.is_none()
 }
 
 /// Whether this box takes part in the positioned layers rather than the
@@ -4537,19 +4581,29 @@ fn paint_stacking_context_in(
     };
     let matrix = paint_matrix(root);
 
-    if dx == 0.0 && dy == 0.0 && matrix.is_identity() {
+    if dx == 0.0 && dy == 0.0 && matrix.is_identity() && root.filter.is_none() {
         paint_stacking_context_inner(root, clip, view, out);
         return;
     }
 
     let start = out.len();
     paint_stacking_context_inner(root, clip, view, out);
+    // One allocation for the whole subtree: the painter groups by which one an
+    // item points at, so every item painted through this filter has to share it.
+    let filter = (!root.filter.is_none()).then(|| std::rc::Rc::new(root.filter.clone()));
     for entry in &mut out[start..] {
         if !matrix.is_identity() {
             transform_display_item(entry, &matrix);
         }
         if dx != 0.0 || dy != 0.0 {
             translate_display_item(entry, dx, dy);
+        }
+        // A descendant that filters itself has already claimed its items. Its
+        // result is not filtered again by this box — nesting one filtered layer
+        // inside another would need a second offscreen pass, and the inner
+        // effect is the one the author is usually after.
+        if entry.filter.is_none() {
+            entry.filter.clone_from(&filter);
         }
     }
 }
@@ -4644,24 +4698,40 @@ fn paint_stacking_context_inner(
     out.extend(
         collect_own_decoration(root)
             .map(PaintItem::Decoration)
-            .map(|item| DisplayItem { item, clip }),
+            .map(|item| DisplayItem {
+                item,
+                clip,
+                filter: None,
+            }),
     );
 
     let inner = descendant_clip(root, clip);
 
     let mut layers = StackingLayers::default();
     // The root's own content belongs to the in-flow content of this context.
-    layers.inline_content.extend(
-        collect_own_text(root)
-            .into_iter()
-            .map(PaintItem::Text)
-            .map(|item| DisplayItem { item, clip: inner }),
-    );
-    layers.inline_content.extend(
-        collect_own_image(root)
-            .map(PaintItem::Image)
-            .map(|item| DisplayItem { item, clip: inner }),
-    );
+    layers
+        .inline_content
+        .extend(
+            collect_own_text(root)
+                .into_iter()
+                .map(PaintItem::Text)
+                .map(|item| DisplayItem {
+                    item,
+                    clip: inner,
+                    filter: None,
+                }),
+        );
+    layers
+        .inline_content
+        .extend(
+            collect_own_image(root)
+                .map(PaintItem::Image)
+                .map(|item| DisplayItem {
+                    item,
+                    clip: inner,
+                    filter: None,
+                }),
+        );
 
     for child in child_boxes(root) {
         collect_into_layers(
@@ -4716,10 +4786,10 @@ fn collect_into_layers<'a>(
         return;
     }
 
-    // A transformed box paints as a unit in the positioned layers, as CSS
-    // says — and that is also the only path that applies its transform, since
-    // it is the subtree walk that carries one.
-    if is_positioned(node) || !node.transform.is_none() {
+    // A transformed or filtered box paints as a unit in the positioned layers,
+    // as CSS says — and that is also the only path that applies either effect,
+    // since it is the subtree walk that carries them.
+    if is_positioned(node) || !node.transform.is_none() || !node.filter.is_none() {
         // Painted later in its own layer; the clip it inherited travels with it.
         let z = if establishes_stacking_context(node) {
             node.z_index.unwrap_or(0)
@@ -4756,7 +4826,11 @@ fn collect_into_layers<'a>(
     );
     let decoration = collect_own_decoration(node)
         .map(PaintItem::Decoration)
-        .map(|item| DisplayItem { item, clip });
+        .map(|item| DisplayItem {
+            item,
+            clip,
+            filter: None,
+        });
     if is_inline_level {
         layers.inline_content.extend(decoration);
     } else {
@@ -4769,18 +4843,30 @@ fn collect_into_layers<'a>(
     // A box with its own line boxes owns those runs outright — it is a block
     // container, so no ancestor's line boxes can have contained them.
     if !text_already_painted || node.line_boxes.is_some() {
-        layers.inline_content.extend(
-            collect_own_text(node)
-                .into_iter()
-                .map(PaintItem::Text)
-                .map(|item| DisplayItem { item, clip: inner }),
-        );
+        layers
+            .inline_content
+            .extend(
+                collect_own_text(node)
+                    .into_iter()
+                    .map(PaintItem::Text)
+                    .map(|item| DisplayItem {
+                        item,
+                        clip: inner,
+                        filter: None,
+                    }),
+            );
     }
-    layers.inline_content.extend(
-        collect_own_image(node)
-            .map(PaintItem::Image)
-            .map(|item| DisplayItem { item, clip: inner }),
-    );
+    layers
+        .inline_content
+        .extend(
+            collect_own_image(node)
+                .map(PaintItem::Image)
+                .map(|item| DisplayItem {
+                    item,
+                    clip: inner,
+                    filter: None,
+                }),
+        );
 
     for child in child_boxes(node) {
         // Suppression is inherited: inline layout flattens a whole inline
@@ -5013,6 +5099,8 @@ pub struct ImageInfo {
     pub height: f32,
     /// The source URL of the image.
     pub src: String,
+    /// Whether the markup asked for this one to wait until it is scrolled near.
+    pub lazy: bool,
 }
 
 /// Collect all image nodes from the layout tree for rendering.
@@ -5036,6 +5124,7 @@ pub fn collect_own_image(node: &LayoutNode) -> Option<ImageInfo> {
         width: node.rect.width,
         height: node.rect.height,
         src: src.clone(),
+        lazy: node.lazy_image,
     })
 }
 
@@ -5314,6 +5403,107 @@ mod scroll_and_sticky_tests {
     }
 
     /// A sticky box `top: 0` inside a tall section.
+    /// A filtered box with a child, so a display list has a run to group.
+    fn filtered_page(value: &str) -> LayoutNode {
+        let mut child = LayoutNode::new(Rect::new(10.0, 10.0, 100.0, 20.0));
+        child.background_color = Some([0, 0, 255, 255]);
+
+        let mut filtered = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 50.0));
+        filtered.background_color = Some([255, 0, 0, 255]);
+        filtered.filter = crate::css::Filter::parse(value, crate::css::LengthContext::default());
+        filtered.add_child(child);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(filtered);
+        root
+    }
+
+    #[test]
+    fn a_filter_reaches_every_item_of_its_subtree() {
+        let list = build_display_list(&filtered_page("blur(2px)"));
+        let filtered: Vec<_> = list.iter().filter(|e| e.filter.is_some()).collect();
+        assert_eq!(
+            filtered.len(),
+            2,
+            "the box and its child are both painted through it"
+        );
+        assert!(
+            std::rc::Rc::ptr_eq(
+                filtered[0].filter.as_ref().unwrap(),
+                filtered[1].filter.as_ref().unwrap()
+            ),
+            "and share one allocation, so the painter can group them"
+        );
+    }
+
+    #[test]
+    fn an_unfiltered_page_stamps_nothing() {
+        let list = build_display_list(&filtered_page("none"));
+        assert!(!list.is_empty());
+        assert!(list.iter().all(|entry| entry.filter.is_none()));
+    }
+
+    #[test]
+    fn a_filtered_box_is_laid_out_where_it_would_be_unfiltered() {
+        let plain = build_display_list(&filtered_page("none"));
+        let blurred = build_display_list(&filtered_page("blur(4px)"));
+        let boxes = |list: Vec<DisplayItem>| -> Vec<(f32, f32, f32, f32)> {
+            list.into_iter()
+                .filter_map(|entry| match entry.item {
+                    PaintItem::Decoration(d) => Some((d.x, d.y, d.width, d.height)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(boxes(plain), boxes(blurred));
+    }
+
+    #[test]
+    fn the_innermost_filter_claims_an_item() {
+        let mut inner = LayoutNode::new(Rect::new(0.0, 0.0, 50.0, 50.0));
+        inner.background_color = Some([0, 255, 0, 255]);
+        inner.filter = crate::css::Filter::parse("invert(1)", crate::css::LengthContext::default());
+
+        let mut outer = LayoutNode::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        outer.background_color = Some([255, 0, 0, 255]);
+        outer.filter = crate::css::Filter::parse("blur(1px)", crate::css::LengthContext::default());
+        outer.add_child(inner);
+
+        let mut root = LayoutNode::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        root.add_child(outer);
+
+        let list = build_display_list(&root);
+        let green = list
+            .iter()
+            .find(|entry| {
+                matches!(&entry.item, PaintItem::Decoration(d)
+                    if d.background_color == Some([0, 255, 0, 255]))
+            })
+            .expect("the inner box paints");
+        assert_eq!(
+            green.filter.as_ref().unwrap().functions(),
+            &[crate::css::FilterFn::Invert(1.0)]
+        );
+    }
+
+    #[test]
+    fn paint_bounds_gives_text_room_above_and_below_its_baseline() {
+        let text = PaintItem::Text(TextInfo {
+            text: "hi".to_string(),
+            font_size: 10.0,
+            x: 100.0,
+            y: 100.0,
+            width: 20.0,
+            color: [0, 0, 0, 255],
+            font_family: String::new(),
+            text_style: crate::css::TextStyleFlags::default(),
+        });
+        let bounds = paint_bounds(&text);
+        assert_eq!(bounds.x, 90.0);
+        assert_eq!(bounds.y, 90.0);
+        assert_eq!(bounds.height, 30.0);
+    }
+
     fn sticky_page() -> LayoutNode {
         let mut section = LayoutNode::new(Rect::new(0.0, 100.0, 800.0, 1000.0));
         let mut header = LayoutNode::new(Rect::new(0.0, 100.0, 800.0, 40.0));

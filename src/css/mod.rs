@@ -1,4 +1,9 @@
+pub mod animation;
+pub mod filter;
 pub mod parser;
+
+pub use animation::{Animation, AnimationDirection, Easing, FillMode, KeyframesRule, Transitions};
+pub use filter::{Filter, FilterFn};
 
 use rustc_hash::FxHashMap;
 
@@ -177,7 +182,7 @@ fn parse_named_color(color: &str) -> Option<(u8, u8, u8)> {
 // ------ Declaration ------
 
 /// A parsed CSS declaration (property: value).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Declaration {
     pub property: String,
     pub value: String,
@@ -429,7 +434,7 @@ fn resolve_root_font_size(
 ///
 /// The CSS initial values, except that the initial font size is scaled by the
 /// page zoom: text nobody sized explicitly has to grow with everything else.
-fn initial_values(zoom: f32) -> ComputedValues {
+pub fn initial_values(zoom: f32) -> ComputedValues {
     ComputedValues {
         font_size: DEFAULT_FONT_SIZE * zoom,
         ..ComputedValues::default()
@@ -1483,6 +1488,15 @@ pub struct ComputedValues {
     pub transform: Transform,
     /// `transform-origin` — the point that is done about.
     pub transform_origin: TransformOrigin,
+    /// `filter` — the paint-time effects the box and its descendants go
+    /// through. Does not inherit: a filtered box filters its subtree as one
+    /// picture, rather than each descendant filtering itself again.
+    pub filter: Filter,
+    /// `animation-*` — the `@keyframes` rule this element is running, if any.
+    pub animation: Animation,
+    /// `transition-*` — which of this element's properties ease into their new
+    /// values rather than jumping to them.
+    pub transitions: Transitions,
     // CSS Custom Properties (CSS variables --*)
     pub custom_properties: rustc_hash::FxHashMap<String, String>,
 }
@@ -2235,6 +2249,9 @@ impl Default for ComputedValues {
             content: Content::default(),
             transform: Transform::default(),
             transform_origin: TransformOrigin::default(),
+            filter: Filter::default(),
+            animation: Animation::default(),
+            transitions: Transitions::default(),
             custom_properties: rustc_hash::FxHashMap::default(),
         }
     }
@@ -2433,6 +2450,106 @@ impl ComputedValues {
     /// size this element has accumulated so far, which — because inheritance
     /// runs before declarations are re-applied — is the parent's font size for
     /// a `font-size` declaration, and the element's own font size afterwards.
+    /// This element's value for an animatable property, written the way CSS
+    /// would write it.
+    ///
+    /// A transition has to notice that a value changed and then blend between
+    /// the old one and the new. Both need a written form: the interpolation
+    /// works on values as text, so that one routine can serve every property
+    /// rather than each one growing its own blend.
+    ///
+    /// `None` means the property is not one this engine animates, or the
+    /// element does not set it.
+    pub fn animatable_value(&self, property: &str) -> Option<String> {
+        let color = |rgba: Option<[u8; 4]>| {
+            rgba.map(|[r, g, b, a]| format!("rgba({r}, {g}, {b}, {})", a as f32 / 255.0))
+        };
+        let px = |value: f32| Some(format!("{value}px"));
+
+        match property {
+            "color" => color(self.color),
+            "background-color" => color(self.background_color),
+            "border-color" => color(self.border_color[0]),
+            "border-radius" => px(self.border_radius),
+            "border-width" => px(self.border_width[0]),
+            "width" => self.width.and_then(px),
+            "height" => self.height.and_then(px),
+            "min-width" => self.min_width.and_then(px),
+            "max-width" => self.max_width.and_then(px),
+            "top" => self.offset_top.and_then(px),
+            "right" => self.offset_right.and_then(px),
+            "bottom" => self.offset_bottom.and_then(px),
+            "left" => self.offset_left.and_then(px),
+            "margin-top" => px(self.margin[0]),
+            "margin-right" => px(self.margin[1]),
+            "margin-bottom" => px(self.margin[2]),
+            "margin-left" => px(self.margin[3]),
+            "padding-top" => px(self.padding[0]),
+            "padding-right" => px(self.padding[1]),
+            "padding-bottom" => px(self.padding[2]),
+            "padding-left" => px(self.padding[3]),
+            "font-size" => px(self.font_size),
+            "line-height" => Some(format!("{}", self.line_height)),
+            "row-gap" => px(self.row_gap),
+            "column-gap" => px(self.column_gap),
+            "flex-grow" => Some(format!("{}", self.flex_grow)),
+            "flex-shrink" => Some(format!("{}", self.flex_shrink)),
+            _ => None,
+        }
+    }
+
+    /// Apply one `transition-*` longhand.
+    ///
+    /// The longhands are four parallel lists that line up by position, so a
+    /// value is written into every entry the property list has — and the
+    /// property list itself is what decides how many entries there are.
+    fn apply_transition_longhand(&mut self, property: &str, value: &str) {
+        use animation::TransitionEntry;
+
+        let parts = animation::split_top_level_commas(value);
+        if property == "transition-property" {
+            self.transitions.entries = parts
+                .iter()
+                .map(|name| TransitionEntry {
+                    property: name.to_ascii_lowercase(),
+                    duration: 0.0,
+                    delay: 0.0,
+                    easing: Easing::default(),
+                })
+                .collect();
+            return;
+        }
+        // A duration written before the property list still has to land
+        // somewhere, so an entry is made for it.
+        if self.transitions.entries.is_empty() {
+            self.transitions.entries.push(TransitionEntry {
+                property: "all".to_string(),
+                duration: 0.0,
+                delay: 0.0,
+                easing: Easing::default(),
+            });
+        }
+
+        for (index, entry) in self.transitions.entries.iter_mut().enumerate() {
+            // A shorter list repeats, as CSS says.
+            let Some(part) = parts.get(index % parts.len().max(1)) else {
+                break;
+            };
+            match property {
+                "transition-duration" => {
+                    entry.duration = animation::parse_time(part).unwrap_or(0.0)
+                }
+                "transition-delay" => entry.delay = animation::parse_time(part).unwrap_or(0.0),
+                "transition-timing-function" => {
+                    if let Some(easing) = Easing::parse(part) {
+                        entry.easing = easing;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn from_declaration_with_ctx(
         mut self,
         decl: &Declaration,
@@ -2908,6 +3025,55 @@ impl ComputedValues {
             }
             "transform-origin" => {
                 self.transform_origin = TransformOrigin::parse(val, ctx);
+            }
+            "filter" => {
+                self.filter = Filter::parse(val, ctx);
+            }
+            "transition" => {
+                self.transitions = Transitions::parse_shorthand(val);
+            }
+            "transition-property"
+            | "transition-duration"
+            | "transition-delay"
+            | "transition-timing-function" => {
+                self.apply_transition_longhand(&prop, val);
+            }
+            "animation" | "-webkit-animation" => {
+                self.animation = Animation::parse_shorthand(val);
+            }
+            "animation-name" => {
+                self.animation.name = val
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_string();
+            }
+            "animation-duration" => {
+                self.animation.duration = animation::parse_time(val).unwrap_or(0.0);
+            }
+            "animation-delay" => {
+                self.animation.delay = animation::parse_time(val).unwrap_or(0.0);
+            }
+            "animation-timing-function" => {
+                if let Some(easing) = Easing::parse(val) {
+                    self.animation.easing = easing;
+                }
+            }
+            "animation-iteration-count" => {
+                self.animation.iterations = if val.trim().eq_ignore_ascii_case("infinite") {
+                    None
+                } else {
+                    Some(val.trim().parse::<f32>().unwrap_or(1.0).max(0.0))
+                };
+            }
+            "animation-direction" => {
+                if let Some(direction) = animation::parse_direction(val) {
+                    self.animation.direction = direction;
+                }
+            }
+            "animation-fill-mode" => {
+                if let Some(fill) = animation::parse_fill_mode(val) {
+                    self.animation.fill_mode = fill;
+                }
             }
             "z-index" => {
                 // `auto` (and anything unparseable) leaves the element in
@@ -3930,6 +4096,7 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
         imports: Vec::new(),
         media_rules: Vec::new(),
         font_faces: Vec::new(),
+        keyframes: Vec::new(),
     }
 }
 
@@ -3950,8 +4117,9 @@ pub fn merge_stylesheets_with_author(
         rules,
         imports,
         media_rules: author.media_rules.clone(),
-        // The UA sheet declares no web fonts.
+        // The UA sheet declares neither web fonts nor animations.
         font_faces: author.font_faces.clone(),
+        keyframes: author.keyframes.clone(),
     }
 }
 

@@ -227,6 +227,11 @@ impl TabManager {
         self.active_tab().and_then(|t| t.page.as_ref())
     }
 
+    /// Get a mutable reference to the active tab's page, if any.
+    pub fn get_active_tab_page_mut(&mut self) -> Option<&mut Page> {
+        self.active_tab_mut().and_then(|t| t.page.as_mut())
+    }
+
     /// Get a mutable reference to the active tab's scroll offset, if any.
     pub fn get_active_tab_scroll_mut(&mut self) -> Option<&mut (f32, f32)> {
         self.active_tab_mut().map(|t| &mut t.scroll_offset)

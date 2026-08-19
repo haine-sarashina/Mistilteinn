@@ -3999,6 +3999,15 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
         ("video", "display: inline-block; background-color: #000000"),
         ("audio", "display: inline-block"),
         ("canvas", "display: inline-block"),
+        // Embedded documents. The border is the one browsers have always drawn
+        // round an iframe, and is what makes the boundary between the two
+        // documents visible.
+        (
+            "iframe",
+            "display: inline-block; border: 2px solid #c0c0c0; background-color: #ffffff",
+        ),
+        ("object", "display: inline-block"),
+        ("embed", "display: inline-block"),
         ("source", "display: none"),
         ("track", "display: none"),
         (

@@ -308,6 +308,52 @@ fn fit_label(
     "…".to_string()
 }
 
+/// Append the paint order of every document `page` embeds, moved into place.
+///
+/// A frame's layout is in its own coordinates, with the origin at its top-left,
+/// so each item is shifted to the content box of the element holding it and
+/// clipped to it. Nesting is followed to the same depth the loader goes to.
+fn append_frame_display_lists(
+    page: &crate::page::Page,
+    out: &mut Vec<crate::layout::DisplayItem>,
+    depth: usize,
+) {
+    if depth >= MistilteinnApp::MAX_FRAME_DEPTH {
+        return;
+    }
+    for frame in page.frame_boxes() {
+        let Some(framed) = page.frame(frame.dom_node_id) else {
+            continue;
+        };
+        let mut items = crate::layout::build_display_list_with_scroll(
+            &framed.layout_root,
+            (0.0, 0.0),
+            (frame.content.width, frame.content.height),
+        );
+        append_frame_display_lists(framed, &mut items, depth + 1);
+
+        for item in &mut items {
+            crate::layout::offset_display_item(item, frame.content.x, frame.content.y);
+            // The frame's own edge cuts everything inside it, on top of
+            // whatever the parent was already clipping the box to.
+            item.clip = Some(match item.clip {
+                Some(existing) => intersect_rect(existing, frame.content),
+                None => frame.content,
+            });
+        }
+        out.extend(items);
+    }
+}
+
+/// The overlap of two rectangles, empty when they do not meet.
+fn intersect_rect(a: crate::layout::Rect, b: crate::layout::Rect) -> crate::layout::Rect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let right = a.right().min(b.right());
+    let bottom = a.bottom().min(b.bottom());
+    crate::layout::Rect::new(x, y, (right - x).max(0.0), (bottom - y).max(0.0))
+}
+
 /// The smallest rectangle containing both.
 fn union_rect(a: crate::layout::Rect, b: crate::layout::Rect) -> crate::layout::Rect {
     let x = a.x.min(b.x);
@@ -1374,11 +1420,15 @@ impl MistilteinnApp {
         // put every positioned overlay underneath the text it should cover.
         // The scroll position goes in because `position: sticky` is the one
         // thing whose painted place depends on it.
-        let display_list = crate::layout::build_display_list_with_scroll(
+        let mut display_list = crate::layout::build_display_list_with_scroll(
             &page.layout_root,
             scroll_offset,
             (content_width, win_h as f32 - ADDRESS_BAR_HEIGHT as f32),
         );
+        // An embedded document paints inside the box that holds it, so its own
+        // paint order is built, moved to that box and cut to it, then appended
+        // — after the box's border, which is the parent's to draw.
+        append_frame_display_lists(page, &mut display_list, 0);
 
         // Allocate full-window RGBA buffer (transparent background)
         let mut composite_buffer = vec![0u8; (win_w * win_h * 4) as usize];
@@ -2206,6 +2256,112 @@ impl MistilteinnApp {
     ///
     /// Fonts are fetched in CORS mode, as browsers do: a font file is only
     /// usable if the server that holds it agreed to share it across origins.
+    /// How deep a stack of embedded documents is followed.
+    ///
+    /// A page can frame itself, directly or through a chain of others, and
+    /// there is nothing on the network that would stop it.
+    const MAX_FRAME_DEPTH: usize = 3;
+
+    /// Load the documents a page embeds, and the documents those embed.
+    ///
+    /// Each frame is fetched, parsed and laid out at the size of the box it
+    /// sits in — a page in its own right, with its own cascade and its own
+    /// scripts. Its pictures are merged into the parent's image cache, which is
+    /// keyed by absolute URL and so cannot collide.
+    fn load_frames<'a>(
+        page: &'a mut crate::page::Page,
+        csp: &'a crate::network::security::Csp,
+        depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+        use crate::network::security::{ResourceKind, SubresourceDecision, check_subresource};
+
+        Box::pin(async move {
+            if depth >= Self::MAX_FRAME_DEPTH {
+                return;
+            }
+            let base = page.base_url();
+            let document_url = page.page_url.clone();
+
+            let wanted: Vec<(u32, String, f32, f32)> = page
+                .frame_boxes()
+                .into_iter()
+                .filter_map(|frame| {
+                    let url = if base.is_empty() {
+                        frame.src.clone()
+                    } else {
+                        crate::network::resolve_url(&base, &frame.src)
+                    };
+                    match check_subresource(&document_url, csp, &url, ResourceKind::Frame) {
+                        SubresourceDecision::Load(url) => Some((
+                            frame.dom_node_id,
+                            url,
+                            frame.content.width,
+                            frame.content.height,
+                        )),
+                        SubresourceDecision::Block(reason) => {
+                            log::warn!("frame blocked: {reason}");
+                            None
+                        }
+                    }
+                })
+                .collect();
+
+            for (dom_node_id, url, width, height) in wanted {
+                if width < 1.0 || height < 1.0 {
+                    continue;
+                }
+                let Some(mut framed) = Self::load_framed_document(&url, width, height).await else {
+                    continue;
+                };
+                Self::load_frames(&mut framed, csp, depth + 1).await;
+
+                // The parent paints the child, so it is the parent's cache the
+                // painter reaches into.
+                let images = std::mem::take(&mut framed.image_cache);
+                page.image_cache.extend(images);
+                page.set_frame(dom_node_id, framed);
+            }
+        })
+    }
+
+    /// Fetch one embedded document and lay it out at the size of its box.
+    async fn load_framed_document(url: &str, width: f32, height: f32) -> Option<crate::page::Page> {
+        let fetched = match crate::network::fetch(url).await {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                log::warn!("failed to fetch framed document {url}: {error:?}");
+                return None;
+            }
+        };
+
+        let final_url = fetched.final_url;
+        let html = fetched.content;
+
+        // A framed document brings its own policy, which governs what it in
+        // turn loads — the parent's does not reach inside it.
+        let mut policies = fetched.csp;
+        policies.extend(crate::network::security::meta_csp(&html));
+        let csp = crate::network::security::Csp::parse(&policies);
+
+        let css = crate::network::fetch_external_css(&final_url, &html, &csp)
+            .await
+            .unwrap_or_else(|_| crate::network::extract_css(&html));
+
+        let mut framed = crate::page::Page::new_with_csp(&html, &css, width, height, &csp);
+        framed.page_url = final_url;
+
+        let requests =
+            framed.pending_image_requests(crate::layout::Rect::new(0.0, 0.0, width, height));
+        framed.mark_images_requested(requests.iter().map(|(url, _, _)| url.clone()));
+        for (src, image) in Self::fetch_images(requests).await {
+            framed.image_cache.insert(src, image);
+        }
+        if !framed.image_cache.is_empty() {
+            framed.recompute_with_hover(&[]);
+        }
+        Some(framed)
+    }
+
     /// Fetch and decode a batch of images, several at a time.
     ///
     /// The requested size is only consulted for an SVG, which has no pixels of
@@ -2475,6 +2631,11 @@ impl MistilteinnApp {
         if crate::render::text::web_font_count() > 0 || !new_page.image_cache.is_empty() {
             new_page.recompute_with_hover(&[]);
         }
+
+        // Embedded documents come last: each is a page in its own right, and
+        // laying one out needs the box it sits in, which only exists once the
+        // parent has been measured with its own pictures in place.
+        Self::load_frames(&mut new_page, csp, 0).await;
 
         if let Some(tab) = self.tab_manager.active_tab_mut() {
             tab.title = new_page.title.clone();
@@ -4660,6 +4821,121 @@ mod tests {
 
     /// The window every test measures against.
     const TEST_WINDOW: (u32, u32) = (1280, 800);
+
+    /// A page with one iframe, holding a document with a red block in it.
+    fn page_with_a_frame() -> crate::page::Page {
+        let mut page = crate::page::Page::new(
+            "<html><body><iframe src='inner.html' width='200' height='100'></iframe></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let holder = page.frame_boxes()[0].dom_node_id;
+        let inner = crate::page::Page::new(
+            "<html><body><div id='mark'></div></body></html>",
+            "#mark { display: block; width: 400px; height: 400px; background-color: #ff0000; }",
+            196.0,
+            96.0,
+        );
+        page.set_frame(holder, inner);
+        page
+    }
+
+    /// Where the framed document's red block is painted, and what clips it.
+    fn framed_mark(page: &crate::page::Page) -> (crate::layout::Rect, Option<crate::layout::Rect>) {
+        let mut list = crate::layout::build_display_list_with_scroll(
+            &page.layout_root,
+            (0.0, 0.0),
+            (800.0, 600.0),
+        );
+        append_frame_display_lists(page, &mut list, 0);
+        list.into_iter()
+            .find_map(|entry| match entry.item {
+                crate::layout::PaintItem::Decoration(d)
+                    if d.background_color == Some([255, 0, 0, 255]) =>
+                {
+                    Some((
+                        crate::layout::Rect::new(d.x, d.y, d.width, d.height),
+                        entry.clip,
+                    ))
+                }
+                _ => None,
+            })
+            .expect("the framed document paints its block")
+    }
+
+    #[test]
+    fn a_framed_document_is_painted_inside_the_box_that_holds_it() {
+        let page = page_with_a_frame();
+        let frame = page.frame_boxes()[0].clone();
+        let (rect, _) = framed_mark(&page);
+
+        // The framed document lays itself out from its own origin — its body
+        // margin and all — and the whole thing is then carried to the content
+        // box of the element holding it.
+        let framed = page.frame(frame.dom_node_id).expect("the frame is loaded");
+        let alone = crate::layout::build_display_list_with_scroll(
+            &framed.layout_root,
+            (0.0, 0.0),
+            (frame.content.width, frame.content.height),
+        )
+        .into_iter()
+        .find_map(|entry| match entry.item {
+            crate::layout::PaintItem::Decoration(d)
+                if d.background_color == Some([255, 0, 0, 255]) =>
+            {
+                Some((d.x, d.y))
+            }
+            _ => None,
+        })
+        .expect("the document paints its block on its own too");
+
+        assert_eq!(
+            (rect.x, rect.y),
+            (frame.content.x + alone.0, frame.content.y + alone.1)
+        );
+        assert!(rect.x >= frame.content.x && rect.y >= frame.content.y);
+    }
+
+    #[test]
+    fn a_framed_document_is_cut_to_its_frame() {
+        let page = page_with_a_frame();
+        let frame = page.frame_boxes()[0].clone();
+        let (rect, clip) = framed_mark(&page);
+        assert!(
+            rect.width > frame.content.width,
+            "the block is deliberately wider than the frame"
+        );
+        assert_eq!(
+            clip,
+            Some(frame.content),
+            "so the frame has to be what stops it spilling onto the page"
+        );
+    }
+
+    #[test]
+    fn a_frame_with_no_document_in_it_paints_nothing_extra() {
+        let page = crate::page::Page::new(
+            "<html><body><iframe src='inner.html'></iframe></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let mut list = Vec::new();
+        append_frame_display_lists(&page, &mut list, 0);
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn frames_stop_being_followed_at_the_depth_limit() {
+        let page = page_with_a_frame();
+        let mut list = Vec::new();
+        append_frame_display_lists(&page, &mut list, MistilteinnApp::MAX_FRAME_DEPTH);
+        assert!(
+            list.is_empty(),
+            "a page that frames itself must not be followed forever"
+        );
+    }
 
     /// An app with one active tab showing `page`.
     ///

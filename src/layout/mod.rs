@@ -229,6 +229,10 @@ pub struct LayoutNode {
     pub media: Option<MediaKind>,
     /// Whether the media element asked for playback controls.
     pub media_controls: bool,
+    /// The document this box embeds, still relative to the parent's base URL.
+    /// An `<iframe>` — or an `<object>`/`<embed>` naming a document — is a
+    /// browsing context of its own, painted inside this box.
+    pub frame_src: Option<String>,
     /// Whether this box is a `<canvas>`. Its picture is not in the document —
     /// it is whatever script has drawn — so the painter fetches it from the
     /// page's canvas store rather than from the image cache.
@@ -328,6 +332,7 @@ impl LayoutNode {
             media: None,
             media_controls: false,
             is_canvas: false,
+            frame_src: None,
             line_boxes: None,
             overflow: Overflow::Visible,
             position: PositionType::Static,
@@ -827,6 +832,7 @@ fn build_layout_children<N, F>(
                     apply_form_control_defaults(&tag, &node, &mut layout_node, get_node);
                     apply_media_defaults(&tag, &node, &mut layout_node, &child_styles);
                     apply_canvas_defaults(&tag, &node, &mut layout_node, &child_styles);
+                    apply_frame_defaults(&tag, &node, &mut layout_node, &child_styles);
 
                     // Track DOM node ID for hit-testing / :hover
                     layout_node.dom_node_id = Some(child_id);
@@ -835,6 +841,8 @@ fn build_layout_children<N, F>(
                         || layout_node.image_src.is_some()
                         || layout_node.media.is_some()
                         || layout_node.is_canvas
+                        || layout_node.frame_src.is_some()
+                        || matches!(tag.as_str(), "iframe" | "object" | "embed")
                     {
                         // Leaf image, SVG, media or canvas node — its
                         // descendants are its data or its fallback, and neither
@@ -1003,6 +1011,7 @@ fn build_layout_children<N, F>(
                     apply_form_control_defaults(&tag, &node, &mut layout_node, get_node);
                     apply_media_defaults(&tag, &node, &mut layout_node, &child_styles);
                     apply_canvas_defaults(&tag, &node, &mut layout_node, &child_styles);
+                    apply_frame_defaults(&tag, &node, &mut layout_node, &child_styles);
 
                     // Track DOM node ID for hit-testing / :hover
                     layout_node.dom_node_id = Some(child_id);
@@ -1011,6 +1020,8 @@ fn build_layout_children<N, F>(
                         || layout_node.image_src.is_some()
                         || layout_node.media.is_some()
                         || layout_node.is_canvas
+                        || layout_node.frame_src.is_some()
+                        || matches!(tag.as_str(), "iframe" | "object" | "embed")
                     {
                         // Leaf image, SVG, media or canvas node — its
                         // descendants are its data or its fallback, and neither
@@ -3509,6 +3520,80 @@ where
     }
 }
 
+/// The CSS default size of an embedded document.
+const FRAME_DEFAULT_SIZE: (f32, f32) = (300.0, 150.0);
+
+/// Set up an `<iframe>`, `<object>` or `<embed>` as embedded content.
+///
+/// All three are replaced elements of a fixed size that hold something the
+/// parent document does not own. An `<object>` or `<embed>` pointing at a
+/// picture is a picture — that is what the elements were for before `<img>`
+/// took over — so it goes through the image pipeline; anything else is treated
+/// as a document and gets a browsing context of its own.
+fn apply_frame_defaults<N: LayoutDomNode>(
+    tag: &str,
+    node: &N,
+    layout_node: &mut LayoutNode,
+    child_styles: &ComputedValues,
+) {
+    let source = match tag {
+        "iframe" => node.get_attr("src"),
+        // `<object>` names its resource with `data`, `<embed>` with `src`.
+        "object" => node.get_attr("data"),
+        "embed" => node.get_attr("src"),
+        _ => return,
+    };
+
+    let declared_type = node.get_attr("type").unwrap_or_default();
+    let source = source.filter(|src| !src.trim().is_empty());
+    if let Some(src) = source {
+        if tag != "iframe" && looks_like_an_image(&src, &declared_type) {
+            layout_node.image_src = Some(src);
+        } else {
+            layout_node.frame_src = Some(src);
+        }
+    }
+
+    let attr_px = |name: &str| {
+        node.get_attr(name)
+            .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
+    };
+    let width = child_styles
+        .width
+        .or_else(|| attr_px("width"))
+        .unwrap_or(FRAME_DEFAULT_SIZE.0);
+    let height = child_styles
+        .height
+        .or_else(|| attr_px("height"))
+        .unwrap_or(FRAME_DEFAULT_SIZE.1);
+
+    layout_node.rect.width = width;
+    layout_node.rect.height = height;
+    layout_node.explicit_width = Some(width);
+    layout_node.explicit_height = Some(height);
+}
+
+/// Whether an `<object>` or `<embed>` is pointing at a picture.
+fn looks_like_an_image(src: &str, declared_type: &str) -> bool {
+    if declared_type
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("image/")
+    {
+        return true;
+    }
+    let path = src
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(src)
+        .to_ascii_lowercase();
+    [
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico",
+    ]
+    .iter()
+    .any(|extension| path.ends_with(extension))
+}
+
 /// Give a `<canvas>` the size it declares.
 ///
 /// The `width` and `height` attributes are the size of the bitmap, and — unless
@@ -4661,6 +4746,14 @@ fn sticky_offset(node: &LayoutNode, containing: Rect, view: &StickyView) -> (f32
 }
 
 /// Move an already-collected paint item, and its clip, by (dx, dy).
+///
+/// Public because an embedded document is laid out in its own coordinates and
+/// has to be carried to the box that holds it.
+pub fn offset_display_item(entry: &mut DisplayItem, dx: f32, dy: f32) {
+    translate_display_item(entry, dx, dy);
+}
+
+/// Move an already-collected paint item, and its clip, by (dx, dy).
 fn translate_display_item(entry: &mut DisplayItem, dx: f32, dy: f32) {
     match &mut entry.item {
         PaintItem::Decoration(d) => {
@@ -5229,6 +5322,58 @@ pub struct ImageInfo {
     pub src: String,
     /// Whether the markup asked for this one to wait until it is scrolled near.
     pub lazy: bool,
+}
+
+/// An embedded document's box: which element it is, where it is, and what it
+/// should be showing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameBox {
+    pub dom_node_id: u32,
+    pub src: String,
+    /// The border box of the embedding element.
+    pub rect: Rect,
+    /// The area the embedded document is laid out and painted in — inside the
+    /// element's border and padding.
+    pub content: Rect,
+}
+
+/// Collect the embedded documents of a laid-out page, in paint order.
+pub fn collect_frame_boxes(node: &LayoutNode) -> Vec<FrameBox> {
+    let mut out = Vec::new();
+    collect_frame_boxes_inner(node, &mut out);
+    out
+}
+
+fn collect_frame_boxes_inner(node: &LayoutNode, out: &mut Vec<FrameBox>) {
+    if matches!(node.display, DisplayType::None) {
+        return;
+    }
+    if let Some(src) = &node.frame_src
+        && node.visibility.is_painted()
+        && let Some(dom_node_id) = node.dom_node_id
+    {
+        out.push(FrameBox {
+            dom_node_id,
+            src: src.clone(),
+            rect: node.rect,
+            content: content_box(node),
+        });
+    }
+    for child in node.children.iter().chain(node.absolute_children.iter()) {
+        collect_frame_boxes_inner(child, out);
+    }
+}
+
+/// The part of a box inside its border and padding.
+fn content_box(node: &LayoutNode) -> Rect {
+    Rect::new(
+        node.rect.x + node.border[3] + node.padding[3],
+        node.rect.y + node.border[0] + node.padding[0],
+        (node.rect.width - node.border[1] - node.border[3] - node.padding[1] - node.padding[3])
+            .max(0.0),
+        (node.rect.height - node.border[0] - node.border[2] - node.padding[0] - node.padding[2])
+            .max(0.0),
+    )
 }
 
 /// A `<canvas>` box: which element it is, and where it is drawn.

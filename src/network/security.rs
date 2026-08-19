@@ -109,6 +109,9 @@ pub enum ResourceKind {
     Script,
     Image,
     Font,
+    /// A nested browsing context: an `<iframe>`, or an `<object>`/`<embed>`
+    /// pointing at a document.
+    Frame,
 }
 
 impl ResourceKind {
@@ -120,6 +123,7 @@ impl ResourceKind {
             ResourceKind::Script => "script-src",
             ResourceKind::Image => "img-src",
             ResourceKind::Font => "font-src",
+            ResourceKind::Frame => "frame-src",
         }
     }
 

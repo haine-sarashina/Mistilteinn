@@ -64,6 +64,13 @@ pub struct Page {
     /// compositor paints them. Nothing in the cascade or the layout tree knows
     /// what is on a canvas, which is why the surfaces live beside them.
     canvases: crate::js::canvas::SharedCanvases,
+    /// The documents embedded in this one, by the DOM id of the `<iframe>`,
+    /// `<object>` or `<embed>` that holds each.
+    ///
+    /// A nested browsing context is a whole page — its own DOM, cascade, layout
+    /// tree and scripts — laid out at the size of the box it sits in and
+    /// painted inside it.
+    frames: rustc_hash::FxHashMap<u32, Box<Page>>,
     /// The hover path the styles were last computed with, so a frame driven by
     /// an animation does not silently drop `:hover`.
     last_hover: Vec<u32>,
@@ -316,6 +323,7 @@ impl Page {
             animator,
             last_hover: Vec::new(),
             canvases,
+            frames: rustc_hash::FxHashMap::default(),
         };
 
         // The document exists now, so anything waiting on it can run. This
@@ -452,6 +460,21 @@ impl Page {
             containing_block,
             &mut text_renderer,
         );
+    }
+
+    /// The document embedded in a given element, if one has been loaded.
+    pub fn frame(&self, dom_node_id: u32) -> Option<&Page> {
+        self.frames.get(&dom_node_id).map(|page| page.as_ref())
+    }
+
+    /// Put a loaded document into the element that embeds it.
+    pub fn set_frame(&mut self, dom_node_id: u32, page: Page) {
+        self.frames.insert(dom_node_id, Box::new(page));
+    }
+
+    /// The elements of this page that embed a document, laid out.
+    pub fn frame_boxes(&self) -> Vec<crate::layout::FrameBox> {
+        crate::layout::collect_frame_boxes(&self.layout_root)
     }
 
     /// Point the JavaScript engine's thread-local state at this page.
@@ -807,6 +830,104 @@ mod tests {
         );
         let texts = crate::layout::collect_text_nodes(&page.layout_root);
         assert!(!texts.iter().any(|t| t.text.contains("No canvas")));
+    }
+
+    fn frame_boxes(html: &str) -> Vec<crate::layout::FrameBox> {
+        Page::new(html, "", 800.0, 600.0).frame_boxes()
+    }
+
+    #[test]
+    fn an_iframe_is_a_box_of_the_default_size_with_room_for_its_document() {
+        let boxes = frame_boxes("<html><body><iframe src='inner.html'></iframe></body></html>");
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].src, "inner.html");
+        assert_eq!((boxes[0].rect.width, boxes[0].rect.height), (300.0, 150.0));
+        assert!(
+            boxes[0].content.width < boxes[0].rect.width,
+            "the UA border takes a couple of pixels off each side"
+        );
+    }
+
+    #[test]
+    fn an_iframe_is_sized_by_its_attributes() {
+        let boxes = frame_boxes(
+            "<html><body><iframe src='a' width='500' height='90'></iframe></body></html>",
+        );
+        assert_eq!((boxes[0].rect.width, boxes[0].rect.height), (500.0, 90.0));
+    }
+
+    #[test]
+    fn an_iframe_with_no_source_embeds_nothing() {
+        assert!(frame_boxes("<html><body><iframe></iframe></body></html>").is_empty());
+    }
+
+    #[test]
+    fn an_object_pointing_at_a_picture_is_a_picture() {
+        let page = Page::new(
+            "<html><body><object data='chart.png'></object></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        assert!(page.frame_boxes().is_empty());
+        let images = crate::layout::collect_image_nodes(&page.layout_root);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].src, "chart.png");
+    }
+
+    #[test]
+    fn an_object_declaring_an_image_type_is_a_picture_whatever_its_url_looks_like() {
+        let page = Page::new(
+            "<html><body><object data='/render?id=7' type='image/png'></object></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        assert!(page.frame_boxes().is_empty());
+        assert_eq!(
+            crate::layout::collect_image_nodes(&page.layout_root).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_embed_pointing_at_a_document_gets_a_context_of_its_own() {
+        let boxes = frame_boxes("<html><body><embed src='player.html'></embed></body></html>");
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].src, "player.html");
+    }
+
+    #[test]
+    fn the_fallback_inside_an_iframe_is_not_put_on_the_page() {
+        let page = Page::new(
+            "<html><body><iframe src='a'>Frames are not supported.</iframe></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let texts = crate::layout::collect_text_nodes(&page.layout_root);
+        assert!(!texts.iter().any(|t| t.text.contains("not supported")));
+    }
+
+    #[test]
+    fn a_frame_holds_the_document_put_into_it() {
+        let mut page = Page::new(
+            "<html><body><iframe src='inner.html'></iframe></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let holder = page.frame_boxes()[0].dom_node_id;
+        assert!(page.frame(holder).is_none());
+
+        let inner = Page::new(
+            "<html><head><title>Inner</title></head><body>hello</body></html>",
+            "",
+            296.0,
+            146.0,
+        );
+        page.set_frame(holder, inner);
+        assert_eq!(page.frame(holder).map(|p| p.title.as_str()), Some("Inner"));
     }
 
     #[test]

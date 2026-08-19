@@ -453,7 +453,7 @@ fn create_element_object(context: &mut Context, node_id: u32) -> JsResult<boa_en
         .function(
             NativeFunction::from_fn_ptr(|this, args, ctx| {
                 if let Some(key) = args.get(0) {
-                    let k = key.display().to_string();
+                    let k = js_value_to_clean_string(key);
                     if let Some(target_id) = get_node_id_from_this(this, ctx) {
                         if let Some(val) =
                             with_active_arena(|arena| arena.get_attribute(target_id, &k)).flatten()
@@ -470,8 +470,12 @@ fn create_element_object(context: &mut Context, node_id: u32) -> JsResult<boa_en
         .function(
             NativeFunction::from_fn_ptr(|this, args, ctx| {
                 if let (Some(key), Some(val)) = (args.get(0), args.get(1)) {
-                    let k = key.display().to_string();
-                    let v = val.display().to_string();
+                    // `display()` writes a JS string with its quotes, so an
+                    // attribute set from script was stored under a name with
+                    // quotes in it — a name no selector, no layout code and no
+                    // `getAttribute` from Rust could ever match.
+                    let k = js_value_to_clean_string(key);
+                    let v = js_value_to_clean_string(val);
                     if let Some(target_id) = get_node_id_from_this(this, ctx) {
                         ACTIVE_ARENA.with(|a| {
                             if let Some(arena) = a.borrow().as_ref() {
@@ -484,6 +488,40 @@ fn create_element_object(context: &mut Context, node_id: u32) -> JsResult<boa_en
             }),
             js_string!("setAttribute"),
             2,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(|this, args, ctx| {
+                // Only the 2D context exists; asking for WebGL gets `null`,
+                // which is exactly the answer a page's feature test expects
+                // from an engine that has not got it.
+                let wanted = args
+                    .first()
+                    .map(js_value_to_clean_string)
+                    .unwrap_or_default();
+                if !wanted.trim().eq_ignore_ascii_case("2d") {
+                    return Ok(JsValue::null());
+                }
+                let Some(node_id) = get_node_id_from_this(this, ctx) else {
+                    return Ok(JsValue::null());
+                };
+                let is_canvas = with_active_arena(|arena| {
+                    arena
+                        .get(crate::html::DomHandle(crate::html::NodeId::from_raw(
+                            node_id,
+                        )))
+                        .and_then(|node| node.tag_name().map(|tag| tag.to_string()))
+                })
+                .flatten()
+                .is_some_and(|tag| tag.eq_ignore_ascii_case("canvas"));
+                if !is_canvas {
+                    return Ok(JsValue::null());
+                }
+                Ok(JsValue::from(crate::js::canvas::create_context_object(
+                    ctx, node_id,
+                )))
+            }),
+            js_string!("getContext"),
+            1,
         )
         .function(
             NativeFunction::from_fn_ptr(|this, args, ctx| {

@@ -1,3 +1,4 @@
+pub mod canvas;
 pub mod filter;
 /// GPU rendering pipeline using wgpu.
 ///
@@ -982,6 +983,212 @@ pub fn draw_select_arrow(
             cx - run,
             cy + row as f32,
             run * 2.0 + 1.0,
+            1.0,
+            color,
+        );
+    }
+}
+
+/// Draw the chrome of a `<video>` or `<audio>` element.
+///
+/// Nothing here plays anything. What it draws is what a reader needs in order
+/// to understand the page: a video is a dark rectangle with a play button in
+/// the middle of it, unless a poster frame has already been painted there, and
+/// a control bar along the bottom when the markup asked for one.
+pub fn draw_media_chrome(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    kind: crate::layout::MediaKind,
+    controls: bool,
+    has_poster: bool,
+) {
+    use crate::layout::MediaKind;
+
+    if width < 8.0 || height < 8.0 {
+        return;
+    }
+
+    let bar_height = (height * 0.28).clamp(20.0, 40.0);
+    let is_audio = kind == MediaKind::Audio;
+
+    if is_audio {
+        // An audio player is all control bar; there is no picture to show.
+        draw_rounded_rect_fill(
+            dest,
+            dest_width,
+            dest_height,
+            x,
+            y,
+            width,
+            height,
+            (height / 4.0).min(12.0),
+            [40, 40, 44, 255],
+        );
+    } else {
+        // A poster frame is the picture, so it must not be blacked out. Without
+        // one there is nothing behind the button, and a dark field is what the
+        // reader expects to see.
+        if !has_poster {
+            draw_solid_rect(
+                dest,
+                dest_width,
+                dest_height,
+                x,
+                y,
+                width,
+                height,
+                [20, 20, 24, 255],
+            );
+        }
+        draw_play_triangle(
+            dest,
+            dest_width,
+            dest_height,
+            x + width / 2.0,
+            y + (height - if controls { bar_height } else { 0.0 }) / 2.0,
+            (width.min(height) * 0.22).clamp(10.0, 44.0),
+            [255, 255, 255, 220],
+        );
+    }
+
+    if !controls {
+        return;
+    }
+
+    let bar_y = y + height - bar_height;
+    if !is_audio {
+        // Translucent, so the last rows of the picture still show through.
+        draw_solid_rect(
+            dest,
+            dest_width,
+            dest_height,
+            x,
+            bar_y,
+            width,
+            bar_height,
+            [0, 0, 0, 140],
+        );
+    }
+
+    let inset = (bar_height * 0.3).max(6.0);
+    let button_size = bar_height * 0.34;
+    draw_play_triangle(
+        dest,
+        dest_width,
+        dest_height,
+        x + inset + button_size / 2.0,
+        bar_y + bar_height / 2.0,
+        button_size,
+        [235, 235, 235, 255],
+    );
+
+    // The scrub bar. Nothing is playing, so it sits at the start.
+    let track_x = x + inset * 2.0 + button_size;
+    let track_width = width - (track_x - x) - inset * 3.0 - button_size;
+    if track_width > 4.0 {
+        let track_y = bar_y + bar_height / 2.0 - 1.5;
+        draw_rounded_rect_fill(
+            dest,
+            dest_width,
+            dest_height,
+            track_x,
+            track_y,
+            track_width,
+            3.0,
+            1.5,
+            [255, 255, 255, 90],
+        );
+    }
+
+    draw_speaker(
+        dest,
+        dest_width,
+        dest_height,
+        x + width - inset - button_size,
+        bar_y + bar_height / 2.0,
+        button_size,
+        [235, 235, 235, 255],
+    );
+}
+
+/// A play button: a solid right-pointing triangle centred on (cx, cy).
+fn draw_play_triangle(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    color: [u8; 4],
+) {
+    if size < 4.0 {
+        return;
+    }
+    let half = size / 2.0;
+    let rows = size.round() as i32;
+    for row in 0..=rows {
+        // The run narrows to a point at the tip, symmetrically about the middle.
+        let from_middle = (row as f32 - half).abs();
+        let run = (half - from_middle) * (size / half.max(1.0)) * 0.5;
+        if run <= 0.0 {
+            continue;
+        }
+        draw_solid_rect(
+            dest,
+            dest_width,
+            dest_height,
+            cx - half * 0.5,
+            cy - half + row as f32,
+            run.max(1.0),
+            1.0,
+            color,
+        );
+    }
+}
+
+/// A speaker glyph: a small box with a cone opening to the right.
+fn draw_speaker(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    color: [u8; 4],
+) {
+    if size < 6.0 {
+        return;
+    }
+    let half = size / 2.0;
+    draw_solid_rect(
+        dest,
+        dest_width,
+        dest_height,
+        cx - half,
+        cy - half * 0.4,
+        half * 0.6,
+        half * 0.8,
+        color,
+    );
+    let rows = (size * 0.8).round() as i32;
+    for row in 0..=rows {
+        let spread = (row as f32 / rows.max(1) as f32 - 0.5).abs() * 2.0;
+        let run = half * (1.0 - spread);
+        if run <= 0.0 {
+            continue;
+        }
+        draw_solid_rect(
+            dest,
+            dest_width,
+            dest_height,
+            cx - half * 0.4,
+            cy - size * 0.4 + row as f32,
+            run,
             1.0,
             color,
         );

@@ -1,3 +1,4 @@
+pub mod canvas;
 pub mod dom;
 
 use boa_engine::{Context, Source};

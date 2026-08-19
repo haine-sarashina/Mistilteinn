@@ -224,6 +224,15 @@ pub struct LayoutNode {
     /// `loading="lazy"` — the picture is not worth fetching until the reader
     /// scrolls near it.
     pub lazy_image: bool,
+    /// The kind of media element this box is, if it is one. A media element
+    /// paints its own chrome rather than any content it contains.
+    pub media: Option<MediaKind>,
+    /// Whether the media element asked for playback controls.
+    pub media_controls: bool,
+    /// Whether this box is a `<canvas>`. Its picture is not in the document —
+    /// it is whatever script has drawn — so the painter fetches it from the
+    /// page's canvas store rather than from the image cache.
+    pub is_canvas: bool,
     /// Line boxes for block containers with inline children (None = no inline layout computed yet).
     pub line_boxes: Option<Vec<LineBox>>,
     /// Overflow behavior for clipping/scrolling.
@@ -316,6 +325,9 @@ impl LayoutNode {
             max_width: None,
             image_src: None,
             lazy_image: false,
+            media: None,
+            media_controls: false,
+            is_canvas: false,
             line_boxes: None,
             overflow: Overflow::Visible,
             position: PositionType::Static,
@@ -813,12 +825,20 @@ fn build_layout_children<N, F>(
 
                     // Handle <input> / <textarea> / <button> text and default sizing
                     apply_form_control_defaults(&tag, &node, &mut layout_node, get_node);
+                    apply_media_defaults(&tag, &node, &mut layout_node, &child_styles);
+                    apply_canvas_defaults(&tag, &node, &mut layout_node, &child_styles);
 
                     // Track DOM node ID for hit-testing / :hover
                     layout_node.dom_node_id = Some(child_id);
 
-                    if tag == "svg" || layout_node.image_src.is_some() {
-                        // Leaf image/SVG node — do not expand internal paths as layout children
+                    if tag == "svg"
+                        || layout_node.image_src.is_some()
+                        || layout_node.media.is_some()
+                        || layout_node.is_canvas
+                    {
+                        // Leaf image, SVG, media or canvas node — its
+                        // descendants are its data or its fallback, and neither
+                        // goes in the flow
                     } else {
                         let text = node.text_content().map(|t| t.to_string());
                         if text.is_some() && node.children_ids().is_empty() {
@@ -981,12 +1001,20 @@ fn build_layout_children<N, F>(
                         _ => InteractionType::None,
                     };
                     apply_form_control_defaults(&tag, &node, &mut layout_node, get_node);
+                    apply_media_defaults(&tag, &node, &mut layout_node, &child_styles);
+                    apply_canvas_defaults(&tag, &node, &mut layout_node, &child_styles);
 
                     // Track DOM node ID for hit-testing / :hover
                     layout_node.dom_node_id = Some(child_id);
 
-                    if tag == "svg" || layout_node.image_src.is_some() {
-                        // Leaf image/SVG node — do not expand internal paths as layout children
+                    if tag == "svg"
+                        || layout_node.image_src.is_some()
+                        || layout_node.media.is_some()
+                        || layout_node.is_canvas
+                    {
+                        // Leaf image, SVG, media or canvas node — its
+                        // descendants are its data or its fallback, and neither
+                        // goes in the flow
                     } else {
                         let text = node.text_content().map(|t| t.to_string());
                         if text.is_some() && node.children_ids().is_empty() {
@@ -3481,6 +3509,106 @@ where
     }
 }
 
+/// Give a `<canvas>` the size it declares.
+///
+/// The `width` and `height` attributes are the size of the bitmap, and — unless
+/// CSS says otherwise — the size of the box as well. Their defaults, 300 by
+/// 150, are the ones the HTML spec names.
+fn apply_canvas_defaults<N: LayoutDomNode>(
+    tag: &str,
+    node: &N,
+    layout_node: &mut LayoutNode,
+    child_styles: &ComputedValues,
+) {
+    if tag != "canvas" {
+        return;
+    }
+    layout_node.is_canvas = true;
+
+    let attr_px = |name: &str| {
+        node.get_attr(name)
+            .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
+    };
+    let width = child_styles
+        .width
+        .or_else(|| attr_px("width"))
+        .unwrap_or(300.0);
+    let height = child_styles
+        .height
+        .or_else(|| attr_px("height"))
+        .unwrap_or(150.0);
+
+    layout_node.rect.width = width;
+    layout_node.rect.height = height;
+    layout_node.explicit_width = Some(width);
+    layout_node.explicit_height = Some(height);
+}
+
+/// The CSS default width and height of a `<video>`, and of an `<audio>` control.
+const VIDEO_DEFAULT_SIZE: (f32, f32) = (300.0, 150.0);
+const AUDIO_CONTROL_SIZE: (f32, f32) = (300.0, 54.0);
+
+/// Apply the size and the poster frame of a `<video>` or `<audio>`.
+///
+/// Nothing here decodes a stream. What a media element contributes to the page
+/// is a box of a known size, the poster frame if the markup names one, and the
+/// controls the reader expects to see — and those are the parts a layout engine
+/// is answerable for. Playback is a separate problem, and a page that reserves
+/// the right space for a player it cannot run still reads correctly.
+fn apply_media_defaults<N: LayoutDomNode>(
+    tag: &str,
+    node: &N,
+    layout_node: &mut LayoutNode,
+    child_styles: &ComputedValues,
+) {
+    let kind = match tag {
+        "video" => MediaKind::Video,
+        "audio" => MediaKind::Audio,
+        _ => return,
+    };
+    layout_node.media = Some(kind);
+    layout_node.media_controls = node.get_attr("controls").is_some();
+
+    // An `<audio>` with no controls has nothing to show, so it takes no space —
+    // which is what browsers do rather than leaving a blank strip in the flow.
+    if kind == MediaKind::Audio && !layout_node.media_controls {
+        layout_node.display = DisplayType::None;
+        return;
+    }
+
+    // The poster goes through the ordinary image pipeline: it is fetched,
+    // cached and painted exactly like an `<img>`.
+    if kind == MediaKind::Video {
+        if let Some(poster) = node.get_attr("poster")
+            && !poster.trim().is_empty()
+        {
+            layout_node.image_src = Some(poster);
+        }
+    }
+
+    let (default_w, default_h) = match kind {
+        MediaKind::Video => VIDEO_DEFAULT_SIZE,
+        MediaKind::Audio => AUDIO_CONTROL_SIZE,
+    };
+    let attr_px = |name: &str| {
+        node.get_attr(name)
+            .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
+    };
+    let width = child_styles
+        .width
+        .or_else(|| attr_px("width"))
+        .unwrap_or(default_w);
+    let height = child_styles
+        .height
+        .or_else(|| attr_px("height"))
+        .unwrap_or(default_h);
+
+    layout_node.rect.width = width;
+    layout_node.rect.height = height;
+    layout_node.explicit_width = Some(width);
+    layout_node.explicit_height = Some(height);
+}
+
 /// Break inline boxes into line boxes based on available width.
 ///
 fn is_cjk_char(c: char) -> bool {
@@ -5101,6 +5229,82 @@ pub struct ImageInfo {
     pub src: String,
     /// Whether the markup asked for this one to wait until it is scrolled near.
     pub lazy: bool,
+}
+
+/// A `<canvas>` box: which element it is, and where it is drawn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CanvasBox {
+    pub dom_node_id: u32,
+    pub rect: Rect,
+}
+
+/// Collect the canvases of a laid-out page, in paint order.
+pub fn collect_canvas_boxes(node: &LayoutNode) -> Vec<CanvasBox> {
+    let mut out = Vec::new();
+    collect_canvas_boxes_inner(node, &mut out);
+    out
+}
+
+fn collect_canvas_boxes_inner(node: &LayoutNode, out: &mut Vec<CanvasBox>) {
+    if matches!(node.display, DisplayType::None) {
+        return;
+    }
+    if node.is_canvas
+        && node.visibility.is_painted()
+        && let Some(dom_node_id) = node.dom_node_id
+    {
+        out.push(CanvasBox {
+            dom_node_id,
+            rect: node.rect,
+        });
+    }
+    for child in node.children.iter().chain(node.absolute_children.iter()) {
+        collect_canvas_boxes_inner(child, out);
+    }
+}
+
+/// The kind of media element a box stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Video,
+    Audio,
+}
+
+/// A media element's box, for the painter that draws its chrome.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaBox {
+    pub rect: Rect,
+    pub kind: MediaKind,
+    pub controls: bool,
+    /// Whether a poster frame is being painted underneath, in which case the
+    /// chrome must not black the box out.
+    pub has_poster: bool,
+}
+
+/// Collect the media elements of a laid-out page, in paint order.
+pub fn collect_media_boxes(node: &LayoutNode) -> Vec<MediaBox> {
+    let mut out = Vec::new();
+    collect_media_boxes_inner(node, &mut out);
+    out
+}
+
+fn collect_media_boxes_inner(node: &LayoutNode, out: &mut Vec<MediaBox>) {
+    if matches!(node.display, DisplayType::None) {
+        return;
+    }
+    if let Some(kind) = node.media
+        && node.visibility.is_painted()
+    {
+        out.push(MediaBox {
+            rect: node.rect,
+            kind,
+            controls: node.media_controls,
+            has_poster: node.image_src.is_some(),
+        });
+    }
+    for child in node.children.iter().chain(node.absolute_children.iter()) {
+        collect_media_boxes_inner(child, out);
+    }
 }
 
 /// Collect all image nodes from the layout tree for rendering.

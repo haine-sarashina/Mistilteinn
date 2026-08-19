@@ -1667,6 +1667,44 @@ impl MistilteinnApp {
                 y - scroll_offset.1 + ADDRESS_BAR_HEIGHT as f32,
             )
         };
+        // Whatever script has drawn on a `<canvas>` goes down here. The bitmap
+        // is not a document resource, so it is not in the image cache and does
+        // not reach the display list; the page keeps it and the box says where
+        // it belongs.
+        for canvas in crate::layout::collect_canvas_boxes(&page.layout_root) {
+            let Some(surface) = page.canvas_surface(canvas.dom_node_id) else {
+                continue;
+            };
+            let (cx, cy) = to_screen(canvas.rect.x, canvas.rect.y);
+            surface.blit_scaled(
+                &mut composite_buffer,
+                win_w,
+                win_h,
+                cx,
+                cy,
+                canvas.rect.width,
+                canvas.rect.height,
+            );
+        }
+
+        // A media element paints its own chrome over its box: the poster frame,
+        // if there is one, has already gone down as an ordinary image.
+        for media in crate::layout::collect_media_boxes(&page.layout_root) {
+            let (mx, my) = to_screen(media.rect.x, media.rect.y);
+            crate::render::draw_media_chrome(
+                &mut composite_buffer,
+                win_w,
+                win_h,
+                mx,
+                my,
+                media.rect.width,
+                media.rect.height,
+                media.kind,
+                media.controls,
+                media.has_poster,
+            );
+        }
+
         for select in crate::layout::collect_select_boxes(&page.layout_root) {
             let (sx, sy) = to_screen(select.x, select.y);
             crate::render::draw_select_arrow(

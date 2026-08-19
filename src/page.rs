@@ -58,6 +58,12 @@ pub struct Page {
     js_context: boa_engine::Context,
     /// The transitions and `@keyframes` animations this page has running.
     pub animator: crate::animator::Animator,
+    /// What each `<canvas>` on this page has had drawn on it.
+    ///
+    /// Shared with the JavaScript context: a script draws into these, and the
+    /// compositor paints them. Nothing in the cascade or the layout tree knows
+    /// what is on a canvas, which is why the surfaces live beside them.
+    canvases: crate::js::canvas::SharedCanvases,
     /// The hover path the styles were last computed with, so a frame driven by
     /// an animation does not silently drop `:hover`.
     last_hover: Vec<u32>,
@@ -204,6 +210,8 @@ impl Page {
         // the arena. The context is kept afterwards: scripts register event
         // listeners that have to survive to be called later.
         let mut js_context = crate::js::init_js_engine_with_arena(arena.clone());
+        let canvases: crate::js::canvas::SharedCanvases = Default::default();
+        crate::js::canvas::set_active_canvases(Some(canvases.clone()));
         let mut blocked = 0usize;
         for (script, nonce) in arena.extract_scripts_with_nonce() {
             if csp.allows_inline_with_nonce(ResourceKind::Script, nonce.as_deref()) {
@@ -307,6 +315,7 @@ impl Page {
             js_context,
             animator,
             last_hover: Vec::new(),
+            canvases,
         };
 
         // The document exists now, so anything waiting on it can run. This
@@ -337,7 +346,7 @@ impl Page {
     /// notified first. Layout is recomputed when any handler ran, because a
     /// handler is free to have changed the DOM.
     pub fn dispatch_event_along(&mut self, path: &[u32], event_type: &str) -> DispatchOutcome {
-        crate::js::dom::set_active_arena(Some(self.arena.clone()));
+        self.make_active();
         crate::js::reset_default_prevented(&mut self.js_context);
 
         let mut total = DispatchOutcome::default();
@@ -357,7 +366,7 @@ impl Page {
     ///
     /// Used by tests and by anything that needs to evaluate script after load.
     pub fn eval_script(&mut self, script: &str) {
-        crate::js::dom::set_active_arena(Some(self.arena.clone()));
+        self.make_active();
         crate::js::execute_script(&mut self.js_context, script);
         self.recompute_with_hover(&[]);
     }
@@ -443,6 +452,33 @@ impl Page {
             containing_block,
             &mut text_renderer,
         );
+    }
+
+    /// Point the JavaScript engine's thread-local state at this page.
+    ///
+    /// The engine's native functions reach the DOM and the canvases through
+    /// thread-locals rather than through captured handles, so whichever page is
+    /// about to run script has to claim them first.
+    fn make_active(&self) {
+        crate::js::dom::set_active_arena(Some(self.arena.clone()));
+        crate::js::canvas::set_active_canvases(Some(self.canvases.clone()));
+    }
+
+    /// The surface of every canvas that has been drawn on, by DOM node id.
+    pub fn canvas_surfaces(&self) -> Vec<(u32, crate::render::canvas::Surface)> {
+        self.canvases
+            .borrow()
+            .iter()
+            .map(|(id, state)| (*id, state.surface.clone()))
+            .collect()
+    }
+
+    /// The surface of one canvas, if a script has drawn on it.
+    pub fn canvas_surface(&self, node_id: u32) -> Option<crate::render::canvas::Surface> {
+        self.canvases
+            .borrow()
+            .get(&node_id)
+            .map(|state| state.surface.clone())
     }
 
     /// Whether this page has an animation or transition still moving.
@@ -646,6 +682,131 @@ mod tests {
             return Some(node.rect.width);
         }
         node.children.iter().find_map(find_box_width)
+    }
+
+    /// The media boxes of a page built from this markup.
+    fn media_boxes(html: &str) -> Vec<crate::layout::MediaBox> {
+        let page = Page::new(html, "", 800.0, 600.0);
+        crate::layout::collect_media_boxes(&page.layout_root)
+    }
+
+    #[test]
+    fn a_video_takes_the_default_size_css_gives_it() {
+        let boxes = media_boxes("<html><body><video></video></body></html>");
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].kind, crate::layout::MediaKind::Video);
+        assert_eq!((boxes[0].rect.width, boxes[0].rect.height), (300.0, 150.0));
+        assert!(!boxes[0].controls);
+    }
+
+    #[test]
+    fn a_video_is_sized_by_its_attributes() {
+        let boxes = media_boxes(
+            "<html><body><video width='640' height='360' controls></video></body></html>",
+        );
+        assert_eq!((boxes[0].rect.width, boxes[0].rect.height), (640.0, 360.0));
+        assert!(boxes[0].controls);
+    }
+
+    #[test]
+    fn a_poster_is_fetched_like_any_other_picture() {
+        let page = Page::new(
+            "<html><body><video poster='frame.jpg'></video></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let urls: Vec<String> = page
+            .pending_image_requests(Rect::new(0.0, 0.0, 800.0, 600.0))
+            .into_iter()
+            .map(|(url, _, _)| url)
+            .collect();
+        assert!(
+            urls.iter().any(|url| url.contains("frame.jpg")),
+            "got {urls:?}"
+        );
+    }
+
+    #[test]
+    fn an_audio_element_shows_nothing_unless_it_has_controls() {
+        assert!(media_boxes("<html><body><audio src='a.mp3'></audio></body></html>").is_empty());
+
+        let boxes = media_boxes("<html><body><audio src='a.mp3' controls></audio></body></html>");
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].kind, crate::layout::MediaKind::Audio);
+        assert!(boxes[0].rect.height > 0.0);
+    }
+
+    #[test]
+    fn the_fallback_inside_a_media_element_is_not_put_on_the_page() {
+        let page = Page::new(
+            "<html><body><video>Your browser cannot play this.</video></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let texts = crate::layout::collect_text_nodes(&page.layout_root);
+        assert!(
+            !texts.iter().any(|t| t.text.contains("cannot play")),
+            "the fallback is for browsers without video, not for this one"
+        );
+    }
+
+    #[test]
+    fn a_canvas_is_a_box_of_the_size_its_attributes_declare() {
+        let page = Page::new(
+            "<html><body><canvas width='320' height='200'></canvas></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let boxes = crate::layout::collect_canvas_boxes(&page.layout_root);
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].rect.width, boxes[0].rect.height), (320.0, 200.0));
+    }
+
+    #[test]
+    fn a_canvas_with_no_attributes_takes_the_html_default_size() {
+        let page = Page::new(
+            "<html><body><canvas></canvas></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let boxes = crate::layout::collect_canvas_boxes(&page.layout_root);
+        assert_eq!((boxes[0].rect.width, boxes[0].rect.height), (300.0, 150.0));
+    }
+
+    #[test]
+    fn what_a_script_drew_survives_the_relayout_after_it() {
+        let mut page = Page::new(
+            "<html><body><canvas id='c' width='20' height='20'></canvas></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        page.eval_script(
+            "var g = document.getElementById('c').getContext('2d');
+             g.fillStyle = 'red';
+             g.fillRect(0, 0, 20, 20);",
+        );
+        let canvas = crate::layout::collect_canvas_boxes(&page.layout_root)[0];
+        let surface = page
+            .canvas_surface(canvas.dom_node_id)
+            .expect("the box and the surface agree on which canvas this is");
+        assert_eq!(surface.pixels[3], 255);
+    }
+
+    #[test]
+    fn the_fallback_inside_a_canvas_is_not_put_on_the_page() {
+        let page = Page::new(
+            "<html><body><canvas>No canvas here.</canvas></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let texts = crate::layout::collect_text_nodes(&page.layout_root);
+        assert!(!texts.iter().any(|t| t.text.contains("No canvas")));
     }
 
     #[test]

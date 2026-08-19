@@ -3994,6 +3994,13 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
         ("colgroup", "display: table-column-group"),
         ("col", "display: table-column"),
         ("img", "display: inline"),
+        // Media elements are replaced content: a box of their own with chrome
+        // painted into it, never a container the page flows through.
+        ("video", "display: inline-block; background-color: #000000"),
+        ("audio", "display: inline-block"),
+        ("canvas", "display: inline-block"),
+        ("source", "display: none"),
+        ("track", "display: none"),
         (
             "a",
             "display: inline; color: #0645ad; text-decoration: underline",

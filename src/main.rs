@@ -1,3 +1,4 @@
+mod animator;
 mod app;
 mod browser;
 mod css;

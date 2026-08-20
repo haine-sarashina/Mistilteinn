@@ -219,6 +219,12 @@ pub struct LayoutNode {
     /// Min/max width constraints
     pub min_width: Option<f32>,
     pub max_width: Option<f32>,
+    /// `width`, `min-width` and `max-width` given as a fraction of the
+    /// containing block, resolved once its width is known. See
+    /// [`resolve_percentage_widths`].
+    pub width_percent: Option<f32>,
+    pub min_width_percent: Option<f32>,
+    pub max_width_percent: Option<f32>,
     /// URL of an image source for <img> tags (None = not an image).
     pub image_src: Option<String>,
     /// `loading="lazy"` — the picture is not worth fetching until the reader
@@ -324,6 +330,9 @@ impl LayoutNode {
             flex_basis: FlexBasis::Auto,
             box_sizing: BoxSizing::ContentBox,
             explicit_width: None,
+            width_percent: None,
+            min_width_percent: None,
+            max_width_percent: None,
             explicit_height: None,
             min_width: None,
             max_width: None,
@@ -594,6 +603,9 @@ where
     root_layout.explicit_height = root_styles.explicit_height;
     root_layout.min_width = root_styles.min_width;
     root_layout.max_width = root_styles.max_width;
+    root_layout.width_percent = root_styles.width_percent;
+    root_layout.min_width_percent = root_styles.min_width_percent;
+    root_layout.max_width_percent = root_styles.max_width_percent;
     root_layout.flex_basis = root_styles.flex_basis;
 
     // Copy grid properties
@@ -723,6 +735,9 @@ fn build_layout_children<N, F>(
                     layout_node.explicit_height = child_styles.explicit_height;
                     layout_node.min_width = child_styles.min_width;
                     layout_node.max_width = child_styles.max_width;
+                    layout_node.width_percent = child_styles.width_percent;
+                    layout_node.min_width_percent = child_styles.min_width_percent;
+                    layout_node.max_width_percent = child_styles.max_width_percent;
 
                     // Copy grid properties
                     layout_node.grid_columns = child_styles.grid_template_columns.clone();
@@ -1150,6 +1165,31 @@ fn serialize_dom_node_to_xml_inner<N: LayoutDomNode, F: Fn(u32) -> Option<N>>(
 /// Flex containers lay out their children using flexbox algorithm.
 /// Inline children are grouped into line boxes with word wrapping and baseline alignment.
 /// Each node's margin, border, padding, and content box are computed.
+/// Turn each child's percentage width into pixels.
+///
+/// A percentage is a share of the containing block's content width, which is
+/// only settled once the parent has been laid out — so this runs at the top of
+/// each of the four child-layout passes, where `available_width` is that
+/// number.
+///
+/// Percentage *heights* are left alone: they resolve against the containing
+/// block's height, and a block whose height is `auto` — nearly all of them —
+/// makes such a height compute to `auto` anyway.
+fn resolve_percentage_widths(parent: &mut LayoutNode, available_width: f32) {
+    for child in &mut parent.children {
+        if let Some(fraction) = child.width_percent {
+            let width = (available_width * fraction).max(0.0);
+            child.explicit_width = Some(width);
+        }
+        if let Some(fraction) = child.min_width_percent {
+            child.min_width = Some((available_width * fraction).max(0.0));
+        }
+        if let Some(fraction) = child.max_width_percent {
+            child.max_width = Some((available_width * fraction).max(0.0));
+        }
+    }
+}
+
 pub fn compute_layout(
     root: &mut LayoutNode,
     page_width: f32,
@@ -1440,6 +1480,7 @@ fn compute_block_children(
     if depth > MAX_LAYOUT_DEPTH {
         return;
     }
+    resolve_percentage_widths(parent, available_width);
 
     // --- Separate children into block and inline runs ---
     // We process the children list and find contiguous runs of inline children.
@@ -1847,24 +1888,54 @@ fn compute_shrink_to_fit_width(
         );
         return w;
     }
-    let mut max_child_w = 0.0f32;
-    for child in &node.children {
-        if is_block_child(child) {
-            let cw = compute_shrink_to_fit_width(child, depth + 1, text_renderer);
-            max_child_w = max_child_w.max(
-                cw + child.padding[1]
-                    + child.padding[3]
-                    + child.border[1]
-                    + child.border[3]
-                    + child.margin[1]
-                    + child.margin[3],
+    // Children that share a line add up; children that stack take the widest.
+    //
+    // A row of flex items stands side by side, and so do inline boxes — both
+    // were being measured with `max`, as though every child started its own
+    // line. That left a menu bar as wide as its longest label, and the items
+    // then shrank to fit inside it: three links in ja.wikipedia.org's header
+    // came out 4, 26 and 9 pixels across, their text running down the page.
+    let lays_children_in_a_row =
+        matches!(node.display, DisplayType::Flex | DisplayType::InlineFlex)
+            && matches!(
+                node.flex_direction,
+                FlexDirection::Row | FlexDirection::RowReverse
             );
+
+    let mut widest = 0.0f32;
+    let mut line_run = 0.0f32;
+    let mut items = 0usize;
+    for child in &node.children {
+        let outer = if is_block_child(child) {
+            compute_shrink_to_fit_width(child, depth + 1, text_renderer)
+                + child.padding[1]
+                + child.padding[3]
+                + child.border[1]
+                + child.border[3]
+                + child.margin[1]
+                + child.margin[3]
         } else if is_inline_child(child) {
-            let cw = compute_shrink_to_fit_width(child, depth + 1, text_renderer);
-            max_child_w = max_child_w.max(cw);
+            compute_shrink_to_fit_width(child, depth + 1, text_renderer)
+        } else {
+            continue;
+        };
+
+        if lays_children_in_a_row || is_inline_child(child) {
+            line_run += outer;
+            items += 1;
+        } else {
+            // A block child ends whatever line was being built and stands alone.
+            widest = widest.max(line_run).max(outer);
+            line_run = 0.0;
+            items = 0;
         }
     }
-    max_child_w + node.padding[1] + node.padding[3] + node.border[1] + node.border[3]
+    if lays_children_in_a_row {
+        line_run += node.column_gap * items.saturating_sub(1) as f32;
+    }
+    let content_w = widest.max(line_run);
+
+    content_w + node.padding[1] + node.padding[3] + node.border[1] + node.border[3]
 }
 
 /// Compute inner height contribution of a single node (content area only, no padding).
@@ -2007,6 +2078,7 @@ fn compute_grid_children(
     if depth > MAX_LAYOUT_DEPTH {
         return;
     }
+    resolve_percentage_widths(parent, available_width);
 
     let tracks = if parent.grid_columns.is_empty() {
         vec![crate::css::GridTrack::Fr(1.0)]
@@ -2238,7 +2310,11 @@ fn compute_grid_children(
 
 /// Compute the main-axis size of a flex item's content.
 /// Used to resolve flex basis when no explicit value is set.
-fn compute_flex_item_content_main_size(item: &LayoutNode, is_row: bool) -> f32 {
+fn compute_flex_item_content_main_size(
+    item: &LayoutNode,
+    is_row: bool,
+    text_renderer: &mut crate::render::text::TextRenderer,
+) -> f32 {
     if item.rect.width > 0.0 && item.rect.height > 0.0 {
         // Item already has dimensions (e.g., from explicit width/height)
         return if is_row {
@@ -2247,17 +2323,22 @@ fn compute_flex_item_content_main_size(item: &LayoutNode, is_row: bool) -> f32 {
             item.rect.height
         };
     }
-    // Estimate from children: use block height computation as fallback
     if is_row {
+        // A row's main axis is horizontal, so the content size is a *width*:
+        // shrink-to-fit, the same measure a float takes.
+        //
+        // This returned the item's *height* before, and the column branch
+        // returned nothing at all — the two axes were the wrong way round. It
+        // is why every auto-width item in a row came out as wide as it was
+        // tall: ja.wikipedia.org's menu items measured 1px across, with their
+        // labels wrapping one character per line.
+        compute_shrink_to_fit_width(item, 0, text_renderer)
+    } else {
         compute_block_height(item, 0)
             + item.padding[0]
             + item.padding[2]
             + item.border[0]
             + item.border[2]
-    } else {
-        // For column direction, we can't easily estimate width from children alone
-        // Return 0 and let flex-grow handle distribution
-        0.0
     }
 }
 
@@ -2289,6 +2370,7 @@ fn compute_flex_children(
     if depth > MAX_LAYOUT_DEPTH {
         return;
     }
+    resolve_percentage_widths(parent, available_width);
 
     let is_row = matches!(
         parent.flex_direction,
@@ -2323,54 +2405,51 @@ fn compute_flex_children(
         main_margin: f32,
     }
 
-    let mut states: Vec<FlexItemState> = parent
-        .children
-        .iter()
-        .map(|child| {
-            let main_margin = if is_row {
-                child.margin[3] + child.margin[1] // left + right
-            } else {
-                child.margin[0] + child.margin[2] // top + bottom
-            };
+    let mut states: Vec<FlexItemState> = Vec::with_capacity(parent.children.len());
+    for child in &parent.children {
+        let main_margin = if is_row {
+            child.margin[3] + child.margin[1] // left + right
+        } else {
+            child.margin[0] + child.margin[2] // top + bottom
+        };
 
-            let basis = match child.flex_basis {
-                FlexBasis::Auto => {
-                    // Use explicit width if set, accounting for box-sizing
-                    if let Some(explicit_w) = child.explicit_width {
-                        match child.box_sizing {
-                            BoxSizing::BorderBox => {
-                                (explicit_w - child.padding[1] - child.padding[3]).max(0.0)
-                            }
-                            BoxSizing::ContentBox => explicit_w,
+        let basis = match child.flex_basis {
+            FlexBasis::Auto => {
+                // Use explicit width if set, accounting for box-sizing
+                if let Some(explicit_w) = child.explicit_width {
+                    match child.box_sizing {
+                        BoxSizing::BorderBox => {
+                            (explicit_w - child.padding[1] - child.padding[3]).max(0.0)
                         }
+                        BoxSizing::ContentBox => explicit_w,
+                    }
+                } else {
+                    // Content-based sizing
+                    if is_row && child.rect.width > 0.0 {
+                        child.rect.width
+                    } else if !is_row && child.rect.height > 0.0 {
+                        child.rect.height
                     } else {
-                        // Content-based sizing
-                        if is_row && child.rect.width > 0.0 {
-                            child.rect.width
-                        } else if !is_row && child.rect.height > 0.0 {
-                            child.rect.height
-                        } else {
-                            compute_flex_item_content_main_size(child, is_row)
-                        }
+                        compute_flex_item_content_main_size(child, is_row, text_renderer)
                     }
                 }
-                FlexBasis::Pixels(p) => p,
-                FlexBasis::Percentage(frac) => {
-                    let available = if is_row {
-                        available_width - child.margin[1] - child.margin[3]
-                    } else {
-                        available_width - child.margin[0] - child.margin[2]
-                    };
-                    (available * frac).max(0.0)
-                }
-            };
-
-            FlexItemState {
-                basis: basis.max(0.0),
-                main_margin,
             }
-        })
-        .collect();
+            FlexBasis::Pixels(p) => p,
+            FlexBasis::Percentage(frac) => {
+                let available = if is_row {
+                    available_width - child.margin[1] - child.margin[3]
+                } else {
+                    available_width - child.margin[0] - child.margin[2]
+                };
+                (available * frac).max(0.0)
+            }
+        };
+
+        states.push(FlexItemState {
+            basis: basis.max(0.0),
+            main_margin,
+        });
+    }
 
     // --- Step 2: Compute cross-size for each item (needed for line packing) ---
     let cross_sizes: Vec<f32> = parent
@@ -4251,6 +4330,11 @@ fn generated_box(style: &ComputedValues, text: String) -> LayoutNode {
     node.background_repeat = style.background_repeat;
     node.explicit_width = style.explicit_width;
     node.explicit_height = style.explicit_height;
+    node.min_width = style.min_width;
+    node.max_width = style.max_width;
+    node.width_percent = style.width_percent;
+    node.min_width_percent = style.min_width_percent;
+    node.max_width_percent = style.max_width_percent;
     if let Some(width) = style.width {
         node.explicit_width = Some(width);
         node.rect.width = width;
@@ -9460,6 +9544,7 @@ fn compute_table_children(
     if depth > MAX_LAYOUT_DEPTH {
         return;
     }
+    resolve_percentage_widths(parent, available_width);
 
     let pad_left = parent.padding[3];
     let pad_right = parent.padding[1];

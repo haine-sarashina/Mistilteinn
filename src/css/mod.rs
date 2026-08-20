@@ -282,7 +282,9 @@ fn inherit_properties(
     if parent.color.is_some() && child.color.is_none() {
         child.color = parent.color;
     }
-    // `font-size` inherits
+    // `font-size` inherits, and is also the base a percentage or `em` on the
+    // child resolves against.
+    child.inherited_font_size = parent.font_size;
     if child.font_size == initial_font_size && parent.font_size != initial_font_size {
         child.font_size = parent.font_size;
     }
@@ -437,6 +439,7 @@ fn resolve_root_font_size(
 pub fn initial_values(zoom: f32) -> ComputedValues {
     ComputedValues {
         font_size: DEFAULT_FONT_SIZE * zoom,
+        inherited_font_size: DEFAULT_FONT_SIZE * zoom,
         ..ComputedValues::default()
     }
 }
@@ -1444,6 +1447,24 @@ pub struct ComputedValues {
     /// Min/max width constraints
     pub min_width: Option<f32>,
     pub max_width: Option<f32>,
+    /// `width`, `min-width` and `max-width` written as a percentage, kept as a
+    /// fraction where `1.0` is 100%.
+    ///
+    /// A percentage is a share of the containing block, which the cascade
+    /// cannot see — only layout knows how wide the parent turned out. Dropping
+    /// them was invisible on a block box, which fills its parent anyway, and
+    /// ruinous on a flex item: `width: 100%` fell back to the item's content
+    /// size, which is how ja.wikipedia.org's 1580px header came out 300px wide
+    /// with its text wrapping one character per line.
+    pub width_percent: Option<f32>,
+    pub min_width_percent: Option<f32>,
+    pub max_width_percent: Option<f32>,
+    /// The font size this element inherited, before its own `font-size` ran.
+    ///
+    /// `font-size: 150%` and `font-size: 1.5em` are both a multiple of the
+    /// *parent's* size. Resolving them against `self.font_size` compounds when
+    /// more than one rule sets the size on the same element.
+    pub inherited_font_size: f32,
     /// Normalized line-height multiplier (CSS default = 1.2 for "normal").
     pub line_height: f32,
     // Overflow
@@ -2208,6 +2229,7 @@ impl Default for ComputedValues {
             background_repeat: BackgroundRepeat::Repeat,
             color: None,
             font_size: 16.0,
+            inherited_font_size: 16.0,
             font_family: String::new(),
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
@@ -2225,6 +2247,9 @@ impl Default for ComputedValues {
             explicit_height: None,
             min_width: None,
             max_width: None,
+            width_percent: None,
+            min_width_percent: None,
+            max_width_percent: None,
             line_height: 1.2,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
@@ -2606,6 +2631,7 @@ impl ComputedValues {
                 };
             }
             "width" => {
+                self.width_percent = parse_percentage(val);
                 self.width = parse_length(val);
                 self.explicit_width = self.width;
             }
@@ -2729,7 +2755,15 @@ impl ComputedValues {
                 }
             }
             "font-size" => {
-                if let Some(v) = parse_length(val) {
+                // Both `%` and `em` here are multiples of the parent's size,
+                // not of whatever a previous rule already set on this element.
+                let base = LengthContext {
+                    font_size: self.inherited_font_size,
+                    ..ctx
+                };
+                if let Some(fraction) = parse_percentage(val) {
+                    self.font_size = self.inherited_font_size * fraction;
+                } else if let Some(v) = parse_length_ctx(val, base) {
                     self.font_size = v;
                 }
             }
@@ -2907,9 +2941,11 @@ impl ComputedValues {
                 };
             }
             "min-width" => {
+                self.min_width_percent = parse_percentage(val);
                 self.min_width = parse_length(val);
             }
             "max-width" => {
+                self.max_width_percent = parse_percentage(val);
                 self.max_width = parse_length(val);
             }
             "grid-template-columns" => {
@@ -3218,6 +3254,17 @@ fn parse_offset(s: &str) -> Option<f32> {
         return None;
     }
     num_str.parse::<f32>().ok()
+}
+
+/// A percentage value as a fraction, where `1.0` is 100%.
+///
+/// `None` for anything that is not a bare percentage — a length, a keyword, or
+/// arithmetic. Percentages resolve against something the cascade often cannot
+/// see, so they are read out separately rather than folded into a length.
+pub(crate) fn parse_percentage(s: &str) -> Option<f32> {
+    let pct = s.trim().strip_suffix('%')?;
+    let value: f32 = pct.trim().parse().ok()?;
+    value.is_finite().then_some(value / 100.0)
 }
 
 /// The context needed to resolve relative CSS length units into pixels.

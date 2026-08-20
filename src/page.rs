@@ -1129,6 +1129,155 @@ mod tests {
         }
     }
 
+    // ------ Widths that come from the containing block ------
+
+    /// The laid-out width of the first element carrying `class`.
+    fn width_of(page: &Page, class: &str) -> f32 {
+        fn find(arena: &DomArena, node: &crate::layout::LayoutNode, class: &str) -> Option<f32> {
+            if let Some(id) = node.dom_node_id {
+                let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(id));
+                if let Some(dom) = arena.get(handle) {
+                    if dom
+                        .get_attr("class")
+                        .is_some_and(|c| c.split(' ').any(|c| c == class))
+                    {
+                        return Some(node.rect.width);
+                    }
+                }
+            }
+            node.children
+                .iter()
+                .find_map(|child| find(arena, child, class))
+        }
+        find(&page.arena, &page.layout_root, class)
+            .unwrap_or_else(|| panic!("no element with class {class}"))
+    }
+
+    /// A percentage width is a share of the containing block. The cascade
+    /// cannot resolve one — it does not know how wide the parent came out — so
+    /// they used to be dropped, which a block box hides by filling its parent
+    /// anyway.
+    #[test]
+    fn a_percentage_width_is_a_share_of_the_containing_block() {
+        let page = Page::new(
+            r#"<body><div class="outer"><div class="inner">x</div></div></body>"#,
+            ".outer { width: 800px } .inner { width: 50% }",
+            1000.0,
+            600.0,
+        );
+        assert_eq!(width_of(&page, "inner"), 400.0);
+    }
+
+    /// On a flex item the dropped percentage was not hidden at all: the item
+    /// fell back to its content size. `width: 100%` on ja.wikipedia.org's
+    /// header left it 300px wide — its `min-width` — inside a 1580px window.
+    #[test]
+    fn a_flex_item_honours_a_percentage_width() {
+        let page = Page::new(
+            r#"<body><div class="fc"><header class="h">x</header></div></body>"#,
+            ".fc { display: flex; justify-content: center; width: 800px }
+             .h { width: 100%; min-width: 18.75em; max-width: 99.75rem }",
+            1000.0,
+            600.0,
+        );
+        assert_eq!(width_of(&page, "h"), 800.0);
+    }
+
+    #[test]
+    fn a_percentage_min_or_max_width_resolves_too() {
+        let page = Page::new(
+            r#"<body><div class="outer"><div class="inner">x</div></div></body>"#,
+            ".outer { width: 800px } .inner { width: 200px; min-width: 50% }",
+            1000.0,
+            600.0,
+        );
+        assert_eq!(width_of(&page, "inner"), 400.0, "min-width: 50% wins");
+    }
+
+    /// A row's main axis is horizontal, so an auto-width item measures its
+    /// content *width*. It used to measure the item's height instead, which is
+    /// how a menu item ended up 1px across with its label running down the page.
+    #[test]
+    fn an_auto_width_flex_item_in_a_row_is_as_wide_as_its_content() {
+        let page = Page::new(
+            r#"<body><ul class="bar"><li class="one"><a>Log in</a></li></ul></body>"#,
+            ".bar { display: flex; margin: 0; padding: 0 } .one { display: block }",
+            1000.0,
+            600.0,
+        );
+        let width = width_of(&page, "one");
+        assert!(
+            width > 30.0,
+            "an item holding 'Log in' cannot be {width}px wide"
+        );
+    }
+
+    /// A row of flex items stands side by side, so the space the row needs is
+    /// their sum. Measuring it as the widest item made every other item shrink
+    /// to fit inside the longest one.
+    #[test]
+    fn a_flex_row_asks_for_the_sum_of_its_items() {
+        let page = Page::new(
+            r#"<body><div class="wrap"><ul class="bar">
+                 <li class="a"><a>Donate</a></li>
+                 <li class="b"><a>Create account</a></li>
+                 <li class="c"><a>Log in</a></li>
+               </ul></div></body>"#,
+            ".wrap { display: flex } .bar { display: flex; margin: 0; padding: 0 }
+             li { display: block }",
+            1000.0,
+            600.0,
+        );
+        let (a, b, c) = (
+            width_of(&page, "a"),
+            width_of(&page, "b"),
+            width_of(&page, "c"),
+        );
+        assert!(
+            b > a && b > c,
+            "the longest label needs the widest item: {a}, {b}, {c}"
+        );
+        assert!(
+            width_of(&page, "bar") >= a + b + c,
+            "the row must hold all three: {a} + {b} + {c} in {}",
+            width_of(&page, "bar")
+        );
+    }
+
+    /// `font-size: 150%` is a multiple of the parent's size, and so is `1.5em`.
+    /// Percentages were dropped outright, which left ja.wikipedia.org's
+    /// headings at body size.
+    #[test]
+    fn a_percentage_font_size_multiplies_the_parents() {
+        let page = Page::new(
+            r#"<body><div class="parent"><span class="child">x</span></div></body>"#,
+            ".parent { font-size: 20px } .child { font-size: 150% }",
+            1000.0,
+            600.0,
+        );
+        fn font_size(
+            arena: &DomArena,
+            node: &crate::layout::LayoutNode,
+            class: &str,
+        ) -> Option<f32> {
+            if let Some(id) = node.dom_node_id {
+                let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(id));
+                if let Some(dom) = arena.get(handle) {
+                    if dom.get_attr("class") == Some(class) {
+                        return Some(node.font_size);
+                    }
+                }
+            }
+            node.children
+                .iter()
+                .find_map(|child| font_size(arena, child, class))
+        }
+        assert_eq!(
+            font_size(&page.arena, &page.layout_root, "child"),
+            Some(30.0)
+        );
+    }
+
     #[test]
     fn page_img_tag_creates_layout_node_with_src() {
         // Verify that <img> tags get their src attribute extracted into layout nodes.

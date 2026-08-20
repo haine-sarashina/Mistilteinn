@@ -9,3 +9,4 @@ pub mod print;
 pub mod storage;
 pub mod tab;
 pub mod tab_group;
+pub mod window_state;

@@ -238,6 +238,12 @@ pub struct MistilteinnApp {
     hovered_bookmark_row: Option<usize>,
     /// In-page search (Ctrl+F).
     find_bar: FindBar,
+    /// Where the window was left last time, kept up to date as it is moved and
+    /// resized so it can be written out when the browser closes.
+    window_geometry: crate::browser::window_state::WindowGeometry,
+    /// Whether the window has moved or resized since its geometry was last
+    /// read. See [`Self::record_window_geometry`] for why the read waits.
+    window_geometry_stale: bool,
 }
 
 /// A scroll axis. The two scrollbars differ only in which coordinate they use,
@@ -521,6 +527,8 @@ impl MistilteinnApp {
             bookmark_scroll: 0.0,
             hovered_bookmark_row: None,
             find_bar: FindBar::default(),
+            window_geometry: crate::browser::window_state::WindowGeometry::load(),
+            window_geometry_stale: false,
         }
     }
 }
@@ -4111,6 +4119,43 @@ impl MistilteinnApp {
         );
     }
 
+    /// Note where the window is now, so the next run can put it back.
+    ///
+    /// Read while the window is alive rather than once on the way out: by the
+    /// time the event loop is shutting down the window may already be gone,
+    /// and asking it then would have nothing to answer with.
+    ///
+    /// A move or a resize only marks the geometry stale; the reading happens
+    /// once the event batch has run out. Maximizing is why. It arrives as a
+    /// move and a resize carrying the full-screen frame, and the window does
+    /// not admit to being maximized until the whole batch has been handled —
+    /// so a read from inside one of those events would file the maximized
+    /// frame away as the size the user chose, and restoring the window down
+    /// would go nowhere.
+    fn record_window_geometry(&mut self) {
+        self.window_geometry_stale = false;
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
+        let window = renderer.window();
+        self.window_geometry.maximized = window.is_maximized();
+
+        // A maximized or minimized window's own size is not what to restore
+        // to. The size worth keeping is the one the user last dragged the
+        // window to, and that is still sitting in the saved geometry.
+        if self.window_geometry.maximized {
+            return;
+        }
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return; // Minimized: the window has no geometry to speak of.
+        }
+        self.window_geometry.size = (size.width, size.height);
+        if let Ok(position) = window.outer_position() {
+            self.window_geometry.position = Some((position.x, position.y));
+        }
+    }
+
     fn set_winit_cursor(renderer: Option<&Renderer>, cursor: crate::css::Cursor) {
         if let Some(r) = renderer {
             // `cursor: none` hides the pointer rather than picking an icon.
@@ -4144,9 +4189,35 @@ impl ApplicationHandler for MistilteinnApp {
                     winit::window::Icon::from_rgba(rgba.into_raw(), width, height).ok()
                 });
 
+            // Open where the last run left off. The monitors attached now
+            // decide whether that placement is still somewhere the user can
+            // reach; see `WindowGeometry::sanitized`.
+            let monitors: Vec<_> = event_loop
+                .available_monitors()
+                .map(|monitor| {
+                    let position = monitor.position();
+                    let size = monitor.size();
+                    (position.x, position.y, size.width, size.height)
+                })
+                .collect();
+            self.window_geometry = self.window_geometry.sanitized(&monitors);
+            let geometry = self.window_geometry.clone();
+
             let mut window_attributes = WindowAttributes::default()
                 .with_title(format!("Mistilteinn v{}", env!("CARGO_PKG_VERSION")))
-                .with_inner_size(winit::dpi::PhysicalSize::new(1280, 800));
+                .with_inner_size(winit::dpi::PhysicalSize::new(
+                    geometry.size.0,
+                    geometry.size.1,
+                ))
+                // The size above is passed even when this is set, so that a
+                // window restored down from maximized lands on the size the
+                // user chose rather than on the default.
+                .with_maximized(geometry.maximized);
+
+            if let Some((x, y)) = geometry.position {
+                window_attributes =
+                    window_attributes.with_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
 
             if let Some(icon) = icon {
                 window_attributes = window_attributes.with_window_icon(Some(icon));
@@ -4156,7 +4227,20 @@ impl ApplicationHandler for MistilteinnApp {
                 .create_window(window_attributes)
                 .expect("Failed to create window");
 
-            log::info!("Window created (1280x800)");
+            log::info!(
+                "Window created ({}x{}{}{})",
+                geometry.size.0,
+                geometry.size.1,
+                geometry
+                    .position
+                    .map(|(x, y)| format!(" at {x},{y}"))
+                    .unwrap_or_default(),
+                if geometry.maximized {
+                    ", maximized"
+                } else {
+                    ""
+                }
+            );
 
             // Use tokio runtime to run the async wgpu initialization.
             // wgpu requires an async runtime for adapter/device requests.
@@ -4210,9 +4294,21 @@ impl ApplicationHandler for MistilteinnApp {
         match event {
             WindowEvent::CloseRequested => {
                 log::info!("Window close requested, exiting");
+                // Written here rather than only on the way out: the window is
+                // still alive at this point, whereas shutting the renderer and
+                // the runtime down afterwards is not something to bet the
+                // placement on finishing.
+                self.record_window_geometry();
+                self.window_geometry.save();
                 event_loop.exit();
             }
+            WindowEvent::Moved(_) => {
+                // Nothing on screen changes when the window is dragged; the
+                // move is only worth noting down for the next run.
+                self.window_geometry_stale = true;
+            }
             WindowEvent::Resized(size) => {
+                self.window_geometry_stale = true;
                 if size.width == 0 || size.height == 0 {
                     return; // Ignore spurious resize events
                 }
@@ -5183,6 +5279,27 @@ impl ApplicationHandler for MistilteinnApp {
             }
             _ => {}
         }
+    }
+
+    /// Run once the pending events have all been handled.
+    ///
+    /// This is where a move or a resize is finally read off the window: by now
+    /// the batch that carried it is done and the window agrees with itself
+    /// about whether it is maximized.
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.window_geometry_stale {
+            self.record_window_geometry();
+        }
+    }
+
+    /// Write the placement down for any way out that is not the close button.
+    ///
+    /// The window is gone by now, so there is nothing left to ask — this
+    /// writes the geometry that was collected as the window moved and
+    /// resized. Repeating what `CloseRequested` already wrote costs one write
+    /// of a handful of bytes, and covers the exits that never pass through it.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.window_geometry.save();
     }
 }
 

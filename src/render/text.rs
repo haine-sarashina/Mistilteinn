@@ -143,6 +143,21 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// How wide a laid-out run is, trailing whitespace included.
+///
+/// `Layout::max_content_width()` is the *max-content* width, which by
+/// definition stops at the last non-space glyph: a run that is only a space
+/// measures 0 through it. Inline layout puts real space between words with
+/// that number, so a 0 there jams every word in a line together. The line's
+/// own advance is the full pen movement and does include the space.
+fn line_advance(layout: &Layout<()>) -> f32 {
+    let advance = layout
+        .lines()
+        .map(|line| line.metrics().advance)
+        .fold(0.0f32, f32::max);
+    advance.max(layout.max_content_width())
+}
+
 impl TextRenderer {
     /// Create a new text renderer with system fonts loaded.
     ///
@@ -328,7 +343,13 @@ impl TextRenderer {
         layout.break_all_lines(None);
         layout.align(None, Alignment::Start, AlignmentOptions::default());
 
-        let width = layout.max_content_width();
+        // Parley still lays out one line for an empty string, and that line
+        // carries an advance. Nothing was asked to be drawn, so nothing is wide.
+        let width = if text.is_empty() {
+            0.0
+        } else {
+            line_advance(&layout)
+        };
         let height = layout.height();
 
         (width, height)
@@ -713,6 +734,30 @@ mod tests {
         let _renderer = TextRenderer::new();
         // Just verify it creates without panic
         assert!(true);
+    }
+
+    #[test]
+    fn a_lone_space_has_a_width() {
+        let mut renderer = TextRenderer::new();
+        let (space, _) = renderer.measure(" ", 16.0, "sans-serif");
+        assert!(
+            space > 0.0,
+            "a space measured on its own is what inline layout puts between              two words; 0 jams them together"
+        );
+    }
+
+    #[test]
+    fn a_space_measured_alone_agrees_with_one_measured_in_context() {
+        let mut renderer = TextRenderer::new();
+        let (space, _) = renderer.measure(" ", 16.0, "sans-serif");
+        let (a, _) = renderer.measure("a", 16.0, "sans-serif");
+        let (b, _) = renderer.measure("b", 16.0, "sans-serif");
+        let (a_b, _) = renderer.measure("a b", 16.0, "sans-serif");
+        assert!(
+            (a + space + b - a_b).abs() < 0.5,
+            "'a' + ' ' + 'b' = {} but 'a b' = {a_b}",
+            a + space + b
+        );
     }
 
     #[test]

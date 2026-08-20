@@ -72,6 +72,106 @@ pub struct Selector {
     pub complex: Vec<(Combinator, SimpleSelector)>,
 }
 
+/// Everything the matcher may ask about the one element under test.
+///
+/// The fields are trait objects rather than generics so that `:not(...)` can
+/// call back into the matcher without the compiler chasing an unbounded chain
+/// of instantiations.
+struct MatchCtx<'a> {
+    tag_name: &'a str,
+    classes: &'a dyn Fn(&str) -> bool,
+    has_id: &'a dyn Fn(&str) -> bool,
+    matches_attr: &'a dyn Fn(&str, &AttrOperator, Option<&str>) -> bool,
+    is_first_child: &'a dyn Fn() -> bool,
+    is_last_child: &'a dyn Fn() -> bool,
+    is_only_child: &'a dyn Fn() -> bool,
+    child_index_1based: &'a dyn Fn() -> usize,
+    is_hovered: &'a dyn Fn() -> bool,
+}
+
+/// Match one simple selector against the element `ctx` describes.
+fn matches_simple(sel: &SimpleSelector, ctx: &MatchCtx<'_>) -> bool {
+    match sel {
+        SimpleSelector::Universal => true,
+        SimpleSelector::Type(t) => ctx.tag_name.eq_ignore_ascii_case(t),
+        SimpleSelector::Class(c) => (ctx.classes)(c),
+        SimpleSelector::Id(i) => (ctx.has_id)(i),
+        SimpleSelector::Attribute {
+            name,
+            operator,
+            value,
+        } => (ctx.matches_attr)(name, operator, value.as_deref()),
+        SimpleSelector::PseudoClass { name, arguments } => match name.as_str() {
+            "first-child" => (ctx.is_first_child)(),
+            "last-child" => (ctx.is_last_child)(),
+            "only-child" => (ctx.is_only_child)(),
+            "nth-child" => arguments
+                .as_deref()
+                .is_some_and(|arg| matches_nth_child(arg, (ctx.child_index_1based)())),
+            "hover" => (ctx.is_hovered)(),
+            "not" => arguments
+                .as_deref()
+                .is_some_and(|args| !nested_list_matches(args, ctx)),
+            "is" | "where" | "matches" | "any" | "-moz-any" | "-webkit-any" => arguments
+                .as_deref()
+                .is_some_and(|args| nested_list_matches(args, ctx)),
+            _ => false,
+        },
+        SimpleSelector::PseudoElement(_) => false,
+    }
+}
+
+/// Whether any selector in a nested list matches the element under test.
+///
+/// Combinators inside the list are not walked: each selector is judged by its
+/// own simple parts against this one element. `:not(.a .b)` therefore asks
+/// whether the element is both at once, which is stricter than the descendant
+/// test it stands for — and a `:not()` that is too strict lets its rule
+/// through rather than dropping it, which is the safer way to be wrong.
+fn nested_list_matches(arguments: &str, ctx: &MatchCtx<'_>) -> bool {
+    nested_selectors(arguments).iter().any(|sel| {
+        !sel.complex.is_empty()
+            && sel
+                .complex
+                .iter()
+                .all(|(_, simple)| matches_simple(simple, ctx))
+    })
+}
+
+/// The most specific selector in a nested list, for `:not()` and `:is()`.
+fn nested_specificity(arguments: &str) -> (u32, u32, u32) {
+    nested_selectors(arguments)
+        .iter()
+        .map(|sel| sel.specificity())
+        .max()
+        .unwrap_or((0, 0, 0))
+}
+
+thread_local! {
+    /// Parsed `:not()` / `:is()` / `:where()` arguments, keyed by the text
+    /// inside the parentheses.
+    ///
+    /// The cascade asks about the same handful of arguments once per element,
+    /// and a page has far more elements than it has distinct selectors.
+    static NESTED_SELECTORS: std::cell::RefCell<
+        rustc_hash::FxHashMap<String, std::rc::Rc<Vec<Selector>>>,
+    > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+/// The argument of a nested-selector pseudo-class, parsed once and kept.
+fn nested_selectors(arguments: &str) -> std::rc::Rc<Vec<Selector>> {
+    NESTED_SELECTORS.with(|cache| {
+        if let Some(parsed) = cache.borrow().get(arguments) {
+            return parsed.clone();
+        }
+        let parsed = std::rc::Rc::new(parse_selectors_from_string(arguments));
+        cache
+            .borrow_mut()
+            .insert(arguments.to_string(), parsed.clone());
+        parsed
+    })
+}
+
 /// Evaluate an attribute operator matching against an attribute value.
 pub fn evaluate_attr_operator(
     attr_val: &str,
@@ -168,7 +268,20 @@ impl Selector {
                 SimpleSelector::Id(_) => ids += 1,
                 SimpleSelector::Class(_) => classes += 1,
                 SimpleSelector::Attribute { .. } => classes += 1,
-                SimpleSelector::PseudoClass { .. } => classes += 1,
+                SimpleSelector::PseudoClass { name, arguments } => match name.as_str() {
+                    // `:where()` adds nothing, which is the whole point of it.
+                    "where" => {}
+                    // `:not()` and `:is()` count as their most specific argument.
+                    "not" | "is" | "matches" => {
+                        if let Some(args) = arguments {
+                            let (i, c, t) = nested_specificity(args);
+                            ids += i;
+                            classes += c;
+                            types += t;
+                        }
+                    }
+                    _ => classes += 1,
+                },
                 SimpleSelector::Type(_) => types += 1,
                 SimpleSelector::PseudoElement(_) => types += 1,
                 SimpleSelector::Universal => {}
@@ -274,32 +387,23 @@ impl Selector {
         child_index_1based: impl Fn() -> usize,
         is_hovered: impl Fn() -> bool,
     ) -> bool {
-        match sel {
-            SimpleSelector::Universal => true,
-            SimpleSelector::Type(t) => tag_name.eq_ignore_ascii_case(t),
-            SimpleSelector::Class(c) => classes(c),
-            SimpleSelector::Id(i) => has_id(i),
-            SimpleSelector::Attribute {
-                name,
-                operator,
-                value,
-            } => matches_attr(name, operator, value.as_deref()),
-            SimpleSelector::PseudoClass { name, arguments } => match name.as_str() {
-                "first-child" => is_first_child(),
-                "last-child" => is_last_child(),
-                "only-child" => is_only_child(),
-                "nth-child" => {
-                    if let Some(arg) = arguments {
-                        matches_nth_child(arg, child_index_1based())
-                    } else {
-                        false
-                    }
-                }
-                "hover" => is_hovered(),
-                _ => false,
+        // Every caller brings its own closure types, but `:not()` has to
+        // re-enter the matcher on the same element. Trait objects give it one
+        // type to recurse through.
+        matches_simple(
+            sel,
+            &MatchCtx {
+                tag_name,
+                classes: &classes,
+                has_id: &has_id,
+                matches_attr: &matches_attr,
+                is_first_child: &is_first_child,
+                is_last_child: &is_last_child,
+                is_only_child: &is_only_child,
+                child_index_1based: &child_index_1based,
+                is_hovered: &is_hovered,
             },
-            SimpleSelector::PseudoElement(_) => false,
-        }
+        )
     }
 
     /// The pseudo-element this selector targets, if it ends in one.
@@ -396,6 +500,13 @@ impl Selector {
 pub struct CSSRule {
     pub selectors: Vec<Selector>,
     pub declarations: Vec<Declaration>,
+    /// Where this rule sat in the document, counting rules nested inside
+    /// `@media` and `@supports` alongside the plain ones.
+    ///
+    /// The cascade breaks a specificity tie by taking the later rule, so it
+    /// needs to know which one that was. Grouping the conditional rules at the
+    /// end of the list instead handed every `@media` rule an undeserved win.
+    pub order: usize,
 }
 
 /// A CSS @import rule: points to an external stylesheet URL.
@@ -411,30 +522,247 @@ pub struct MediaRule {
     pub rules: Vec<CSSRule>,
 }
 
-/// Evaluates a media condition against a viewport width.
+/// Whether a media query list matches the screen we are rendering to.
+///
+/// `condition` is everything after `@media`, or the value of a `<link>`'s
+/// `media` attribute — a comma-separated list of queries, matching if any one
+/// of them does.
+///
+/// Two rules matter more than the feature list:
+///
+/// * The **media type** is checked. Without that, `@media print` matched, and
+///   a page's print stylesheet — which is written to strip navigation and swap
+///   in a serif face — landed on top of its screen styles.
+/// * A feature whose value we cannot parse makes its query **false**, never
+///   true. CSS drops what it cannot understand; a query that fails open
+///   applies a `max-width: 640px` block to a 1280px window.
 pub fn evaluate_media_condition(condition: &str, viewport_width: f32) -> bool {
-    let mut matches = true;
-    if let Some(min_idx) = condition.find("min-width:") {
-        let rest = &condition[min_idx + 10..];
-        let end_idx = rest.find(')').unwrap_or(rest.len());
-        let val_str = rest[..end_idx].trim().trim_end_matches("px");
-        if let Ok(min_w) = val_str.parse::<f32>() {
-            if viewport_width < min_w {
-                matches = false;
+    let condition = condition.trim();
+    // `@media { … }` with nothing to say applies everywhere.
+    if condition.is_empty() {
+        return true;
+    }
+    split_top_level(condition, ',')
+        .iter()
+        .any(|query| evaluate_media_query(query, viewport_width))
+}
+
+/// One query out of a comma-separated list.
+///
+/// Shape: `[not | only] <media-type> [and <feature>]*`, or a bare list of
+/// features with the type left implicit (`all`).
+fn evaluate_media_query(query: &str, viewport_width: f32) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return false;
+    }
+
+    // `not` negates the whole query; `only` exists to hide a query from CSS2
+    // parsers and means nothing to us.
+    let (negated, rest) = match strip_leading_keyword(&query, "not") {
+        Some(rest) => (true, rest),
+        None => (
+            false,
+            strip_leading_keyword(&query, "only").unwrap_or(&query),
+        ),
+    };
+
+    let matched = split_top_level_and(rest)
+        .iter()
+        .all(|part| evaluate_media_part(part, viewport_width));
+
+    matched != negated
+}
+
+/// One `and`-joined term: either a media type or a parenthesised feature.
+fn evaluate_media_part(part: &str, viewport_width: f32) -> bool {
+    let part = part.trim();
+    if part.is_empty() {
+        return false;
+    }
+    if part.starts_with('(') {
+        evaluate_media_feature(part, viewport_width)
+    } else {
+        // We are a screen. `print`, `speech` and the deprecated types are not us.
+        matches!(part, "all" | "screen")
+    }
+}
+
+/// A single `(feature: value)` term.
+///
+/// An unrecognised feature is false, per the CSS rule that an unknown media
+/// feature never matches.
+fn evaluate_media_feature(feature: &str, viewport_width: f32) -> bool {
+    let inner = feature
+        .trim()
+        .strip_prefix('(')
+        .and_then(|f| f.strip_suffix(')'))
+        .unwrap_or("")
+        .trim();
+    if inner.is_empty() {
+        return false;
+    }
+
+    // A parenthesised group rather than a feature: `((a) and (b))`.
+    if inner.starts_with('(') {
+        return evaluate_media_query(inner, viewport_width);
+    }
+
+    let Some((name, value)) = inner.split_once(':') else {
+        // A boolean feature — `(color)`, `(hover)`. None of the ones we could
+        // answer for are worth guessing at.
+        return false;
+    };
+    let name = name.trim();
+    let value = value.trim();
+
+    // Lengths here may be arithmetic: MediaWiki writes `calc(640px - 1px)`.
+    let length = || {
+        crate::css::parse_length_ctx(
+            value,
+            crate::css::LengthContext {
+                viewport_width,
+                ..crate::css::LengthContext::default()
+            },
+        )
+    };
+
+    match name {
+        "min-width" => length().is_some_and(|v| viewport_width >= v),
+        "max-width" => length().is_some_and(|v| viewport_width <= v),
+        "width" => length().is_some_and(|v| (viewport_width - v).abs() < 0.5),
+        // We paint a light page and animate freely.
+        "prefers-color-scheme" => value == "light",
+        "prefers-reduced-motion" => value == "no-preference",
+        // A desktop window with a mouse in it.
+        "hover" | "any-hover" => value == "hover",
+        "pointer" | "any-pointer" => value == "fine",
+        "orientation" => value == "landscape",
+        _ => false,
+    }
+}
+
+/// `keyword` if the string starts with it as a whole word, and the rest after it.
+fn strip_leading_keyword<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = s.strip_prefix(keyword)?;
+    if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()) {
+        Some(rest.trim_start())
+    } else {
+        None
+    }
+}
+
+/// Split on the word `and` where it is not inside parentheses.
+fn split_top_level_and(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && bytes[i..].starts_with(b"and") {
+            let before_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
+            let after = i + 3;
+            let after_ok = after >= bytes.len() || bytes[after].is_ascii_whitespace();
+            if before_ok && after_ok {
+                parts.push(s[start..i].trim());
+                start = after;
+                i = after;
+                continue;
             }
         }
+        i += 1;
     }
-    if let Some(max_idx) = condition.find("max-width:") {
-        let rest = &condition[max_idx + 10..];
-        let end_idx = rest.find(')').unwrap_or(rest.len());
-        let val_str = rest[..end_idx].trim().trim_end_matches("px");
-        if let Ok(max_w) = val_str.parse::<f32>() {
-            if viewport_width > max_w {
-                matches = false;
+    parts.push(s[start..].trim());
+    parts.into_iter().filter(|p| !p.is_empty()).collect()
+}
+
+/// Whether an `@supports` condition holds for this engine.
+///
+/// The grammar is `not X`, `X and Y`, `X or Y`, parentheses, and the leaf
+/// `(property: value)`. A leaf we cannot read at all is false, which is the
+/// answer that makes a page hand us its fallback rather than the branch
+/// written for a browser we are not.
+pub fn evaluate_supports_condition(condition: &str) -> bool {
+    let cond = condition.trim();
+    if cond.is_empty() {
+        return false;
+    }
+
+    // `or` binds loosest, then `and`, then `not`.
+    let ors = split_top_level_keyword(cond, "or");
+    if ors.len() > 1 {
+        return ors.iter().any(|part| evaluate_supports_condition(part));
+    }
+    let ands = split_top_level_keyword(cond, "and");
+    if ands.len() > 1 {
+        return ands.iter().all(|part| evaluate_supports_condition(part));
+    }
+
+    if let Some(rest) = strip_leading_keyword(cond, "not") {
+        return !evaluate_supports_condition(rest);
+    }
+
+    // `selector(...)`, `font-format(...)` and friends: we make no claim.
+    if !cond.starts_with('(') {
+        return false;
+    }
+
+    let Some(inner) = cond.strip_prefix('(').and_then(|c| c.strip_suffix(')')) else {
+        return false;
+    };
+    let inner = inner.trim();
+
+    // A parenthesised group rather than a declaration.
+    if inner.starts_with('(') || starts_with_keyword(inner, "not") {
+        return evaluate_supports_condition(inner);
+    }
+
+    match inner.split_once(':') {
+        Some((property, value)) => crate::css::supports_declaration(property, value),
+        None => false,
+    }
+}
+
+/// Whether the string opens with `keyword` as a whole word.
+fn starts_with_keyword(s: &str, keyword: &str) -> bool {
+    strip_leading_keyword(s, keyword).is_some()
+}
+
+/// Split on `keyword` used as a whole word outside any parentheses.
+fn split_top_level_keyword<'a>(s: &'a str, keyword: &str) -> Vec<&'a str> {
+    let bytes = s.as_bytes();
+    let kw = keyword.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && bytes[i..].len() >= kw.len() && bytes[i..].starts_with(kw) {
+            let before_ok = i > 0 && bytes[i - 1].is_ascii_whitespace();
+            let after = i + kw.len();
+            let after_ok = after < bytes.len() && bytes[after].is_ascii_whitespace();
+            if before_ok && after_ok {
+                parts.push(s[start..i].trim());
+                start = after;
+                i = after;
+                continue;
             }
         }
+        i += 1;
     }
-    matches
+    parts.push(s[start..].trim());
+    parts.into_iter().filter(|p| !p.is_empty()).collect()
 }
 
 /// Where one `@font-face` source points.
@@ -696,6 +1024,24 @@ fn try_parse_import(prelude: &str) -> Option<ImportRule> {
 /// Uses string-based splitting to find `{ ... }` block pairs, then parses
 /// selectors from prelude text using cssparser tokens, and declarations
 /// from block text using the string-based parser. Also extracts `@import` rules.
+/// Slide a nested sheet's rule numbering to start at `base`, and report the
+/// next free number.
+///
+/// A nested `parse_stylesheet` numbers from zero because it cannot see what
+/// came before it; this puts the block back where it belongs in the document.
+fn continue_order_from(sheet: &mut Stylesheet, base: usize) -> usize {
+    let mut next = base;
+    let nested = sheet
+        .media_rules
+        .iter_mut()
+        .flat_map(|media| media.rules.iter_mut());
+    for rule in sheet.rules.iter_mut().chain(nested) {
+        rule.order += base;
+        next = next.max(rule.order + 1);
+    }
+    next
+}
+
 pub fn parse_stylesheet(source: &str) -> Stylesheet {
     let mut rules = Vec::new();
     let mut imports = Vec::new();
@@ -703,6 +1049,7 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
     let mut font_faces = Vec::new();
     let mut keyframes = Vec::new();
     let mut pos = 0;
+    let mut order = 0usize;
 
     while pos < source.len() {
         // Skip whitespace
@@ -746,13 +1093,28 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
                     if prelude.starts_with("@media") {
                         let condition = prelude[6..].trim().to_string();
                         // Recursively parse the nested rules
-                        let inner_stylesheet = parse_stylesheet(block_text);
+                        let mut inner_stylesheet = parse_stylesheet(block_text);
+                        order = continue_order_from(&mut inner_stylesheet, order);
                         media_rules.push(MediaRule {
                             condition,
                             rules: inner_stylesheet.rules,
                         });
                         font_faces.extend(inner_stylesheet.font_faces);
                         keyframes.extend(inner_stylesheet.keyframes);
+                    } else if let Some(supports) = prelude.strip_prefix("@supports") {
+                        // The condition does not depend on the viewport, so it
+                        // is settled here and the block either becomes ordinary
+                        // rules or disappears. Skipping every `@supports`
+                        // wholesale dropped 83 blocks of ja.wikipedia.org's
+                        // layout on the floor.
+                        if evaluate_supports_condition(supports) {
+                            let mut inner_stylesheet = parse_stylesheet(block_text);
+                            order = continue_order_from(&mut inner_stylesheet, order);
+                            rules.extend(inner_stylesheet.rules);
+                            media_rules.extend(inner_stylesheet.media_rules);
+                            font_faces.extend(inner_stylesheet.font_faces);
+                            keyframes.extend(inner_stylesheet.keyframes);
+                        }
                     } else if prelude
                         .get(..10)
                         .is_some_and(|p| p.eq_ignore_ascii_case("@font-face"))
@@ -789,7 +1151,9 @@ pub fn parse_stylesheet(source: &str) -> Stylesheet {
                         rules.push(CSSRule {
                             selectors,
                             declarations,
+                            order,
                         });
+                        order += 1;
                     }
                     pos += brace_pos + 1 + block_end + 1; // skip past `}`
                 } else {
@@ -904,6 +1268,52 @@ fn collect_tokens_from_parser<'i, 't>(parser: &mut Parser<'i, 't>, tokens: &mut 
     }
 }
 
+/// Read the text between a pseudo-class function's parentheses.
+///
+/// `*i` starts just past the `Function` token and ends just past its closing
+/// parenthesis. The text is rebuilt so it can be parsed again — `:not()` and
+/// `:is()` hold a selector list, and a list that came back as
+/// `role=button` instead of `[role="button"]` would match nothing.
+fn collect_function_arguments(tokens: &[&Token<'_>], i: &mut usize) -> Option<String> {
+    let mut args = String::new();
+    let mut depth = 1usize;
+    while *i < tokens.len() && depth > 0 {
+        let t = &tokens[*i];
+        // A `Function` token opens a block of its own, exactly as
+        // `ParenthesisBlock` does — counting only the latter used to end the
+        // argument early on `:where(.new:not(…))`.
+        if matches!(t, Token::CloseParenthesis) {
+            depth -= 1;
+            if depth > 0 {
+                args.push(')');
+            }
+        } else if matches!(t, Token::ParenthesisBlock | Token::Function(_)) {
+            depth += 1;
+            args.push_str(&token_to_selector_text(t));
+        } else if !matches!(t, Token::CloseCurlyBracket) {
+            args.push_str(&token_to_selector_text(t));
+        }
+        *i += 1;
+    }
+    let args = args.trim().to_string();
+    (!args.is_empty()).then_some(args)
+}
+
+/// Render a token back as selector source.
+///
+/// Differs from [`token_to_string`] in keeping the brackets and quotes, which
+/// only matter when the text is going to be parsed as a selector again.
+fn token_to_selector_text(token: &Token<'_>) -> String {
+    match token {
+        Token::SquareBracketBlock => "[".to_string(),
+        Token::CloseSquareBracket => "]".to_string(),
+        Token::ParenthesisBlock => "(".to_string(),
+        Token::CloseParenthesis => ")".to_string(),
+        Token::QuotedString(s) => format!("\"{}\"", cow_to_string(s)),
+        other => token_to_string(other),
+    }
+}
+
 /// Parses selectors from a CSS selector string using cssparser.
 fn parse_selectors_from_string(selector_text: &str) -> Vec<Selector> {
     let trimmed = selector_text.trim();
@@ -928,10 +1338,21 @@ fn build_selectors_from_tokens(tokens: &[Token<'_>]) -> Vec<Selector> {
 
     let mut selectors = Vec::new();
     let mut current_tokens: Vec<&Token<'_>> = Vec::new();
+    // `:not(.a, .b)` is one selector, not two. Splitting on every comma tore
+    // the tail of the argument off into a selector of its own.
+    let mut depth = 0usize;
 
     for token in tokens.iter() {
         match token {
-            Token::Comma => {
+            Token::ParenthesisBlock | Token::Function(_) | Token::SquareBracketBlock => {
+                depth += 1;
+                current_tokens.push(token);
+            }
+            Token::CloseParenthesis | Token::CloseSquareBracket => {
+                depth = depth.saturating_sub(1);
+                current_tokens.push(token);
+            }
+            Token::Comma if depth == 0 => {
                 if !current_tokens.is_empty() {
                     selectors.push(parse_single_selector_impl(&current_tokens));
                     current_tokens.clear();
@@ -1023,22 +1444,9 @@ fn try_parse_simple_selector<'t>(
         }
         Token::Function(name) => {
             *i += 1;
-            let mut args = String::new();
-            let mut depth = 1usize;
-            while *i < tokens.len() && depth > 0 {
-                let t = &tokens[*i];
-                if matches!(t, Token::CloseParenthesis) {
-                    depth -= 1;
-                } else if matches!(t, Token::ParenthesisBlock) {
-                    depth += 1;
-                } else if !matches!(t, Token::CloseCurlyBracket) {
-                    args.push_str(&token_to_string(t));
-                }
-                *i += 1;
-            }
             Some(SimpleSelector::PseudoClass {
                 name: cow_to_string(name),
-                arguments: if args.is_empty() { None } else { Some(args) },
+                arguments: collect_function_arguments(tokens, i),
             })
         }
         Token::SquareBracketBlock => {
@@ -1066,22 +1474,9 @@ fn try_parse_simple_selector<'t>(
                     }
                     Token::Function(name) => {
                         *i += 1;
-                        let mut args = String::new();
-                        let mut depth = 1usize;
-                        while *i < tokens.len() && depth > 0 {
-                            let t = &tokens[*i];
-                            if matches!(t, Token::CloseParenthesis) {
-                                depth -= 1;
-                            } else if matches!(t, Token::ParenthesisBlock) {
-                                depth += 1;
-                            } else if !matches!(t, Token::CloseCurlyBracket) {
-                                args.push_str(&token_to_string(t));
-                            }
-                            *i += 1;
-                        }
                         return Some(SimpleSelector::PseudoClass {
                             name: cow_to_string(name),
-                            arguments: if args.is_empty() { None } else { Some(args) },
+                            arguments: collect_function_arguments(tokens, i),
                         });
                     }
                     _ => {}
@@ -1209,6 +1604,189 @@ pub fn parse_selector_str(source: &str) -> Vec<Selector> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------ Media queries ------
+
+    /// A page's print stylesheet strips its navigation and swaps in a serif
+    /// face. Applying it to the screen is how ja.wikipedia.org came out in
+    /// mincho with no search box.
+    #[test]
+    fn print_only_rules_do_not_apply_to_the_screen() {
+        assert!(!evaluate_media_condition("print", 1280.0));
+        assert!(!evaluate_media_condition(
+            "print and (min-width: 100px)",
+            1280.0
+        ));
+        assert!(evaluate_media_condition("not print", 1280.0));
+    }
+
+    #[test]
+    fn screen_and_all_apply() {
+        assert!(evaluate_media_condition("screen", 1280.0));
+        assert!(evaluate_media_condition("all", 1280.0));
+        assert!(evaluate_media_condition("only screen", 1280.0));
+        assert!(evaluate_media_condition("", 1280.0));
+    }
+
+    /// MediaWiki writes its breakpoints as `calc(640px - 1px)`. Read as a bare
+    /// number that fails to parse, the condition used to be dropped and the
+    /// block applied at every width — which is why a 1280px window got the
+    /// narrow-screen layout.
+    #[test]
+    fn a_breakpoint_written_as_calc_is_evaluated() {
+        assert!(!evaluate_media_condition(
+            "all and (max-width:calc(640px - 1px))",
+            1280.0
+        ));
+        assert!(evaluate_media_condition(
+            "all and (max-width:calc(640px - 1px))",
+            500.0
+        ));
+        assert!(!evaluate_media_condition(
+            "screen and (max-width:calc(1120px - 1px))",
+            1280.0
+        ));
+        assert!(evaluate_media_condition(
+            "screen and (min-width:calc(640px - 1px))",
+            1280.0
+        ));
+    }
+
+    #[test]
+    fn plain_width_breakpoints_still_work() {
+        assert!(evaluate_media_condition(
+            "screen and (min-width:1120px)",
+            1280.0
+        ));
+        assert!(!evaluate_media_condition(
+            "screen and (min-width:1680px)",
+            1280.0
+        ));
+        assert!(evaluate_media_condition("(max-width: 1399px)", 1280.0));
+        assert!(!evaluate_media_condition("(max-width: 640px)", 1280.0));
+    }
+
+    #[test]
+    fn both_ends_of_a_range_must_hold() {
+        let range = "screen and (min-width:640px) and (max-width:1120px)";
+        assert!(evaluate_media_condition(range, 800.0));
+        assert!(!evaluate_media_condition(range, 1280.0));
+        assert!(!evaluate_media_condition(range, 400.0));
+    }
+
+    #[test]
+    fn a_query_list_matches_if_any_query_does() {
+        assert!(evaluate_media_condition("print, screen", 1280.0));
+        assert!(!evaluate_media_condition("print, speech", 1280.0));
+    }
+
+    /// We render a light page and do not honour a motion preference, so the
+    /// dark and reduced-motion blocks are not ours. They used to match because
+    /// the condition mentioned neither `min-width` nor `max-width`.
+    #[test]
+    fn preference_features_answer_for_how_we_actually_render() {
+        assert!(!evaluate_media_condition(
+            "screen and (prefers-color-scheme:dark)",
+            1280.0
+        ));
+        assert!(evaluate_media_condition(
+            "screen and (prefers-color-scheme:light)",
+            1280.0
+        ));
+        assert!(!evaluate_media_condition(
+            "(prefers-reduced-motion:reduce)",
+            1280.0
+        ));
+    }
+
+    /// An unknown feature makes its query false. Failing open is what let a
+    /// narrow-screen block style a wide window.
+    #[test]
+    fn an_unreadable_feature_fails_closed() {
+        assert!(!evaluate_media_condition("(min-resolution: 2dppx)", 1280.0));
+        assert!(!evaluate_media_condition(
+            "screen and (max-width: banana)",
+            1280.0
+        ));
+        assert!(!evaluate_media_condition(
+            "screen and (min-width: 100px) and (min-resolution: 2dppx)",
+            1280.0
+        ));
+    }
+
+    // ------ @supports ------
+
+    #[test]
+    fn supports_holds_for_a_property_the_cascade_applies() {
+        assert!(evaluate_supports_condition("(display:grid)"));
+        assert!(evaluate_supports_condition("(display: flex)"));
+        assert!(evaluate_supports_condition("(position:sticky)"));
+    }
+
+    /// Saying yes to a property we ignore is the harmful answer: MediaWiki
+    /// pairs its mask-image icons with a `background-image` fallback and picks
+    /// between them on exactly this question.
+    #[test]
+    fn supports_admits_a_property_we_do_not_have() {
+        assert!(!evaluate_supports_condition("(mask-image:none)"));
+        assert!(!evaluate_supports_condition("(-webkit-mask-image:none)"));
+        assert!(!evaluate_supports_condition("(overflow-wrap:anywhere)"));
+        assert!(!evaluate_supports_condition("(word-break:break-word)"));
+    }
+
+    #[test]
+    fn supports_reads_not_and_or_and_nesting() {
+        assert!(evaluate_supports_condition(
+            "not ((-webkit-mask-image:none) or (mask-image:none))"
+        ));
+        assert!(!evaluate_supports_condition(
+            "((-webkit-mask-image:none) or (mask-image:none))"
+        ));
+        assert!(evaluate_supports_condition(
+            "(display:grid) or (mask-image:none)"
+        ));
+        assert!(!evaluate_supports_condition(
+            "(display:grid) and (mask-image:none)"
+        ));
+        assert!(evaluate_supports_condition(
+            "(display:grid) and (display:flex)"
+        ));
+    }
+
+    /// A property we know carrying arithmetic we cannot evaluate.
+    #[test]
+    fn supports_rejects_a_value_function_we_cannot_evaluate() {
+        assert!(!evaluate_supports_condition("(width:round(1.5px,1px))"));
+        assert!(evaluate_supports_condition("(width:calc(100% - 1px))"));
+    }
+
+    /// `selector()` asks about our selector support, which we do not claim.
+    #[test]
+    fn supports_makes_no_claim_about_selectors() {
+        assert!(!evaluate_supports_condition("selector(:focus-visible)"));
+        assert!(evaluate_supports_condition("not selector(:focus-visible)"));
+    }
+
+    #[test]
+    fn a_supported_block_contributes_its_rules() {
+        let ss = parse_stylesheet("@supports (display:grid) { .a { color: red } }");
+        assert_eq!(ss.rules.len(), 1, "the block's rules become ordinary rules");
+    }
+
+    #[test]
+    fn an_unsupported_block_contributes_nothing() {
+        let ss = parse_stylesheet("@supports (mask-image:none) { .a { color: red } }");
+        assert_eq!(ss.rules.len(), 0);
+    }
+
+    #[test]
+    fn a_media_rule_inside_supports_is_kept() {
+        let ss = parse_stylesheet(
+            "@supports (display:grid) { @media screen and (min-width:100px) { .a { color: red } } }",
+        );
+        assert_eq!(ss.media_rules.len(), 1);
+        assert_eq!(ss.media_rules[0].rules.len(), 1);
+    }
 
     #[test]
     fn parse_empty_stylesheet() {

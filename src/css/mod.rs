@@ -577,6 +577,10 @@ where
             active_rules.extend(media_rule.rules.iter());
         }
     }
+    // Back into document order. The declarations are applied in this order at
+    // equal specificity, so a `@media` rule must not jump ahead of a later
+    // unconditional one simply for being conditional.
+    active_rules.sort_by_key(|rule| rule.order);
 
     // Keep applied declarations per element so we can re-evaluate variables after inheriting from parent
     let mut applied_decls_per_element: rustc_hash::FxHashMap<u32, Vec<Declaration>> =
@@ -3236,6 +3240,220 @@ pub struct LengthContext {
     pub zoom: f32,
 }
 
+// ------ `@supports` ------
+
+/// Every property name the cascade knows how to apply.
+///
+/// This is what `@supports (prop: value)` answers from. Claiming a property we
+/// then ignore is worse than admitting we lack it: a page that asks whether we
+/// have `mask-image` has a `background-image` fallback ready for when we say
+/// no, and taking the mask branch leaves its icons blank.
+const SUPPORTED_PROPERTIES: &[&str] = &[
+    "-webkit-animation",
+    "align-content",
+    "align-items",
+    "align-self",
+    "animation",
+    "animation-delay",
+    "animation-direction",
+    "animation-duration",
+    "animation-fill-mode",
+    "animation-iteration-count",
+    "animation-name",
+    "animation-timing-function",
+    "background",
+    "background-color",
+    "background-image",
+    "background-position",
+    "background-repeat",
+    "background-size",
+    "border",
+    "border-bottom",
+    "border-bottom-color",
+    "border-bottom-style",
+    "border-bottom-width",
+    "border-color",
+    "border-left",
+    "border-left-color",
+    "border-left-style",
+    "border-left-width",
+    "border-radius",
+    "border-right",
+    "border-right-color",
+    "border-right-style",
+    "border-right-width",
+    "border-style",
+    "border-top",
+    "border-top-color",
+    "border-top-style",
+    "border-top-width",
+    "border-width",
+    "bottom",
+    "box-sizing",
+    "clear",
+    "color",
+    "column-gap",
+    "content",
+    "cursor",
+    "direction",
+    "display",
+    "filter",
+    "flex",
+    "flex-basis",
+    "flex-direction",
+    "flex-grow",
+    "flex-shrink",
+    "flex-wrap",
+    "float",
+    "font-family",
+    "font-size",
+    "font-style",
+    "font-weight",
+    "gap",
+    "grid-column-gap",
+    "grid-row-gap",
+    "grid-template-columns",
+    "grid-template-rows",
+    "height",
+    "justify-content",
+    "justify-items",
+    "left",
+    "letter-spacing",
+    "line-height",
+    "margin",
+    "margin-bottom",
+    "margin-left",
+    "margin-right",
+    "margin-top",
+    "max-width",
+    "min-width",
+    "order",
+    "overflow",
+    "overflow-x",
+    "overflow-y",
+    "padding",
+    "padding-bottom",
+    "padding-left",
+    "padding-right",
+    "padding-top",
+    "position",
+    "right",
+    "row-gap",
+    "text-align",
+    "text-decoration",
+    "text-decoration-line",
+    "text-transform",
+    "top",
+    "transform",
+    "transform-origin",
+    "transition",
+    "transition-delay",
+    "transition-duration",
+    "transition-property",
+    "transition-timing-function",
+    "visibility",
+    "width",
+    "word-spacing",
+    "z-index",
+];
+
+/// Value functions we can evaluate. Anything else makes a value unsupported.
+const SUPPORTED_VALUE_FUNCTIONS: &[&str] = &[
+    "calc",
+    "min",
+    "max",
+    "clamp",
+    "var",
+    "url",
+    "attr",
+    "rgb",
+    "rgba",
+    "hsl",
+    "hsla",
+    "linear-gradient",
+    "radial-gradient",
+    "translate",
+    "translatex",
+    "translatey",
+    "translate3d",
+    "scale",
+    "scalex",
+    "scaley",
+    "rotate",
+    "skew",
+    "skewx",
+    "skewy",
+    "matrix",
+    "blur",
+    "brightness",
+    "contrast",
+    "grayscale",
+    "invert",
+    "opacity",
+    "saturate",
+    "sepia",
+    "hue-rotate",
+    "drop-shadow",
+    "repeat",
+    "minmax",
+    "fit-content",
+    "cubic-bezier",
+    "steps",
+    "counter",
+    "format",
+    "local",
+];
+
+/// Whether `@supports (property: value)` should hold.
+///
+/// True when the cascade has a rule for the property *and* the value uses only
+/// functions we can evaluate — `width: round(1.5px, 1px)` is a property we know
+/// carrying arithmetic we do not.
+pub fn supports_declaration(property: &str, value: &str) -> bool {
+    let property = property.trim().to_ascii_lowercase();
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    // A custom property accepts any value by definition.
+    if property.starts_with("--") {
+        return true;
+    }
+    if !SUPPORTED_PROPERTIES.contains(&property.as_str()) {
+        return false;
+    }
+    !uses_an_unknown_function(value)
+}
+
+/// Whether a value calls a function we cannot evaluate.
+fn uses_an_unknown_function(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'(' {
+            continue;
+        }
+        // Walk back over the function name preceding the parenthesis.
+        let mut start = i;
+        while start > 0 {
+            let c = bytes[start - 1];
+            if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        // `(` with nothing before it is a grouping parenthesis, not a call.
+        if start == i {
+            continue;
+        }
+        if !SUPPORTED_VALUE_FUNCTIONS.contains(&&lower[start..i]) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The CSS initial font size, used whenever no explicit context is available.
 pub const DEFAULT_FONT_SIZE: f32 = 16.0;
 
@@ -3477,7 +3695,7 @@ fn eval_math_fn(inner: &str, which: MathFn, ctx: LengthContext) -> Option<f32> {
 /// and `calc()` / `min()` / `max()` / `clamp()` over those.
 /// A bare number is treated as pixels (quirks-friendly, and correct for `0`).
 /// Returns `None` for `"auto"`, `"inherit"`, percentages, or unparseable values.
-fn parse_length_ctx(s: &str, ctx: LengthContext) -> Option<f32> {
+pub(crate) fn parse_length_ctx(s: &str, ctx: LengthContext) -> Option<f32> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("inherit") {
         return None;
@@ -4098,12 +4316,13 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
 
     let mut rules = Vec::new();
 
-    for (selector_str, decls_str) in ua_rules {
+    for (order, (selector_str, decls_str)) in ua_rules.into_iter().enumerate() {
         let selectors = parser::parse_selector_str(selector_str);
         let declarations = parse_declarations(decls_str);
         rules.push(parser::CSSRule {
             selectors,
             declarations,
+            order,
         });
     }
 
@@ -4124,15 +4343,32 @@ pub fn merge_stylesheets_with_author(
     ua: &parser::Stylesheet,
     author: &parser::Stylesheet,
 ) -> parser::Stylesheet {
+    // The author's numbering restarts at zero, so it is slid past the UA
+    // sheet's — otherwise sorting by source order would interleave the two and
+    // let a UA rule outrank the page's own.
+    let base = ua.rules.iter().map(|r| r.order + 1).max().unwrap_or(0);
+    let shifted = |rule: &parser::CSSRule| parser::CSSRule {
+        order: rule.order + base,
+        ..rule.clone()
+    };
+
     let mut rules = Vec::new();
     rules.extend_from_slice(&ua.rules);
-    rules.extend_from_slice(&author.rules);
+    rules.extend(author.rules.iter().map(shifted));
     // UA stylesheet has no imports; pass through author imports (already resolved at fetch time)
     let imports = author.imports.clone();
+    let media_rules = author
+        .media_rules
+        .iter()
+        .map(|media| parser::MediaRule {
+            condition: media.condition.clone(),
+            rules: media.rules.iter().map(shifted).collect(),
+        })
+        .collect();
     parser::Stylesheet {
         rules,
         imports,
-        media_rules: author.media_rules.clone(),
+        media_rules,
         // The UA sheet declares neither web fonts nor animations.
         font_faces: author.font_faces.clone(),
         keyframes: author.keyframes.clone(),
@@ -5235,6 +5471,166 @@ mod tests {
         } else {
             assert!(false, "Expected to find a <p> node");
         }
+    }
+
+    // ------ Cascade source order ------
+
+    /// The colour the first `<a>` ends up with, from author CSS alone.
+    fn cascaded_link_color(css: &str) -> Option<[u8; 4]> {
+        let arena = crate::html::parse_html("<a>link</a>");
+        let author = parser::parse_stylesheet(css);
+        let merged = merge_stylesheets_with_author(&user_agent_stylesheet(), &author);
+        let styles = compute_styles_for_tree(&arena, &merged, (1280.0, 800.0));
+        styles_for_tag(&arena, &styles, "a").color
+    }
+
+    /// At equal specificity the later rule wins — including when the earlier
+    /// one is inside a `@media` block. Collecting the media rules after all the
+    /// plain ones used to hand them the tie regardless of where they were
+    /// written.
+    #[test]
+    fn a_later_rule_beats_an_earlier_media_rule() {
+        assert_eq!(
+            cascaded_link_color("@media screen { a { color: red } } a { color: lime }"),
+            Some([0, 255, 0, 255]),
+            "the unconditional rule comes second and wins"
+        );
+    }
+
+    #[test]
+    fn a_later_media_rule_beats_an_earlier_plain_rule() {
+        assert_eq!(
+            cascaded_link_color("a { color: red } @media screen { a { color: lime } }"),
+            Some([0, 255, 0, 255])
+        );
+    }
+
+    /// The author's rules restart their numbering at zero, so they have to be
+    /// slid past the UA sheet or the two interleave.
+    #[test]
+    fn an_author_rule_beats_the_ua_sheet_at_equal_specificity() {
+        assert_eq!(
+            cascaded_link_color("a { color: red }"),
+            Some([255, 0, 0, 255]),
+            "the UA sheet also has a plain `a` rule, and must lose to this one"
+        );
+    }
+
+    #[test]
+    fn a_supports_block_keeps_the_position_it_was_written_at() {
+        assert_eq!(
+            cascaded_link_color("@supports (display:grid) { a { color: red } } a { color: lime }"),
+            Some([0, 255, 0, 255])
+        );
+        assert_eq!(
+            cascaded_link_color("a { color: lime } @supports (display:grid) { a { color: red } }"),
+            Some([255, 0, 0, 255])
+        );
+    }
+
+    // ------ `:not()`, `:is()`, `:where()` ------
+
+    /// Whether an author rule painting `<a>` red reached the first one.
+    ///
+    /// The UA sheet already gives a link a colour, so "did the rule apply" is
+    /// the question, not "is a colour set".
+    fn link_is_red(css: &str, html: &str) -> bool {
+        let arena = crate::html::parse_html(html);
+        let author = parser::parse_stylesheet(css);
+        let merged = merge_stylesheets_with_author(&user_agent_stylesheet(), &author);
+        let styles = compute_styles_for_tree(&arena, &merged, (1280.0, 800.0));
+        styles_for_tag(&arena, &styles, "a").color == Some([255, 0, 0, 255])
+    }
+
+    /// Every `:not()` used to fail to match, so 360 of the rules on
+    /// ja.wikipedia.org never reached an element.
+    #[test]
+    fn not_matches_when_its_argument_does_not() {
+        assert!(
+            link_is_red("a:not(.notheme) { color: red }", "<a>link</a>"),
+            "the element has no class, so :not(.notheme) holds"
+        );
+        assert!(
+            !link_is_red(
+                "a:not(.notheme) { color: red }",
+                r#"<a class="notheme">link</a>"#
+            ),
+            "the element has the class, so the rule must not apply"
+        );
+    }
+
+    #[test]
+    fn not_takes_a_selector_list() {
+        assert!(link_is_red(
+            "a:not(.x, .y) { color: red }",
+            r#"<a class="z">l</a>"#
+        ));
+        assert!(
+            !link_is_red("a:not(.x, .y) { color: red }", r#"<a class="y">l</a>"#),
+            "matching either arm of the list rules the element out"
+        );
+    }
+
+    #[test]
+    fn not_takes_an_attribute_selector() {
+        assert!(link_is_red(
+            r#"a:not([role="button"]) { color: red }"#,
+            r#"<a href="/x">l</a>"#
+        ));
+        assert!(!link_is_red(
+            r#"a:not([role="button"]) { color: red }"#,
+            r#"<a role="button">l</a>"#
+        ));
+    }
+
+    /// An unknown pseudo-class inside `:not()` cannot be shown to match, and a
+    /// static element is not `:active` or `:focus` anyway.
+    #[test]
+    fn not_of_a_state_pseudo_class_holds_for_a_resting_element() {
+        assert!(link_is_red("a:not(:active) { color: red }", "<a>l</a>"));
+    }
+
+    #[test]
+    fn is_and_where_match_any_of_their_arguments() {
+        assert!(link_is_red(
+            "a:is(.x, .y) { color: red }",
+            r#"<a class="y">l</a>"#
+        ));
+        assert!(!link_is_red(
+            "a:is(.x, .y) { color: red }",
+            r#"<a class="z">l</a>"#
+        ));
+        assert!(link_is_red(
+            "a:where(.x) { color: red }",
+            r#"<a class="x">l</a>"#
+        ));
+    }
+
+    #[test]
+    fn nested_functions_survive_being_read_back() {
+        // The argument is rebuilt as text and parsed again; a nested `:not()`
+        // used to be cut off at the inner closing parenthesis.
+        assert!(link_is_red(
+            r#"a:where(.new:not([role="button"])) { color: red }"#,
+            r#"<a class="new">l</a>"#
+        ));
+        assert!(!link_is_red(
+            r#"a:where(.new:not([role="button"])) { color: red }"#,
+            r#"<a class="new" role="button">l</a>"#
+        ));
+    }
+
+    #[test]
+    fn where_contributes_no_specificity_and_not_contributes_its_argument() {
+        let sel = |src: &str| parser::parse_selector_str(src)[0].specificity();
+        assert_eq!(sel("a:where(.x)"), (0, 0, 1), ":where() adds nothing");
+        assert_eq!(sel("a:not(.x)"), (0, 1, 1), ":not() counts as its argument");
+        assert_eq!(sel("a:not(#x)"), (1, 0, 1));
+        assert_eq!(
+            sel("a:is(#x, .y)"),
+            (1, 0, 1),
+            ":is() takes the most specific"
+        );
     }
 
     // ------ Length units ------

@@ -372,15 +372,30 @@ pub fn resolve_url(base_url: &str, href: &str) -> String {
 }
 
 /// Extract external stylesheet URLs from HTML content.
-/// Finds all `<link rel="stylesheet" href="...">` elements and returns their href values.
-pub fn extract_external_css_urls(html_content: &str) -> Vec<String> {
+/// One place a document brings CSS in from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CssSource {
+    /// The text of a `<style>` block.
+    Inline(String),
+    /// A `<link rel="stylesheet">`, with its `media` attribute if it had one.
+    Link { href: String, media: Option<String> },
+}
+
+/// Every stylesheet a document pulls in, in the order it writes them.
+///
+/// Order is the point: the cascade breaks a specificity tie by taking the
+/// later rule, and MediaWiki's per-article `<style>` blocks sit in the body,
+/// after the skin's `<link>`s in the head. Gathering all the inline CSS first
+/// and all the linked CSS after it reversed that, and the article's own styles
+/// lost to the skin's.
+pub fn extract_css_sources(html_content: &str) -> Vec<CssSource> {
     let arena = crate::html::parser::parse_html(html_content);
-    let mut urls = Vec::new();
+    let mut sources = Vec::new();
 
     fn walk_node(
         arena: &crate::html::DomArena,
         node_id: crate::html::NodeId,
-        urls: &mut Vec<String>,
+        sources: &mut Vec<CssSource>,
     ) {
         let node = match arena.get(crate::html::DomHandle(node_id)) {
             Some(n) => n,
@@ -388,25 +403,51 @@ pub fn extract_external_css_urls(html_content: &str) -> Vec<String> {
         };
 
         if node.is_element() {
-            let tag = node.tag_name();
-            if tag.map(|t| t.as_ref() == "link").unwrap_or(false) {
-                if let Some(rel) = node.get_attr("rel") {
-                    if rel.eq_ignore_ascii_case("stylesheet") {
+            match node.tag_name().as_deref().map(|t| t.as_ref()) {
+                Some("link") => {
+                    let is_stylesheet = node
+                        .get_attr("rel")
+                        .is_some_and(|rel| rel.eq_ignore_ascii_case("stylesheet"));
+                    if is_stylesheet {
                         if let Some(href) = node.get_attr("href") {
-                            urls.push(href.to_string());
+                            sources.push(CssSource::Link {
+                                href: href.to_string(),
+                                media: node.get_attr("media").map(|m| m.to_string()),
+                            });
                         }
                     }
                 }
+                Some("style") => {
+                    for &child_id in node.children() {
+                        if let Some(child) = arena.get(crate::html::DomHandle(child_id)) {
+                            if let Some(text) = child.text_content() {
+                                sources.push(CssSource::Inline(text.to_string()));
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
         for &child_id in node.children() {
-            walk_node(arena, child_id, urls);
+            walk_node(arena, child_id, sources);
         }
     }
 
-    walk_node(&arena, crate::html::NodeId::DOCUMENT, &mut urls);
-    urls
+    walk_node(&arena, crate::html::NodeId::DOCUMENT, &mut sources);
+    sources
+}
+
+/// Finds all `<link rel="stylesheet" href="...">` elements and returns their href values.
+pub fn extract_external_css_urls(html_content: &str) -> Vec<String> {
+    extract_css_sources(html_content)
+        .into_iter()
+        .filter_map(|source| match source {
+            CssSource::Link { href, .. } => Some(href),
+            CssSource::Inline(_) => None,
+        })
+        .collect()
 }
 
 /// Extract CSS from HTML content — inline `<style>` blocks only.
@@ -852,55 +893,63 @@ pub async fn fetch_external_css(
     // An inline `<style>` block is inline content in the CSP sense, so a
     // policy without `'unsafe-inline'` drops it exactly as it drops an inline
     // script.
-    let inline_css = if csp.allows_inline(security::ResourceKind::Style) {
-        extract_css(html_content)
-    } else {
+    let inline_allowed = csp.allows_inline(security::ResourceKind::Style);
+    if !inline_allowed {
         log::warn!("inline <style> blocked by this page's Content-Security-Policy");
-        String::new()
-    };
-    let external_hrefs = extract_external_css_urls(html_content);
-
-    if external_hrefs.is_empty() {
-        return Ok(inline_css);
     }
 
-    // Cap the number of external stylesheets to prevent excessive fetches
-    let total_count = external_hrefs.len();
-    let limited_hrefs: Vec<String> = external_hrefs
-        .into_iter()
-        .take(MAX_EXTERNAL_SHEETS)
-        .collect();
-
-    if limited_hrefs.len() < total_count {
+    let sources = extract_css_sources(html_content);
+    let link_count = sources
+        .iter()
+        .filter(|s| matches!(s, CssSource::Link { .. }))
+        .count();
+    if link_count > MAX_EXTERNAL_SHEETS {
         log::warn!(
             "Limited external stylesheets from {} to {}",
-            total_count,
+            link_count,
             MAX_EXTERNAL_SHEETS
         );
     }
+    log::info!("Found {link_count} external stylesheet(s), fetching concurrently");
 
-    log::info!(
-        "Found {} external stylesheet(s), fetching concurrently",
-        limited_hrefs.len()
-    );
-
-    // Resolve all relative URLs against the base URL, then put each through
-    // the page's own policy and the mixed-content rules. A stylesheet can
-    // rewrite the whole page, so an insecure one is dropped rather than
-    // upgraded and hoped for.
-    let resolved_urls: Vec<String> = limited_hrefs
-        .iter()
-        .map(|href| resolve_url(base_url, href))
-        .filter_map(|url| {
-            match security::check_subresource(base_url, csp, &url, security::ResourceKind::Style) {
-                security::SubresourceDecision::Load(url) => Some(url),
-                security::SubresourceDecision::Block(reason) => {
-                    log::warn!("stylesheet blocked: {reason}");
-                    None
+    // Resolve each link against the base URL, then put it through the page's
+    // own policy and the mixed-content rules. A stylesheet can rewrite the
+    // whole page, so an insecure one is dropped rather than upgraded and hoped
+    // for. The slot each one occupies in the document is kept so the fetched
+    // text can go back where it belongs.
+    let mut resolved_urls: Vec<String> = Vec::new();
+    let mut fetch_slot: Vec<Option<usize>> = Vec::with_capacity(sources.len());
+    for source in &sources {
+        match source {
+            CssSource::Inline(_) => fetch_slot.push(None),
+            CssSource::Link { href, .. } => {
+                if resolved_urls.len() >= MAX_EXTERNAL_SHEETS {
+                    fetch_slot.push(None);
+                    continue;
+                }
+                let url = resolve_url(base_url, href);
+                match security::check_subresource(
+                    base_url,
+                    csp,
+                    &url,
+                    security::ResourceKind::Style,
+                ) {
+                    security::SubresourceDecision::Load(url) => {
+                        fetch_slot.push(Some(resolved_urls.len()));
+                        resolved_urls.push(url);
+                    }
+                    security::SubresourceDecision::Block(reason) => {
+                        log::warn!("stylesheet blocked: {reason}");
+                        fetch_slot.push(None);
+                    }
                 }
             }
-        })
-        .collect();
+        }
+    }
+
+    if resolved_urls.is_empty() && !inline_allowed {
+        return Ok(String::new());
+    }
 
     // Fetch all external stylesheets concurrently using join_all
     let fetch_futures = resolved_urls.iter().map(|url| {
@@ -925,11 +974,31 @@ pub async fn fetch_external_css(
 
     let results = futures::future::join_all(fetch_futures).await;
 
-    // Merge inline CSS with all successfully fetched external CSS
-    let mut merged = Vec::new();
-    merged.push(inline_css);
-    for result in results.into_iter().flatten() {
-        merged.push(result);
+    // Put every sheet back in document order.
+    let mut merged: Vec<String> = Vec::new();
+    for (source, slot) in sources.iter().zip(fetch_slot) {
+        match source {
+            CssSource::Inline(text) => {
+                if inline_allowed {
+                    merged.push(text.clone());
+                }
+            }
+            CssSource::Link { media, .. } => {
+                let Some(text) = slot.and_then(|i| results[i].clone()) else {
+                    continue;
+                };
+                // A `media` attribute governs the whole sheet, exactly as an
+                // `@media` block governs the rules inside it. Wrapping it lets
+                // the one evaluator answer for both — and keeps a
+                // `media="print"` sheet off the screen.
+                merged.push(match media.as_deref().map(str::trim) {
+                    Some(m) if !m.is_empty() && !m.eq_ignore_ascii_case("all") => {
+                        format!("@media {m} {{\n{text}\n}}")
+                    }
+                    _ => text,
+                });
+            }
+        }
     }
 
     let merged_css = merged.join("\n");
@@ -948,6 +1017,66 @@ pub async fn fetch_external_css(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------ Where a document's CSS comes from ------
+
+    /// The cascade breaks a specificity tie by source order, so the sources
+    /// have to come back in the order the document writes them. MediaWiki puts
+    /// its per-article `<style>` blocks in the body, after the skin's `<link>`s
+    /// in the head; gathering all inline CSS first reversed that.
+    #[test]
+    fn css_sources_come_back_in_document_order() {
+        let html = r#"<html><head>
+            <link rel="stylesheet" href="/skin.css">
+            <style>a { color: red }</style>
+            </head><body>
+            <style>a { color: lime }</style>
+            <link rel="stylesheet" href="/late.css">
+            </body></html>"#;
+        assert_eq!(
+            extract_css_sources(html),
+            vec![
+                CssSource::Link {
+                    href: "/skin.css".to_string(),
+                    media: None
+                },
+                CssSource::Inline("a { color: red }".to_string()),
+                CssSource::Inline("a { color: lime }".to_string()),
+                CssSource::Link {
+                    href: "/late.css".to_string(),
+                    media: None
+                },
+            ]
+        );
+    }
+
+    /// A `media` attribute governs the whole sheet. Ignoring it is how a
+    /// `media="print"` stylesheet lands on the screen.
+    #[test]
+    fn a_links_media_attribute_is_kept() {
+        let html = r#"<link rel="stylesheet" href="/p.css" media="print">
+                      <link rel="stylesheet" href="/s.css" media="screen and (min-width: 640px)">"#;
+        assert_eq!(
+            extract_css_sources(html),
+            vec![
+                CssSource::Link {
+                    href: "/p.css".to_string(),
+                    media: Some("print".to_string())
+                },
+                CssSource::Link {
+                    href: "/s.css".to_string(),
+                    media: Some("screen and (min-width: 640px)".to_string())
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_non_stylesheet_link_is_not_a_css_source() {
+        let html = r#"<link rel="icon" href="/favicon.ico">
+                      <link rel="preload" href="/x.css">"#;
+        assert!(extract_css_sources(html).is_empty());
+    }
 
     #[test]
     fn empty_response_detail_names_bot_protection() {

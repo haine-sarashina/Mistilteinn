@@ -1758,6 +1758,11 @@ pub struct ComputedValues {
     pub overflow_y: Overflow,
     // Positioning
     pub position: PositionType,
+    /// `top` / `right` / `bottom` / `left` given as a fraction of the
+    /// containing block, kept unresolved until there is a containing block to
+    /// measure against. `top: 100%` — a menu that hangs below the control it
+    /// belongs to — is the one that matters.
+    pub offset_percent: [Option<f32>; 4],
     pub offset_top: Option<f32>,
     pub offset_right: Option<f32>,
     pub offset_bottom: Option<f32>,
@@ -2577,6 +2582,7 @@ impl Default for ComputedValues {
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
             position: PositionType::Static,
+            offset_percent: [None; 4],
             offset_top: None,
             offset_right: None,
             offset_bottom: None,
@@ -3265,15 +3271,19 @@ impl ComputedValues {
             }
             "top" => {
                 self.offset_top = parse_offset(val);
+                self.offset_percent[0] = parse_percentage(val);
             }
             "right" => {
                 self.offset_right = parse_offset(val);
+                self.offset_percent[1] = parse_percentage(val);
             }
             "bottom" => {
                 self.offset_bottom = parse_offset(val);
+                self.offset_percent[2] = parse_percentage(val);
             }
             "left" => {
                 self.offset_left = parse_offset(val);
+                self.offset_percent[3] = parse_percentage(val);
             }
             "box-sizing" => {
                 self.box_sizing = match val {

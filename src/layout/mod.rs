@@ -258,6 +258,9 @@ pub struct LayoutNode {
     pub position: PositionType,
     /// Offset values: [top, right, bottom, left]
     pub offsets: [Option<f32>; 4],
+    /// The same four, given as a fraction of the containing block and resolved
+    /// once there is one to measure against. See [`ComputedValues::offset_percent`].
+    pub offset_percents: [Option<f32>; 4],
     /// Absolutely positioned children extracted from the normal flow.
     pub absolute_children: Vec<LayoutNode>,
     /// Computed font size in pixels (copied from CSS ComputedValues).
@@ -388,6 +391,7 @@ impl LayoutNode {
             transform_origin: crate::css::TransformOrigin::default(),
             filter: crate::css::Filter::default(),
             offsets: [None, None, None, None],
+            offset_percents: [None; 4],
             absolute_children: Vec::new(),
             font_size: 16.0,
             font_family: String::new(),
@@ -624,6 +628,7 @@ where
         root_styles.offset_bottom,
         root_styles.offset_left,
     ];
+    root_layout.offset_percents = root_styles.offset_percent;
     root_layout.float = root_styles.float;
     root_layout.clear = root_styles.clear;
     root_layout.border = root_styles.used_border_width();
@@ -808,6 +813,7 @@ fn build_layout_children<N, F>(
                         child_styles.offset_bottom,
                         child_styles.offset_left,
                     ];
+                    layout_node.offset_percents = child_styles.offset_percent;
                     layout_node.float = child_styles.float;
                     layout_node.clear = child_styles.clear;
                     layout_node.border = child_styles.used_border_width();
@@ -1012,6 +1018,7 @@ fn build_layout_children<N, F>(
                         child_styles.offset_bottom,
                         child_styles.offset_left,
                     ];
+                    layout_node.offset_percents = child_styles.offset_percent;
                     layout_node.float = child_styles.float;
                     layout_node.clear = child_styles.clear;
                     layout_node.border = child_styles.used_border_width();
@@ -1421,6 +1428,10 @@ pub fn compute_absolute_positions(
     text_renderer: &mut crate::render::text::TextRenderer,
 ) {
     for abs_child in &mut node.absolute_children {
+        // A percentage inset is a fraction of the containing block, and this is
+        // the first point at which there is one to take a fraction of.
+        resolve_offset_percentages(abs_child, containing_block);
+
         // Position based on offsets relative to containing block's content box
         let x = containing_block.x + abs_child.offsets[3].unwrap_or(0.0); // left offset (index 3)
         let y = containing_block.y + abs_child.offsets[0].unwrap_or(0.0); // top offset (index 0)
@@ -1440,33 +1451,16 @@ pub fn compute_absolute_positions(
                 - abs_child.padding[3]
                 - abs_child.border[1]
                 - abs_child.border[3]
+        } else if abs_child.children.is_empty() {
+            // Nothing inside: the box is its own padding and border.
+            abs_child.padding[1] + abs_child.padding[3] + abs_child.border[1] + abs_child.border[3]
         } else {
-            // Estimate intrinsic width from content
-            let mut max_child_width = 0.0;
-            for grandchild in &abs_child.children {
-                if is_block_child(grandchild) {
-                    // For block children, they'd take full available width
-                    // Use a reasonable default based on containing block
-                    max_child_width = containing_block.width;
-                    break;
-                } else if is_inline_child(grandchild) {
-                    let child_content_h = compute_inline_height(grandchild);
-                    if child_content_h > max_child_width {
-                        max_child_width = child_content_h;
-                    }
-                }
-            }
-            if abs_child.children.is_empty() {
-                // No children: shrink to fit padding+border only
-                max_child_width = 0.0;
-            } else {
-                max_child_width = max_child_width.min(containing_block.width);
-            }
-            max_child_width
-                + abs_child.padding[1]
-                + abs_child.padding[3]
-                + abs_child.border[1]
-                + abs_child.border[3]
+            // An absolute box with no width shrinks to fit, and never past the
+            // block that contains it. This used to measure the *height* of the
+            // content and use it as a width, so a menu came out one line-height
+            // across and its text ran down the page.
+            let fit = compute_shrink_to_fit_width(abs_child, 0, text_renderer);
+            fit.min(containing_block.width).max(0.0)
         };
 
         // Handle right/bottom offsets (if set, they constrain the box differently)
@@ -1549,6 +1543,55 @@ pub fn compute_absolute_positions(
         );
         compute_absolute_positions(abs_child, abs_content_box, text_renderer);
     }
+
+    // Walking only the absolute children meant an absolutely positioned box
+    // anywhere inside ordinary content was never laid out at all: it kept the
+    // empty rect it was built with and sat at the top-left corner of the page.
+    // Every dropdown panel on a page is one of those.
+    //
+    // A positioned box is the containing block for the absolutes inside it;
+    // anything else passes on the one it was given, which is what makes `top`
+    // measure from the right ancestor.
+    for child in &mut node.children {
+        let inner = if is_positioned(child) {
+            content_box_of(child)
+        } else {
+            containing_block
+        };
+        compute_absolute_positions(child, inner, text_renderer);
+    }
+}
+
+/// Turn any percentage insets into pixels, now that there is a containing
+/// block to measure them against.
+///
+/// The horizontal pair take their fraction of its width and the vertical pair
+/// of its height, as CSS says — `top: 100%` puts a box's top edge on the bottom
+/// edge of what contains it, which is how a menu hangs below its button.
+fn resolve_offset_percentages(node: &mut LayoutNode, containing_block: Rect) {
+    for side in 0..4 {
+        let Some(fraction) = node.offset_percents[side] else {
+            continue;
+        };
+        let basis = if side % 2 == 0 {
+            containing_block.height
+        } else {
+            containing_block.width
+        };
+        node.offsets[side] = Some(fraction * basis);
+    }
+}
+
+/// The area inside a box's border and padding.
+fn content_box_of(node: &LayoutNode) -> Rect {
+    Rect::new(
+        node.rect.x + node.padding[3] + node.border[3],
+        node.rect.y + node.padding[0] + node.border[0],
+        (node.rect.width - node.padding[1] - node.padding[3] - node.border[1] - node.border[3])
+            .max(0.0),
+        (node.rect.height - node.padding[0] - node.padding[2] - node.border[0] - node.border[2])
+            .max(0.0),
+    )
 }
 
 /// Check if a child participates in the inline formatting context.

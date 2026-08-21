@@ -1159,6 +1159,98 @@ mod tests {
         assert_eq!(rect_of(&page, "wrap").height, 50.0, "30 above, 20 of box");
     }
 
+    // -- Absolutely positioned boxes --
+
+    fn popup_page(css: &str) -> Page {
+        Page::new(
+            "<html><body><div id='anchor'><div id='pop'>menu</div></div></body></html>",
+            css,
+            400.0,
+            300.0,
+        )
+    }
+
+    /// The positioning pass walked only the boxes already pulled out of the
+    /// flow, so an absolutely positioned box anywhere inside ordinary content
+    /// was never laid out: it kept the empty rect it was built with and sat in
+    /// the corner of the page. Every dropdown panel is one of those.
+    #[test]
+    fn an_absolute_box_inside_the_page_is_laid_out_at_all() {
+        let page = popup_page(
+            "body { margin: 0 }
+             #anchor { position: relative; width: 200px; height: 40px }
+             #pop { position: absolute; top: 40px; left: 0 }",
+        );
+        let pop = rect_of(&page, "pop");
+        assert_eq!(pop.y, 40.0, "below the box it belongs to");
+        assert!(
+            pop.width > 0.0 && pop.height > 0.0,
+            "and a box of its own: {pop:?}"
+        );
+    }
+
+    /// `top: 100%` puts a box's top edge on the bottom edge of what contains
+    /// it — how a menu hangs under the control it belongs to. A percentage
+    /// cannot be resolved by the cascade, which has no containing block to take
+    /// a fraction of, so it is carried unresolved to where there is one.
+    #[test]
+    fn a_percentage_inset_measures_against_the_containing_block() {
+        let page = popup_page(
+            "body { margin: 0 }
+             #anchor { position: relative; width: 200px; height: 40px }
+             #pop { position: absolute; top: 100%; left: 0 }",
+        );
+        assert_eq!(rect_of(&page, "pop").y, 40.0);
+    }
+
+    #[test]
+    fn an_absolute_box_is_measured_against_the_nearest_positioned_ancestor() {
+        // Not the page: a menu inside a positioned header belongs to the
+        // header, and a menu inside nothing in particular belongs to the page.
+        let inside = popup_page(
+            "body { margin: 0 }
+             #anchor { position: relative; margin-top: 100px; width: 200px; height: 40px }
+             #pop { position: absolute; top: 0; left: 0 }",
+        );
+        assert_eq!(
+            rect_of(&inside, "pop").y,
+            100.0,
+            "measured from the positioned box it sits in"
+        );
+
+        let loose = popup_page(
+            "body { margin: 0 }
+             #anchor { margin-top: 100px; width: 200px; height: 40px }
+             #pop { position: absolute; top: 0; left: 0 }",
+        );
+        assert_eq!(
+            rect_of(&loose, "pop").y,
+            0.0,
+            "with no positioned ancestor it measures from the page"
+        );
+    }
+
+    /// An absolute box with no width shrinks to fit. This used to measure the
+    /// *height* of its content and use that as a width, so a menu came out one
+    /// line-height across with its text running down the page.
+    #[test]
+    fn an_absolute_box_shrinks_to_fit_its_words() {
+        let page = Page::new(
+            "<html><body><div id='anchor'><div id='pop'>a longer piece of text</div></div></body></html>",
+            "body { margin: 0 }
+             #anchor { position: relative; width: 300px; height: 40px }
+             #pop { position: absolute; top: 100% }",
+            400.0,
+            300.0,
+        );
+        let pop = rect_of(&page, "pop");
+        assert!(
+            pop.width > 60.0,
+            "as wide as the words in it, not as tall as they are: {pop:?}"
+        );
+        assert!(pop.width <= 300.0, "and never wider than what contains it");
+    }
+
     // -- Checkboxes and radio buttons --
 
     fn menu_page(markup: &str) -> Page {

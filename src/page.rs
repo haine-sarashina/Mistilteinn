@@ -900,6 +900,84 @@ mod tests {
         assert!(runs[0].x < runs[1].x);
     }
 
+    // -- Flex item margins --
+
+    /// The widths of the two pictures in a flex row, left to right.
+    fn flex_row_widths(css: &str) -> Vec<(f32, f32)> {
+        let page = Page::new(
+            "<html><body><div class='wrap'>
+                <div class='a'></div><div class='b'></div>
+             </div></body></html>",
+            css,
+            800.0,
+            600.0,
+        );
+        fn walk(node: &crate::layout::LayoutNode, out: &mut Vec<(f32, f32)>) {
+            if node.rect.height > 0.0 && node.rect.width < 300.0 {
+                out.push((node.rect.x, node.rect.width));
+            }
+            for child in &node.children {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&page.layout_root, &mut out);
+        out
+    }
+
+    /// A margin on a flex item goes beside the item, not into it. It used to be
+    /// taken off the item's own size, so the page logo — 50px wide with a 10px
+    /// gap after it — was laid out 40px wide and squashed.
+    #[test]
+    fn a_flex_item_keeps_its_width_when_it_has_a_margin() {
+        let plain = flex_row_widths(
+            ".wrap { display: flex; width: 300px }
+             .a { width: 50px; height: 50px }
+             .b { width: 120px; height: 20px }",
+        );
+        let spaced = flex_row_widths(
+            ".wrap { display: flex; width: 300px }
+             .a { width: 50px; height: 50px; margin-right: 10px }
+             .b { width: 120px; height: 20px }",
+        );
+        assert_eq!(plain[0].1, 50.0);
+        assert_eq!(
+            spaced[0].1, 50.0,
+            "the margin is beside the picture, not inside it"
+        );
+        assert_eq!(
+            spaced[1].0 - plain[1].0,
+            10.0,
+            "and what follows is pushed along by it"
+        );
+    }
+
+    #[test]
+    fn a_column_item_is_narrowed_by_the_margins_that_actually_narrow_it() {
+        // In a column the main axis is vertical, so the margins that take room
+        // from the width are the horizontal pair. Using the vertical pair made
+        // an item with `margin-top` narrower and one with `margin-left` full
+        // width — both backwards.
+        let page = Page::new(
+            "<html><body><div class='wrap'><div class='a'></div></div></body></html>",
+            ".wrap { display: flex; flex-direction: column; width: 200px }
+             .a { height: 20px; margin-top: 30px; margin-left: 10px }",
+            800.0,
+            600.0,
+        );
+        fn find(node: &crate::layout::LayoutNode) -> Option<f32> {
+            if node.margin[0] == 30.0 {
+                return Some(node.rect.width);
+            }
+            node.children.iter().find_map(find)
+        }
+        assert_eq!(
+            find(&page.layout_root),
+            Some(190.0),
+            "200 wide less the 10px on its left, and nothing for the 30 on top"
+        );
+    }
+
     // -- Masked icons --
 
     /// An icon drawn as a mask: one shape, coloured by the box it sits in.

@@ -2730,7 +2730,11 @@ fn compute_flex_children(
 
         for &item_i in &line.item_indices {
             let child = &mut parent.children[item_i];
-            let main_content_size = (states[item_i].basis - states[item_i].main_margin).max(0.0);
+            // `basis` is the item's own main size throughout; its margins are
+            // added to it wherever the line is measured. Taking them off again
+            // here shrank every item that had one by the width of its own
+            // margin — a 50px logo beside a 10px gap came out 40 wide.
+            let main_content_size = states[item_i].basis.max(0.0);
 
             if is_row {
                 // Row: main=horizontal, cross=vertical
@@ -2740,8 +2744,11 @@ fn compute_flex_children(
                 child.rect.width = main_content_size;
                 child.rect.height = cross_content + child.margin[0] + child.margin[2];
             } else {
-                // Column: main=vertical, cross=horizontal
-                let child_width = (available_width - states[item_i].main_margin).max(0.0);
+                // Column: main=vertical, cross=horizontal. The margins that
+                // eat into the width are the horizontal ones — the main-axis
+                // pair is top and bottom, which take nothing from it.
+                let cross_margin = child.margin[1] + child.margin[3];
+                let child_width = (available_width - cross_margin).max(0.0);
                 child.rect.x = current_main_pos + child.margin[3];
                 child.rect.y = current_cross_pos + child.margin[0];
                 child.rect.width = child_width;

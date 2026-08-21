@@ -189,13 +189,59 @@ pub struct Declaration {
     pub important: bool,
 }
 
+/// Split a declaration list on the semicolons that actually end declarations.
+///
+/// A semicolon inside a string or a function is part of a value, not the end of
+/// one. `url("data:image/svg+xml;utf8,<svg …>")` is the case that matters:
+/// splitting it produces a truncated `mask-image` and a line of SVG read as a
+/// property nobody has, which is how a page's icons disappear one at a time.
+fn split_declarations(source: &str) -> Vec<&str> {
+    let bytes = source.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        match quote {
+            // Inside a string, only its own closing quote means anything, and a
+            // backslash hides whatever follows it — including that quote.
+            Some(open) => {
+                if byte == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if byte == open {
+                    quote = None;
+                }
+            }
+            None => match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'(' => depth += 1,
+                b')' => depth = (depth - 1).max(0),
+                b';' if depth == 0 => {
+                    parts.push(&source[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+
+    parts.push(&source[start..]);
+    parts
+}
+
 /// Parses a simple CSS declaration list into property-value pairs.
 ///
 /// Example: `"color: red; margin: 10px"` → `[(color, red), (margin, 10px)]`
 pub fn parse_declarations(source: &str) -> Vec<Declaration> {
     let mut declarations = Vec::new();
 
-    for block in source.split(';') {
+    for block in split_declarations(source) {
         let block = block.trim();
         if block.is_empty() {
             continue;

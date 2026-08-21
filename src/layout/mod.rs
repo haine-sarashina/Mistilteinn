@@ -724,6 +724,19 @@ fn build_layout_children<N, F>(
                 None => inherited_text_style(parent),
             };
 
+            // `aria-hidden="true"` is not a visual instruction. It marks an
+            // element as redundant for a screen reader — usually because the
+            // accessible name is carried by something beside it — and the
+            // element stays on screen. Skipping these took the whole
+            // `<label>` of every ja.wikipedia.org dropdown out of the tree,
+            // and the masked icon inside it with it: 10 elements, which is
+            // most of what "styles carrying a mask 29, boxes laid out with
+            // one 2" was counting.
+            //
+            // The class names below are the opposite case: conventions for
+            // content that *is* hidden visually, by CSS this engine reads
+            // only partly (`clip`, a 1px box, an off-screen position).
+            // Approximating them by name is a stopgap until it does.
             let class_str = node.get_attr("class").unwrap_or_default().to_lowercase();
             let is_skip_or_hidden = class_str.contains("gb_a")
                 || class_str.contains("vntupb")
@@ -732,11 +745,7 @@ fn build_layout_children<N, F>(
                 || class_str.contains("visually-hidden")
                 || class_str.contains("phibootstrap")
                 || class_str.contains("u-screen-reader");
-            let is_aria_hidden = node.get_attr("aria-hidden").as_deref() == Some("true")
-                && tag != "svg"
-                && tag != "img";
-
-            if is_skip_or_hidden || is_aria_hidden {
+            if is_skip_or_hidden {
                 continue;
             }
 
@@ -2118,8 +2127,17 @@ fn compute_block_children(
     // Only set height if it's zero (not already set by flexbox parent)
     if parent.rect.height == 0.0 {
         parent.rect.height = computed_total_height;
-    } else {
-        // Use the larger of computed or existing height
+    } else if parent.explicit_height.is_none() {
+        // Use the larger of computed or existing height.
+        //
+        // Skipped when a height was declared: that height is the height, and
+        // content taller than it overflows rather than pushing the box open —
+        // which is the whole reason `overflow` exists. Growing to fit made the
+        // `height: 1px` box of the visually-hidden idiom (`width: 1px;
+        // height: 1px; overflow: hidden`) 98px tall, so the clip it handed its
+        // text was 30px rather than 1px. The declared height itself was
+        // already worked out by whoever sized this box; only the growth is
+        // wrong.
         parent.rect.height = parent.rect.height.max(computed_total_height);
     }
     clamp_height(parent);
@@ -10655,6 +10673,71 @@ mod tests {
             inner.rect.width, outer.rect.width,
             "the inner box fills its parent's content width"
         );
+    }
+
+    // ------ W3: what is hidden from a screen reader is not hidden from sight ------
+
+    #[test]
+    fn an_aria_hidden_element_still_gets_a_box() {
+        // `aria-hidden="true"` marks an element as redundant for assistive
+        // technology — usually because something beside it carries the
+        // accessible name — and leaves it on screen. Skipping it took the
+        // whole `<label>` of every ja.wikipedia.org dropdown out of the tree,
+        // and the masked icon inside it with it.
+        let root = laid_out(
+            "<body><label aria-hidden='true'><span class='i'></span>menu</label></body>",
+            ".i { display: inline-block; width: 20px; height: 20px; }",
+            400.0,
+        );
+        let icon = first_box(&root, &|n| n.explicit_width == Some(20.0));
+        assert!(
+            icon.is_some(),
+            "the icon inside an aria-hidden label should still be laid out"
+        );
+    }
+
+    #[test]
+    fn a_declared_height_is_not_pushed_open_by_taller_content() {
+        // The visually-hidden idiom is a 1px box with `overflow: hidden`. If
+        // the box grows to its content there is nothing left to clip against,
+        // and the text it was meant to hide is laid out at full size.
+        let root = laid_out(
+            "<body><span class='sr'>a rather long label that would wrap</span></body>",
+            ".sr { display: block; position: absolute; width: 1px; height: 1px; \
+                   overflow: hidden; }",
+            400.0,
+        );
+        let hidden = first_box(&root, &|n| n.explicit_height == Some(1.0)).expect("the box");
+        assert_eq!(hidden.rect.width, 1.0);
+        assert_eq!(
+            hidden.rect.height, 1.0,
+            "content must overflow the declared height, not raise it"
+        );
+    }
+
+    #[test]
+    fn overflow_hidden_clips_the_text_inside_it() {
+        let root = laid_out(
+            "<body><span class='sr'>a rather long label that would wrap</span></body>",
+            ".sr { display: block; position: absolute; width: 1px; height: 1px; \
+                   overflow: hidden; }",
+            400.0,
+        );
+        let items = build_display_list_with_scroll(&root, (0.0, 0.0), (400.0, 800.0));
+        let runs: Vec<&DisplayItem> = items
+            .iter()
+            .filter(|i| matches!(i.item, PaintItem::Text(_)))
+            .collect();
+        assert!(!runs.is_empty(), "the text is still painted, just clipped");
+        for run in runs {
+            let clip = run.clip.expect("a clip from the overflow ancestor");
+            assert!(
+                clip.width <= 1.0 && clip.height <= 1.0,
+                "the clip should be the 1px box, got {}x{}",
+                clip.width,
+                clip.height
+            );
+        }
     }
 
     #[test]

@@ -1770,6 +1770,11 @@ pub struct ComputedValues {
     /// Min/max width constraints
     pub min_width: Option<f32>,
     pub max_width: Option<f32>,
+    /// Min/max height constraints. A floor is what holds a box open around
+    /// content shorter than it: `min-height: 32px` on ja.wikipedia.org's
+    /// article tabs is the whole of their height, their text being 19.6px.
+    pub min_height: Option<f32>,
+    pub max_height: Option<f32>,
     /// `width`, `min-width` and `max-width` written as a percentage, kept as a
     /// fraction where `1.0` is 100%.
     ///
@@ -2622,6 +2627,8 @@ impl Default for ComputedValues {
             min_width_percent: None,
             max_width_percent: None,
             width_intrinsic: None,
+            min_height: None,
+            max_height: None,
             line_height: 1.2,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
@@ -2885,6 +2892,8 @@ impl ComputedValues {
             "height" => self.height.and_then(px),
             "min-width" => self.min_width.and_then(px),
             "max-width" => self.max_width.and_then(px),
+            "min-height" => self.min_height.and_then(px),
+            "max-height" => self.max_height.and_then(px),
             "top" => self.offset_top.and_then(px),
             "right" => self.offset_right.and_then(px),
             "bottom" => self.offset_bottom.and_then(px),
@@ -3343,6 +3352,15 @@ impl ComputedValues {
             "max-width" => {
                 self.max_width_percent = parse_percentage(val);
                 self.max_width = parse_length(val);
+            }
+            // No percentage form: a percentage height resolves against the
+            // containing block's height, and a block whose height is `auto` —
+            // nearly all of them — makes one compute to `auto` anyway.
+            "min-height" => {
+                self.min_height = parse_length(val);
+            }
+            "max-height" => {
+                self.max_height = parse_length(val);
             }
             "grid-template-columns" => {
                 self.grid_template_columns = parse_grid_track_list(val);
@@ -3835,7 +3853,9 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "margin-left",
     "margin-right",
     "margin-top",
+    "max-height",
     "max-width",
+    "min-height",
     "min-width",
     "order",
     "overflow",

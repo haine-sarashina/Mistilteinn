@@ -226,6 +226,10 @@ pub struct LayoutNode {
     /// Min/max width constraints
     pub min_width: Option<f32>,
     pub max_width: Option<f32>,
+    /// Min/max height constraints, applied by [`clamp_height`] wherever a
+    /// box's height has just been settled.
+    pub min_height: Option<f32>,
+    pub max_height: Option<f32>,
     /// `width`, `min-width` and `max-width` given as a fraction of the
     /// containing block, resolved once its width is known. See
     /// [`resolve_percentage_widths`].
@@ -380,6 +384,8 @@ impl LayoutNode {
             min_width_percent: None,
             max_width_percent: None,
             width_intrinsic: None,
+            min_height: None,
+            max_height: None,
             explicit_height: None,
             min_width: None,
             max_width: None,
@@ -800,6 +806,8 @@ fn build_layout_children<N, F>(
                     layout_node.min_width_percent = child_styles.min_width_percent;
                     layout_node.max_width_percent = child_styles.max_width_percent;
                     layout_node.width_intrinsic = child_styles.width_intrinsic;
+                    layout_node.min_height = child_styles.min_height;
+                    layout_node.max_height = child_styles.max_height;
 
                     // Copy grid properties
                     layout_node.grid_columns = child_styles.grid_template_columns.clone();
@@ -1058,6 +1066,8 @@ fn build_layout_children<N, F>(
                         layout_node.min_width_percent = child_styles.min_width_percent;
                         layout_node.max_width_percent = child_styles.max_width_percent;
                         layout_node.width_intrinsic = child_styles.width_intrinsic;
+                        layout_node.min_height = child_styles.min_height;
+                        layout_node.max_height = child_styles.max_height;
                         if let Some(w) = child_styles.explicit_width {
                             layout_node.rect.width = w;
                         }
@@ -1367,6 +1377,43 @@ fn intrinsic_width_for(
     content.max(0.0)
 }
 
+/// Hold a box open to its `min-height`, and cut it down to its `max-height`.
+///
+/// Runs wherever a height has just been settled — after a box's own children
+/// have been laid out, and again on the parent once its content extent is
+/// known. A floor is the more visible of the two: ja.wikipedia.org's article
+/// tabs are 32px tall because `min-height` says so, and were coming out 19.6px,
+/// the height of their text.
+fn clamp_height(node: &mut LayoutNode) {
+    node.rect.height = clamped_height(node, node.rect.height);
+}
+
+/// The same constraint applied to a height that is not in a rect yet — the
+/// height an inline-level box is about to take on its line. The search box's
+/// `<input>` is a replaced element and never passes through the rect version,
+/// so its `min-height: 32px` was reaching the control but not the line under it.
+fn clamped_height(node: &LayoutNode, height: f32) -> f32 {
+    if node.min_height.is_none() && node.max_height.is_none() {
+        return height;
+    }
+    // Under `content-box` the constraint names the content alone, so the
+    // frame goes back on to compare it against a border-box height.
+    let frame = match node.box_sizing {
+        crate::css::BoxSizing::BorderBox => 0.0,
+        crate::css::BoxSizing::ContentBox => {
+            node.padding[0] + node.padding[2] + node.border[0] + node.border[2]
+        }
+    };
+    let mut height = height;
+    if let Some(min_h) = node.min_height {
+        height = height.max(min_h + frame);
+    }
+    if let Some(max_h) = node.max_height {
+        height = height.min(max_h + frame);
+    }
+    height.max(0.0)
+}
+
 fn resolve_percentage_widths(parent: &mut LayoutNode, available_width: f32) {
     for child in &mut parent.children {
         if let Some(fraction) = child.width_percent {
@@ -1499,6 +1546,21 @@ pub fn compute_absolute_positions(
         // the first point at which there is one to take a fraction of.
         resolve_offset_percentages(abs_child, containing_block);
 
+        // So is a percentage width. The four in-flow passes resolve these for
+        // the children they lay out, and an absolute box is in none of them —
+        // so `width: 100%` on one fell through to shrink-to-fit. That is the
+        // 2px underline under ja.wikipedia.org's selected tab: it asks for the
+        // full width of the link and was coming out empty.
+        if let Some(fraction) = abs_child.width_percent {
+            abs_child.explicit_width = Some((containing_block.width * fraction).max(0.0));
+        }
+        if let Some(fraction) = abs_child.min_width_percent {
+            abs_child.min_width = Some((containing_block.width * fraction).max(0.0));
+        }
+        if let Some(fraction) = abs_child.max_width_percent {
+            abs_child.max_width = Some((containing_block.width * fraction).max(0.0));
+        }
+
         // Position based on offsets relative to containing block's content box
         let x = containing_block.x + abs_child.offsets[3].unwrap_or(0.0); // left offset (index 3)
         let y = containing_block.y + abs_child.offsets[0].unwrap_or(0.0); // top offset (index 0)
@@ -1579,6 +1641,7 @@ pub fn compute_absolute_positions(
         }
 
         abs_child.rect.width = total_width.max(0.0);
+        clamp_height(abs_child);
 
         // Compute layout for the absolute child's normal-flow children
         let inner_width = (abs_child.rect.width
@@ -1955,15 +2018,17 @@ fn compute_block_children(
 
             parent.children[i].rect = Rect::new(child_x, child_y, child_width, child_height);
 
-            // Recurse into block child's children
-            let inner_width = (parent.children[i].rect.width
-                - margin_left
-                - margin_right
-                - border_left
-                - border_right
-                - pad_left
-                - pad_right)
-                .max(0.0);
+            // Recurse into block child's children.
+            //
+            // The rect is the child's *border* box: its margins are the space
+            // outside it and were taken off `available_width` on the way in.
+            // Taking them off again here handed every box with a horizontal
+            // margin twice as little room as it has — a tab link inside an
+            // `<li>` with `margin: 0 8px` came out 16px narrower than the text
+            // it holds, and the underline under it that much too short.
+            let inner_width =
+                (parent.children[i].rect.width - border_left - border_right - pad_left - pad_right)
+                    .max(0.0);
             let inner_x = parent.children[i].rect.x + pad_left + border_left;
             let inner_y = parent.children[i].rect.y + pad_top + border_top;
 
@@ -2018,6 +2083,8 @@ fn compute_block_children(
                 }
             }
 
+            clamp_height(&mut parent.children[i]);
+
             if is_float {
                 // Add to float context
                 let rect = parent.children[i].rect;
@@ -2055,6 +2122,7 @@ fn compute_block_children(
         // Use the larger of computed or existing height
         parent.rect.height = parent.rect.height.max(computed_total_height);
     }
+    clamp_height(parent);
 
     // If width wasn't set, fill available width
     if parent.rect.width == 0.0 {
@@ -2117,6 +2185,7 @@ fn size_self_sizing_inline_box(
             child.rect.height = probe.rect.height;
         }
     }
+    clamp_height(child);
 }
 
 /// Which of a box's two intrinsic widths to measure.
@@ -2615,6 +2684,7 @@ fn compute_grid_children(
         }
         parent.rect.width = parent.rect.width.max(total_width);
         parent.rect.height = parent.rect.height.max(total_height);
+        clamp_height(parent);
     }
 }
 
@@ -3215,9 +3285,10 @@ fn compute_flex_children(
 
     // --- Step 9: Recurse into children ---
     for child in &mut parent.children {
+        // The item's own margins are outside its rect and were already
+        // accounted for when the line was packed — see the note in
+        // `compute_block_children`.
         let inner_width = (child.rect.width
-            - child.margin[3]
-            - child.margin[1]
             - child.border[3]
             - child.border[1]
             - child.padding[3]
@@ -3270,6 +3341,7 @@ fn compute_flex_children(
                 );
             }
         }
+        clamp_height(child);
     }
 
     // --- Step 10: Update parent height based on all children extent ---
@@ -3308,6 +3380,7 @@ fn compute_flex_children(
         + parent.border[0]
         + parent.padding[2]
         + parent.border[2];
+    clamp_height(parent);
 }
 
 /// Check if a string contains only collapsible whitespace characters.
@@ -3410,7 +3483,7 @@ fn collect_inline_boxes_recursive(
         boxes.push(InlineBox::Element {
             child_index: child_idx,
             width: child.explicit_width.unwrap_or(child.rect.width),
-            height: child.explicit_height.unwrap_or(child.rect.height),
+            height: clamped_height(child, child.explicit_height.unwrap_or(child.rect.height)),
             baseline_offset: 0.0,
             dom_node_id: dom_id,
             interaction_type: interaction,
@@ -3440,7 +3513,7 @@ fn collect_inline_boxes_recursive(
         }
     } else if child.image_src.is_some() || matches!(child.display, DisplayType::InlineBlock) {
         let w = child.explicit_width.unwrap_or(child.rect.width);
-        let h = child.explicit_height.unwrap_or(child.rect.height);
+        let h = clamped_height(child, child.explicit_height.unwrap_or(child.rect.height));
         boxes.push(InlineBox::Element {
             child_index: child_idx,
             width: w,
@@ -3456,7 +3529,7 @@ fn collect_inline_boxes_recursive(
             }
         } else {
             let w = child.explicit_width.unwrap_or(child.rect.width);
-            let h = child.explicit_height.unwrap_or(child.rect.height);
+            let h = clamped_height(child, child.explicit_height.unwrap_or(child.rect.height));
             boxes.push(InlineBox::Element {
                 child_index: child_idx,
                 width: w,
@@ -5086,6 +5159,8 @@ fn generated_box(style: &ComputedValues, text: String) -> LayoutNode {
     node.min_width_percent = style.min_width_percent;
     node.max_width_percent = style.max_width_percent;
     node.width_intrinsic = style.width_intrinsic;
+    node.min_height = style.min_height;
+    node.max_height = style.max_height;
     if let Some(width) = style.width {
         node.explicit_width = Some(width);
         node.rect.width = width;
@@ -5098,6 +5173,17 @@ fn generated_box(style: &ComputedValues, text: String) -> LayoutNode {
     node.text_align = style.text_align;
     node.direction = style.direction;
     node.position = style.position;
+    // Without its insets an absolutely positioned pseudo-element sits at its
+    // containing block's top-left corner whatever it asked for: the 2px
+    // underline under ja.wikipedia.org's selected tab is `bottom: 0; left: 0`,
+    // and was landing on top of the tab's text.
+    node.offsets = [
+        style.offset_top,
+        style.offset_right,
+        style.offset_bottom,
+        style.offset_left,
+    ];
+    node.offset_percents = style.offset_percent;
     node.z_index = style.z_index;
     node.transform = style.transform.clone();
     node.transform_origin = style.transform_origin;
@@ -10376,8 +10462,11 @@ mod tests {
             |id| arena.get(crate::html::DomHandle(crate::html::NodeId::from_raw(id))),
             page_width,
         );
+        // The same order `Page::new` runs the pipeline in.
+        extract_absolute_children(&mut root);
         let mut renderer = crate::render::text::TextRenderer::new();
         compute_layout(&mut root, page_width, &mut renderer);
+        apply_relative_positioning(&mut root);
         let viewport = Rect::new(0.0, 0.0, page_width, 800.0);
         compute_absolute_positions(&mut root, viewport, &mut renderer);
         root
@@ -10479,6 +10568,93 @@ mod tests {
         );
         let w = sized_box(&root).rect.width;
         assert!(w <= 100.0, "max-width must cap the panel, got {w}");
+    }
+
+    // ------ W2-5: the article tab strip ------
+
+    #[test]
+    fn min_height_holds_a_box_open_around_shorter_text() {
+        // The article tabs are 32px tall because `min-height` says so; their
+        // text is a good deal shorter than that.
+        let root = laid_out(
+            "<body><div class='t'>tab</div></body>",
+            ".t { min-height: 32px; }",
+            400.0,
+        );
+        let tab = first_box(&root, &|n| n.min_height == Some(32.0)).expect("the tab");
+        assert!(
+            tab.rect.height >= 32.0,
+            "min-height must hold the box open, got {}",
+            tab.rect.height
+        );
+    }
+
+    #[test]
+    fn max_height_cuts_a_box_down_to_size() {
+        let root = laid_out(
+            "<body><div class='t'><div>one</div><div>two</div><div>three</div></div></body>",
+            ".t { max-height: 20px; }",
+            400.0,
+        );
+        let box_ = first_box(&root, &|n| n.max_height == Some(20.0)).expect("the capped box");
+        assert!(
+            box_.rect.height <= 20.0,
+            "max-height must cap the box, got {}",
+            box_.rect.height
+        );
+    }
+
+    #[test]
+    fn an_absolute_after_underlines_the_full_width_of_its_parent() {
+        // The 2px rule under the selected tab: `position: absolute; bottom: 0;
+        // left: 0; width: 100%` on an `::after`. It used to lose its insets on
+        // the way out of the cascade and never resolve its percentage width, so
+        // it came out empty and sat on top of the tab's text.
+        let root = laid_out(
+            "<body><a class='tab'>tab</a></body>",
+            ".tab { display: inline-flex; position: relative; min-height: 32px; }\
+             .tab::after { content: ''; position: absolute; bottom: 0; left: 0; \
+                           width: 100%; height: 2px; background-color: #202122; }",
+            400.0,
+        );
+        let tab = first_box(&root, &|n| n.min_height == Some(32.0)).expect("the tab");
+        let rule = tab
+            .absolute_children
+            .first()
+            .expect("the ::after should have been taken out of flow");
+        assert_eq!(rule.rect.height, 2.0);
+        assert_eq!(
+            rule.rect.width, tab.rect.width,
+            "`width: 100%` should span the link"
+        );
+        assert!(
+            (rule.rect.bottom() - tab.rect.bottom()).abs() < 0.01,
+            "`bottom: 0` should sit the rule on the tab's bottom edge: rule ends at {}, tab at {}",
+            rule.rect.bottom(),
+            tab.rect.bottom()
+        );
+    }
+
+    #[test]
+    fn a_horizontal_margin_is_taken_off_the_width_only_once() {
+        // The margin is the space outside the box; it was subtracted when the
+        // box was sized and again when its content area was worked out, so a
+        // child of a box with `margin: 0 8px` lost 32px rather than 16.
+        let root = laid_out(
+            "<body><div class='outer'><div class='inner'>x</div></div></body>",
+            "body { margin: 0; } .outer { margin: 0 12px; } .inner { width: 100%; }",
+            400.0,
+        );
+        let outer = first_box(&root, &|n| n.margin[3] == 12.0).expect("the outer box");
+        let inner = outer.children.first().expect("the inner box");
+        assert_eq!(
+            outer.rect.width, 376.0,
+            "400 less one 12px margin each side"
+        );
+        assert_eq!(
+            inner.rect.width, outer.rect.width,
+            "the inner box fills its parent's content width"
+        );
     }
 
     #[test]
@@ -10846,4 +11022,5 @@ fn compute_table_children(
 
     let total_height = (current_y - start_y) + pad_top + pad_bottom + border_top + border_bottom;
     parent.rect = Rect::new(parent_x, parent_y, table_width, total_height);
+    clamp_height(parent);
 }

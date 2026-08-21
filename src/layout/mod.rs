@@ -232,6 +232,10 @@ pub struct LayoutNode {
     pub width_percent: Option<f32>,
     pub min_width_percent: Option<f32>,
     pub max_width_percent: Option<f32>,
+    /// `width` asked for as `min-content` / `max-content` / `fit-content`.
+    /// Resolved into `explicit_width` by [`resolve_intrinsic_widths`], which
+    /// runs where the box's children are already built.
+    pub width_intrinsic: Option<crate::css::IntrinsicSize>,
     /// URL of an image source for <img> tags (None = not an image).
     pub image_src: Option<String>,
     /// `loading="lazy"` — the picture is not worth fetching until the reader
@@ -375,6 +379,7 @@ impl LayoutNode {
             width_percent: None,
             min_width_percent: None,
             max_width_percent: None,
+            width_intrinsic: None,
             explicit_height: None,
             min_width: None,
             max_width: None,
@@ -794,6 +799,7 @@ fn build_layout_children<N, F>(
                     layout_node.width_percent = child_styles.width_percent;
                     layout_node.min_width_percent = child_styles.min_width_percent;
                     layout_node.max_width_percent = child_styles.max_width_percent;
+                    layout_node.width_intrinsic = child_styles.width_intrinsic;
 
                     // Copy grid properties
                     layout_node.grid_columns = child_styles.grid_template_columns.clone();
@@ -1051,6 +1057,7 @@ fn build_layout_children<N, F>(
                         layout_node.width_percent = child_styles.width_percent;
                         layout_node.min_width_percent = child_styles.min_width_percent;
                         layout_node.max_width_percent = child_styles.max_width_percent;
+                        layout_node.width_intrinsic = child_styles.width_intrinsic;
                         if let Some(w) = child_styles.explicit_width {
                             layout_node.rect.width = w;
                         }
@@ -1300,6 +1307,66 @@ fn serialize_dom_node_to_xml_inner<N: LayoutDomNode, F: Fn(u32) -> Option<N>>(
 /// Percentage *heights* are left alone: they resolve against the containing
 /// block's height, and a block whose height is `auto` — nearly all of them —
 /// makes such a height compute to `auto` anyway.
+/// Turn each child's intrinsic width keyword into pixels.
+///
+/// `width: max-content` is not a share of the parent, it is a question about
+/// the child's own contents — so unlike a percentage it can be answered as
+/// soon as the box tree exists. It still needs `available_width`, because
+/// `fit-content` is capped by it.
+///
+/// Runs beside [`resolve_percentage_widths`] and writes the same field, so
+/// everything downstream sees an ordinary explicit width. Without it the
+/// keyword parsed to no width at all and the box fell back to shrink-to-fit
+/// against the space on offer: ja.wikipedia.org's dropdown panels sit in a
+/// containing block as narrow as the button that opens them, so every menu
+/// came out 12 pixels wide.
+fn resolve_intrinsic_widths(
+    parent: &mut LayoutNode,
+    available_width: f32,
+    text_renderer: &mut crate::render::text::TextRenderer,
+) {
+    for i in 0..parent.children.len() {
+        let Some(kind) = parent.children[i].width_intrinsic else {
+            continue;
+        };
+        // A percentage or a length already written into `explicit_width` this
+        // pass wins: whichever declaration the cascade kept is the one that
+        // set `width_intrinsic`, and it clears the field when it is a length.
+        let width = intrinsic_width_for(&parent.children[i], kind, available_width, text_renderer);
+        parent.children[i].explicit_width = Some(width);
+    }
+}
+
+/// Resolve one intrinsic keyword against a box, as a **content** width —
+/// `explicit_width` is a content-box figure under the default `box-sizing`.
+fn intrinsic_width_for(
+    node: &LayoutNode,
+    kind: crate::css::IntrinsicSize,
+    available_width: f32,
+    text_renderer: &mut crate::render::text::TextRenderer,
+) -> f32 {
+    use crate::css::IntrinsicSize;
+    let frame = node.padding[1] + node.padding[3] + node.border[1] + node.border[3];
+    let border_box = match kind {
+        IntrinsicSize::MinContent => {
+            measure_intrinsic_width(node, IntrinsicMode::Min, 0, text_renderer)
+        }
+        IntrinsicSize::MaxContent => {
+            measure_intrinsic_width(node, IntrinsicMode::Max, 0, text_renderer)
+        }
+        IntrinsicSize::FitContent => {
+            let min = measure_intrinsic_width(node, IntrinsicMode::Min, 0, text_renderer);
+            let max = measure_intrinsic_width(node, IntrinsicMode::Max, 0, text_renderer);
+            max.min(available_width.max(min))
+        }
+    };
+    let content = match node.box_sizing {
+        crate::css::BoxSizing::BorderBox => border_box,
+        crate::css::BoxSizing::ContentBox => border_box - frame,
+    };
+    content.max(0.0)
+}
+
 fn resolve_percentage_widths(parent: &mut LayoutNode, available_width: f32) {
     for child in &mut parent.children {
         if let Some(fraction) = child.width_percent {
@@ -1444,24 +1511,50 @@ pub fn compute_absolute_positions(
             + abs_child.border[0]
             + abs_child.border[2];
 
-        // Width: if explicit width is set via rect, use it; otherwise compute from content
-        let mut total_width = if abs_child.rect.width > 0.0 {
+        // Width, as a border box. A declared width wins; an intrinsic keyword
+        // is measured against the box's own contents; otherwise the box
+        // shrinks to fit and never grows past the block that contains it.
+        let frame =
+            abs_child.padding[1] + abs_child.padding[3] + abs_child.border[1] + abs_child.border[3];
+        // Under `content-box` a declared width names the content alone, so the
+        // frame goes back on to make a border box; under `border-box` it is
+        // already one.
+        let outer = |content: f32| match abs_child.box_sizing {
+            crate::css::BoxSizing::BorderBox => content,
+            crate::css::BoxSizing::ContentBox => content + frame,
+        };
+        let mut total_width = if let Some(kind) = abs_child.width_intrinsic {
+            // The containing block caps `fit-content` and nothing else: a
+            // dropdown panel is deliberately wider than the button it hangs
+            // from, which is the whole reason the page asks for max-content.
+            outer(intrinsic_width_for(
+                abs_child,
+                kind,
+                containing_block.width,
+                text_renderer,
+            ))
+        } else if let Some(w) = abs_child.explicit_width {
+            outer(w)
+        } else if abs_child.rect.width > 0.0 {
             abs_child.rect.width
-                - abs_child.padding[1]
-                - abs_child.padding[3]
-                - abs_child.border[1]
-                - abs_child.border[3]
         } else if abs_child.children.is_empty() {
             // Nothing inside: the box is its own padding and border.
-            abs_child.padding[1] + abs_child.padding[3] + abs_child.border[1] + abs_child.border[3]
+            frame
         } else {
             // An absolute box with no width shrinks to fit, and never past the
             // block that contains it. This used to measure the *height* of the
             // content and use it as a width, so a menu came out one line-height
             // across and its text ran down the page.
             let fit = compute_shrink_to_fit_width(abs_child, 0, text_renderer);
-            fit.min(containing_block.width).max(0.0)
+            fit.min(containing_block.width)
         };
+        if let Some(min_w) = abs_child.min_width {
+            total_width = total_width.max(outer(min_w));
+        }
+        if let Some(max_w) = abs_child.max_width {
+            total_width = total_width.min(outer(max_w));
+        }
+        total_width = total_width.max(0.0);
 
         // Handle right/bottom offsets (if set, they constrain the box differently)
         if abs_child.offsets[1].is_some() {
@@ -1642,6 +1735,7 @@ fn compute_block_children(
         return;
     }
     resolve_percentage_widths(parent, available_width);
+    resolve_intrinsic_widths(parent, available_width, text_renderer);
 
     // --- Separate children into block and inline runs ---
     // We process the children list and find contiguous runs of inline children.
@@ -2025,29 +2119,84 @@ fn size_self_sizing_inline_box(
     }
 }
 
+/// Which of a box's two intrinsic widths to measure.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntrinsicMode {
+    /// The narrowest the box can be without its content spilling: every line
+    /// broken at every opportunity the content offers.
+    Min,
+    /// The widest the box would like to be: lines broken only where the
+    /// content itself forces a break.
+    Max,
+}
+
+/// Measure the max-content width of a box — what `shrink-to-fit` asks for
+/// before it is capped by the space available.
 fn compute_shrink_to_fit_width(
     node: &LayoutNode,
+    depth: usize,
+    text_renderer: &mut crate::render::text::TextRenderer,
+) -> f32 {
+    measure_intrinsic_width(node, IntrinsicMode::Max, depth, text_renderer)
+}
+
+/// Measure one of a box's intrinsic widths, as a **border-box** figure.
+///
+/// Every branch returns a width that already includes the box's own padding
+/// and border, and the walk over children adds only their margins. The two
+/// used to disagree: a child measured itself with its padding and the parent
+/// added the child's padding again, so a nested box counted its own frame
+/// twice and every level of nesting made the overshoot worse.
+fn measure_intrinsic_width(
+    node: &LayoutNode,
+    mode: IntrinsicMode,
     depth: usize,
     text_renderer: &mut crate::render::text::TextRenderer,
 ) -> f32 {
     if depth > MAX_LAYOUT_DEPTH {
         return 0.0;
     }
+    let frame = node.padding[1] + node.padding[3] + node.border[1] + node.border[3];
     if let Some(w) = node.explicit_width {
-        return w;
+        return match node.box_sizing {
+            crate::css::BoxSizing::BorderBox => w,
+            crate::css::BoxSizing::ContentBox => w + frame,
+        };
     }
     if node.image_src.is_some() && node.rect.width > 0.0 {
-        return node.rect.width;
+        return node.rect.width + frame;
     }
     if let Some(ref text) = node.text {
         let transformed = node.text_style.transform.apply(text);
-        let (w, _) = text_renderer.measure_styled(
-            &transformed,
-            node.font_size,
-            crate::css::font_stack_or_default(&node.font_family),
-            node.text_style,
-        );
-        return w;
+        let font = crate::css::font_stack_or_default(&node.font_family);
+        let width = match mode {
+            IntrinsicMode::Max => {
+                text_renderer
+                    .measure_styled(&transformed, node.font_size, font, node.text_style)
+                    .0
+            }
+            // The narrowest line is the widest piece the breaker may not
+            // split. Asking the breaker itself which pieces those are keeps
+            // this in step with how the text actually wraps — a Japanese
+            // caption has no spaces to split on, but breaks between almost
+            // every character.
+            IntrinsicMode::Min => {
+                let mut widest = 0.0f32;
+                for token in tokenize_text_for_line_breaking(&transformed) {
+                    if let LineBreakToken::Text(piece) = token {
+                        let (w, _) = text_renderer.measure_styled(
+                            piece,
+                            node.font_size,
+                            font,
+                            node.text_style,
+                        );
+                        widest = widest.max(w);
+                    }
+                }
+                widest
+            }
+        };
+        return width + frame;
     }
     // Children that share a line add up; children that stack take the widest.
     //
@@ -2067,23 +2216,24 @@ fn compute_shrink_to_fit_width(
     let mut line_run = 0.0f32;
     let mut items = 0usize;
     for child in &node.children {
-        let outer = if is_block_child(child) {
-            compute_shrink_to_fit_width(child, depth + 1, text_renderer)
-                + child.padding[1]
-                + child.padding[3]
-                + child.border[1]
-                + child.border[3]
+        let shares_the_line = lays_children_in_a_row || is_inline_child(child);
+        let outer = if is_block_child(child) || is_inline_child(child) {
+            measure_intrinsic_width(child, mode, depth + 1, text_renderer)
                 + child.margin[1]
                 + child.margin[3]
-        } else if is_inline_child(child) {
-            compute_shrink_to_fit_width(child, depth + 1, text_renderer)
         } else {
             continue;
         };
 
-        if lays_children_in_a_row || is_inline_child(child) {
-            line_run += outer;
-            items += 1;
+        if shares_the_line {
+            // At min-content every break opportunity is taken, so boxes on one
+            // line no longer add up — the widest of them is the answer.
+            if mode == IntrinsicMode::Min {
+                widest = widest.max(outer);
+            } else {
+                line_run += outer;
+                items += 1;
+            }
         } else {
             // A block child ends whatever line was being built and stands alone.
             widest = widest.max(line_run).max(outer);
@@ -2091,7 +2241,7 @@ fn compute_shrink_to_fit_width(
             items = 0;
         }
     }
-    if lays_children_in_a_row {
+    if lays_children_in_a_row && mode == IntrinsicMode::Max {
         line_run += node.column_gap * items.saturating_sub(1) as f32;
     }
     let content_w = widest.max(line_run);
@@ -2240,6 +2390,7 @@ fn compute_grid_children(
         return;
     }
     resolve_percentage_widths(parent, available_width);
+    resolve_intrinsic_widths(parent, available_width, text_renderer);
 
     let tracks = if parent.grid_columns.is_empty() {
         vec![crate::css::GridTrack::Fr(1.0)]
@@ -2533,6 +2684,7 @@ fn compute_flex_children(
         return;
     }
     resolve_percentage_widths(parent, available_width);
+    resolve_intrinsic_widths(parent, available_width, text_renderer);
 
     let is_row = matches!(
         parent.flex_direction,
@@ -4933,6 +5085,7 @@ fn generated_box(style: &ComputedValues, text: String) -> LayoutNode {
     node.width_percent = style.width_percent;
     node.min_width_percent = style.min_width_percent;
     node.max_width_percent = style.max_width_percent;
+    node.width_intrinsic = style.width_intrinsic;
     if let Some(width) = style.width {
         node.explicit_width = Some(width);
         node.rect.width = width;
@@ -10196,6 +10349,152 @@ mod tests {
         assert_eq!(hit_test_interactive(&root, 30.0, 20.0), None);
         assert_eq!(hit_test_dom_path(&root, 30.0, 20.0), vec![0u32]);
     }
+
+    // ------ W2-6: intrinsic widths (`max-content` / `min-content` / `fit-content`) ------
+
+    /// Lay out an HTML fragment against a stylesheet and hand back the `<body>` box.
+    fn laid_out(html: &str, css: &str, page_width: f32) -> LayoutNode {
+        let arena = crate::html::parse_html(html);
+        let author = crate::css::parser::parse_stylesheet(css);
+        let stylesheet = crate::css::merge_stylesheets_with_author(
+            &crate::css::user_agent_stylesheet(),
+            &author,
+        );
+        let styles = crate::css::compute_styles_for_tree(&arena, &stylesheet, (page_width, 800.0));
+        let body_id = {
+            let nodes = arena.nodes.borrow();
+            nodes
+                .iter()
+                .position(|n| {
+                    n.is_element() && n.tag_name().map(|t| t.to_string()).as_deref() == Some("body")
+                })
+                .expect("a <body>") as u32
+        };
+        let mut root = build_layout_tree(
+            body_id,
+            &styles,
+            |id| arena.get(crate::html::DomHandle(crate::html::NodeId::from_raw(id))),
+            page_width,
+        );
+        let mut renderer = crate::render::text::TextRenderer::new();
+        compute_layout(&mut root, page_width, &mut renderer);
+        let viewport = Rect::new(0.0, 0.0, page_width, 800.0);
+        compute_absolute_positions(&mut root, viewport, &mut renderer);
+        root
+    }
+
+    /// The first box in the tree that answers the question, absolutes included.
+    fn first_box<'a>(
+        node: &'a LayoutNode,
+        pred: &dyn Fn(&LayoutNode) -> bool,
+    ) -> Option<&'a LayoutNode> {
+        if pred(node) {
+            return Some(node);
+        }
+        node.children
+            .iter()
+            .chain(node.absolute_children.iter())
+            .find_map(|c| first_box(c, pred))
+    }
+
+    fn sized_box(root: &LayoutNode) -> &LayoutNode {
+        first_box(root, &|n| n.width_intrinsic.is_some())
+            .expect("the box asking for an intrinsic width")
+    }
+
+    #[test]
+    fn width_max_content_is_the_widest_line_not_the_space_available() {
+        // A block fills its parent; `max-content` asks instead for the width
+        // the text wants, which on a 1000px page is far narrower.
+        let root = laid_out(
+            "<body><div class='m'>short</div></body>",
+            ".m { width: max-content; }",
+            1000.0,
+        );
+        let w = sized_box(&root).rect.width;
+        assert!(
+            w > 0.0 && w < 200.0,
+            "max-content should hug the text, got {w}"
+        );
+    }
+
+    #[test]
+    fn width_min_content_is_narrower_than_width_max_content() {
+        let html = "<body><div class='m'>one two three four five</div></body>";
+        let wide = sized_box(&laid_out(html, ".m { width: max-content; }", 1000.0))
+            .rect
+            .width;
+        let narrow = sized_box(&laid_out(html, ".m { width: min-content; }", 1000.0))
+            .rect
+            .width;
+        assert!(
+            narrow < wide,
+            "min-content ({narrow}) must be narrower than max-content ({wide})"
+        );
+        assert!(narrow > 0.0, "min-content must still hold the longest word");
+    }
+
+    #[test]
+    fn width_fit_content_stops_at_the_space_on_offer() {
+        // The text wants far more than 60px, so fit-content settles for 60.
+        let root = laid_out(
+            "<body><div class='m'>one two three four five six seven eight</div></body>",
+            ".m { width: fit-content; }",
+            60.0,
+        );
+        let w = sized_box(&root).rect.width;
+        assert!(
+            w <= 60.0,
+            "fit-content must not exceed the available width, got {w}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_box_with_max_content_outgrows_its_containing_block() {
+        // The dropdown panel case: the block that positions the menu is only as
+        // wide as the button that opens it, and the menu is deliberately wider.
+        // Shrink-to-fit caps at the containing block; `max-content` does not.
+        let root = laid_out(
+            "<body><div class='anchor'><div class='panel'>a much longer menu label</div></div></body>",
+            ".anchor { position: relative; width: 12px; }\
+             .panel { position: absolute; top: 100%; width: max-content; }",
+            1000.0,
+        );
+        let panel = sized_box(&root);
+        assert_eq!(panel.position, PositionType::Absolute);
+        assert!(
+            panel.rect.width > 12.0,
+            "the panel must not be trapped at its anchor's 12px, got {}",
+            panel.rect.width
+        );
+    }
+
+    #[test]
+    fn max_width_clamps_an_absolutely_positioned_box() {
+        let root = laid_out(
+            "<body><div class='anchor'><div class='panel'>a much longer menu label that runs on and on</div></div></body>",
+            ".anchor { position: relative; width: 12px; }\
+             .panel { position: absolute; width: max-content; max-width: 100px; }",
+            1000.0,
+        );
+        let w = sized_box(&root).rect.width;
+        assert!(w <= 100.0, "max-width must cap the panel, got {w}");
+    }
+
+    #[test]
+    fn an_intrinsic_measure_counts_a_nested_frame_once() {
+        // The measure used to add a child's padding on top of a figure that
+        // already included it, so each level of nesting inflated the answer.
+        let mut inner = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
+        inner.explicit_width = Some(100.0);
+        inner.padding = [0.0, 10.0, 0.0, 10.0];
+        let mut outer = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
+        outer.children.push(inner);
+
+        let mut renderer = crate::render::text::TextRenderer::new();
+        let w = compute_shrink_to_fit_width(&outer, 0, &mut renderer);
+        assert_eq!(w, 120.0, "100px of content inside a 10px frame is 120px");
+    }
 }
 
 /// Compute table layout for a `display: table` or `display: inline-table` node.
@@ -10212,6 +10511,7 @@ fn compute_table_children(
         return;
     }
     resolve_percentage_widths(parent, available_width);
+    resolve_intrinsic_widths(parent, available_width, text_renderer);
 
     let pad_left = parent.padding[3];
     let pad_right = parent.padding[1];

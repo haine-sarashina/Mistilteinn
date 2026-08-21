@@ -1285,6 +1285,43 @@ pub enum GridTrack {
     FitContent(f32),
 }
 
+/// An intrinsic sizing keyword written where a length was expected.
+///
+/// These are not lengths: `max-content` is "as wide as the content wants to
+/// be", which nothing outside layout can work out. The cascade records which
+/// keyword was asked for and layout measures it once the box has children.
+// The shared `Content` suffix is the CSS keyword, not a naming habit.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntrinsicSize {
+    /// The narrowest the box can be without its content spilling.
+    MinContent,
+    /// The widest the box would like to be, breaking lines only where the
+    /// content forces a break.
+    MaxContent,
+    /// `min(max-content, max(min-content, available))` — max-content, but
+    /// never wider than the space on offer.
+    FitContent,
+}
+
+/// Read `min-content` / `max-content` / `fit-content` from a declaration value.
+///
+/// `fit-content(<length>)` is the grid track form and is handled by
+/// [`parse_track_token`]; as a `width` it is the bare keyword.
+pub fn parse_intrinsic_size(value: &str) -> Option<IntrinsicSize> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("min-content") {
+        return Some(IntrinsicSize::MinContent);
+    }
+    if v.eq_ignore_ascii_case("max-content") {
+        return Some(IntrinsicSize::MaxContent);
+    }
+    if v.eq_ignore_ascii_case("fit-content") {
+        return Some(IntrinsicSize::FitContent);
+    }
+    None
+}
+
 // ------ Alignment on Item (align-self) ------
 
 /// The computed `align-self` CSS property for flex/grid items.
@@ -1745,6 +1782,12 @@ pub struct ComputedValues {
     pub width_percent: Option<f32>,
     pub min_width_percent: Option<f32>,
     pub max_width_percent: Option<f32>,
+    /// `width` written as an intrinsic keyword rather than a length.
+    ///
+    /// Like a percentage this cannot be resolved by the cascade — but unlike a
+    /// percentage it does not depend on the parent, it depends on what is
+    /// *inside* the box, so it is resolved where the children are measured.
+    pub width_intrinsic: Option<IntrinsicSize>,
     /// The font size this element inherited, before its own `font-size` ran.
     ///
     /// `font-size: 150%` and `font-size: 1.5em` are both a multiple of the
@@ -2578,6 +2621,7 @@ impl Default for ComputedValues {
             width_percent: None,
             min_width_percent: None,
             max_width_percent: None,
+            width_intrinsic: None,
             line_height: 1.2,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
@@ -2978,6 +3022,7 @@ impl ComputedValues {
                 }
             }
             "width" => {
+                self.width_intrinsic = parse_intrinsic_size(val);
                 self.width_percent = parse_percentage(val);
                 self.width = parse_length(val);
                 self.explicit_width = self.width;

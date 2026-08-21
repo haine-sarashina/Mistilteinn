@@ -4857,16 +4857,26 @@ pub fn break_into_lines(
         // says where that baseline falls.
         let mut ref_font = 0.0f32;
         let mut ref_family = crate::css::DEFAULT_FONT_FAMILY.to_string();
+        // The whole line, not just the reference run: a Japanese word beside
+        // Latin text is drawn in a different face, and that face is what makes
+        // the line as tall as it has to be. A prefix is enough to tell the
+        // scripts apart.
+        let mut line_text = String::new();
         for b in boxes.iter() {
             if let InlineBox::Text {
                 font_size,
                 font_family,
+                text,
                 ..
             } = b
-                && *font_size > ref_font
             {
-                ref_font = *font_size;
-                ref_family = font_family.clone();
+                if line_text.len() < 64 {
+                    line_text.push_str(text);
+                }
+                if *font_size > ref_font {
+                    ref_font = *font_size;
+                    ref_family = font_family.clone();
+                }
             }
         }
         if ref_font <= 0.0 {
@@ -4877,8 +4887,11 @@ pub fn break_into_lines(
             };
         }
 
-        let (ascent, descent, _) =
-            text_renderer.line_metrics(ref_font, crate::css::font_stack_or_default(&ref_family));
+        let (ascent, descent, _) = text_renderer.line_metrics(
+            ref_font,
+            crate::css::font_stack_or_default(&ref_family),
+            &line_text,
+        );
         // The glyphs need `ascent + descent`; the line is `line-height` tall.
         // The difference is leading, split evenly above and below — so raising
         // `line-height` pushes the text down as much as it pushes the next
@@ -9148,7 +9161,8 @@ mod tests {
         // The baseline is where the reference font puts it: half the leading,
         // then that font's ascent. Which font answers depends on the machine,
         // so this checks the relationship rather than a number.
-        let (ascent, descent, _) = renderer.line_metrics(16.0, crate::css::DEFAULT_FONT_FAMILY);
+        let (ascent, descent, _) =
+            renderer.line_metrics(16.0, crate::css::DEFAULT_FONT_FAMILY, "Hello");
         let expected = ((lines[0].height - (ascent + descent)) / 2.0).max(0.0) + ascent;
         assert!(
             (lines[0].baseline_y - expected).abs() < 0.01,
@@ -9189,7 +9203,8 @@ mod tests {
         assert_eq!(lines.len(), 1, "Mixed-size text fits on one line");
         // The largest text on the line sets both, so the answer must match
         // what 24px alone would give — the 12px run changes nothing.
-        let (ascent, descent, _) = renderer.line_metrics(24.0, crate::css::DEFAULT_FONT_FAMILY);
+        let (ascent, descent, _) =
+            renderer.line_metrics(24.0, crate::css::DEFAULT_FONT_FAMILY, "Large");
         let expected_height = (24.0f32 * crate::css::DEFAULT_LINE_HEIGHT).max(ascent + descent);
         assert!(
             (lines[0].height - expected_height).abs() < 0.01,
@@ -10832,7 +10847,8 @@ mod tests {
         // Raising `line-height` pushes the text down as much as it pushes the
         // next line away. Adding it all below would ride every line's top.
         let mut renderer = crate::render::text::TextRenderer::new();
-        let (ascent, descent, _) = renderer.line_metrics(16.0, crate::css::DEFAULT_FONT_FAMILY);
+        let (ascent, descent, _) =
+            renderer.line_metrics(16.0, crate::css::DEFAULT_FONT_FAMILY, "Hello");
         let mut float_ctx = FloatContext::new();
         let lines = break_into_lines(
             vec![InlineBox::test_text("Hello", 16.0)],
@@ -10853,19 +10869,95 @@ mod tests {
     }
 
     #[test]
+    fn a_japanese_line_is_measured_in_the_face_its_glyphs_are_drawn_in() {
+        // A Latin stack has a CJK family appended for a Japanese run, and that
+        // face is taller above the baseline and deeper below it. Probing the
+        // stack with Latin letters alone took the metrics from a font the
+        // Japanese glyphs are not drawn in.
+        let mut renderer = crate::render::text::TextRenderer::new();
+        let latin = renderer.line_metrics(16.0, "Georgia, serif", "Handgloves");
+        let japanese = renderer.line_metrics(16.0, "Georgia, serif", "\u{65e5}\u{672c}\u{8a9e}");
+        assert!(
+            japanese.0 + japanese.1 >= latin.0 + latin.1,
+            "the Japanese face needs at least as much room: {japanese:?} vs {latin:?}"
+        );
+    }
+
+    #[test]
     fn the_baseline_follows_the_font_not_a_fixed_fraction() {
         // Two faces with different metrics must put the baseline in different
         // places at the same size. If they agree exactly, the metrics are not
         // being read.
         let mut renderer = crate::render::text::TextRenderer::new();
-        let (sans_a, sans_d, _) = renderer.line_metrics(16.0, "sans-serif");
-        let (mono_a, mono_d, _) = renderer.line_metrics(16.0, "monospace");
+        let (sans_a, sans_d, _) = renderer.line_metrics(16.0, "sans-serif", "Hello");
+        let (mono_a, mono_d, _) = renderer.line_metrics(16.0, "monospace", "Hello");
         assert!(sans_a > 0.0 && sans_d > 0.0, "a font must report metrics");
         assert!(mono_a > 0.0 && mono_d > 0.0, "a font must report metrics");
         assert!(
             sans_a > 16.0 * 0.8,
             "a real sans ascent is more than the 0.8 of the size this used to assume, got {sans_a}"
         );
+    }
+
+    // ------ W3-2 / W3-3: heading rules and link colour ------
+
+    #[test]
+    fn a_heading_carries_the_bottom_border_the_page_asks_for() {
+        let root = laid_out(
+            "<body><h2>Section</h2></body>",
+            "h2 { border-bottom: 2px solid #101418; }",
+            600.0,
+        );
+        let h2 = first_box(&root, &|n| n.border[2] > 0.0).expect("a box with a bottom border");
+        assert_eq!(h2.border[2], 2.0);
+        assert_eq!(h2.border_style[2], crate::css::BorderStyle::Solid);
+        assert_eq!(h2.border_color[2], [16, 20, 24, 255]);
+        // Only the bottom: the shorthand names one side and resets that side.
+        assert_eq!([h2.border[0], h2.border[1], h2.border[3]], [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_heading_inside_a_wrapper_gives_the_rule_up_when_told_to() {
+        // Modern Wikipedia wraps each heading in `.mw-heading` and moves the
+        // rule to the wrapper, so the `<h2>` itself is told `border: 0`. A
+        // rule that lands on the heading anyway would double the line.
+        let root = laid_out(
+            "<body><div class='w'><h2>Section</h2></div></body>",
+            "h2 { border-bottom: 1px solid #a2a9b1; } \
+             .w { border-bottom: 2px solid #101418; } \
+             .w h2 { border: 0; }",
+            600.0,
+        );
+        let bordered: Vec<f32> = {
+            let mut v = Vec::new();
+            fn walk(n: &LayoutNode, v: &mut Vec<f32>) {
+                if n.border[2] > 0.0 {
+                    v.push(n.border[2]);
+                }
+                for c in n.children.iter().chain(n.absolute_children.iter()) {
+                    walk(c, v);
+                }
+            }
+            walk(&root, &mut v);
+            v
+        };
+        assert_eq!(bordered, vec![2.0], "only the wrapper draws a rule");
+    }
+
+    #[test]
+    fn an_author_link_colour_beats_the_user_agent_default() {
+        // Vector paints links `#3366cc`, not the UA's `#0645ad` / `#0000ee`.
+        let root = laid_out(
+            "<body><a href='#'>link</a></body>",
+            "a { color: #3366cc; }",
+            400.0,
+        );
+        let runs = collect_text_nodes(&root);
+        let link = runs
+            .iter()
+            .find(|r| r.text.contains("link"))
+            .expect("the link run");
+        assert_eq!(link.color, [51, 102, 204, 255]);
     }
 
     // ------ W3: what is hidden from a screen reader is not hidden from sight ------

@@ -33,7 +33,16 @@ const LOADING_BAR_HEIGHT: f32 = 3.0;
 const LOADING_BAR_COLOR_R: f32 = 80.0 / 255.0;
 const LOADING_BAR_COLOR_G: f32 = 140.0 / 255.0;
 const LOADING_BAR_COLOR_B: f32 = 230.0 / 255.0;
-const SCROLLBAR_WIDTH: f32 = 10.0;
+/// How wide a scrollbar is.
+///
+/// Chrome on Windows gives one 15px, which is the figure a page measures
+/// itself against: `window.innerWidth - documentElement.clientWidth` is 15
+/// there. Ten made the bar noticeably thinner than the one beside it in
+/// another window, and gave the thumb only six pixels to be seen in.
+const SCROLLBAR_WIDTH: f32 = 15.0;
+/// How far the thumb sits inside its track on each side, leaving a 7px pill —
+/// the proportion Chrome's own scrollbar draws.
+const SCROLLBAR_THUMB_INSET: f32 = 4.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 30.0;
 /// How long the smooth-scroll glide takes to cover ~63% of the remaining
 /// distance. Small enough that scrolling still feels attached to the wheel.
@@ -2880,9 +2889,9 @@ impl MistilteinnApp {
                     viewport_len,
                 );
                 let thumb = crate::layout::Rect::new(
-                    track.x + 2.0,
+                    track.x + SCROLLBAR_THUMB_INSET,
                     track.y + thumb_offset,
-                    SCROLLBAR_WIDTH - 4.0,
+                    SCROLLBAR_WIDTH - SCROLLBAR_THUMB_INSET * 2.0,
                     thumb_len,
                 );
                 (track, thumb)
@@ -2896,9 +2905,9 @@ impl MistilteinnApp {
                 );
                 let thumb = crate::layout::Rect::new(
                     track.x + thumb_offset,
-                    track.y + 2.0,
+                    track.y + SCROLLBAR_THUMB_INSET,
                     thumb_len,
-                    SCROLLBAR_WIDTH - 4.0,
+                    SCROLLBAR_WIDTH - SCROLLBAR_THUMB_INSET * 2.0,
                 );
                 (track, thumb)
             }
@@ -5882,7 +5891,12 @@ mod tests {
         assert_eq!(metrics.track.width, SCROLLBAR_WIDTH);
         assert_eq!(metrics.track.height, 800.0 - ADDRESS_BAR_HEIGHT as f32);
         assert!(metrics.thumb.width < metrics.track.width);
-        assert_eq!(metrics.thumb.x, metrics.track.x + 2.0);
+        assert_eq!(metrics.thumb.x, metrics.track.x + SCROLLBAR_THUMB_INSET);
+        assert_eq!(
+            metrics.thumb.width,
+            SCROLLBAR_WIDTH - SCROLLBAR_THUMB_INSET * 2.0,
+            "the thumb is a pill inside the track, not the whole of it"
+        );
         assert_eq!(metrics.thumb.y, metrics.track.y);
         assert!(metrics.thumb.height >= SCROLLBAR_MIN_THUMB_HEIGHT);
 

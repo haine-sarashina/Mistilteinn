@@ -126,7 +126,7 @@ pub struct TextRenderer {
     /// given family and size never changes. Laying a probe string out each
     /// time cost about 10ms over ja.wikipedia.org's 500-odd lines. Nested so
     /// the outer lookup can borrow the family rather than build a key.
-    line_metrics_cache: rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<u32, (f32, f32, f32)>>,
+    line_metrics_cache: rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<u64, (f32, f32, f32)>>,
 }
 
 /// Whether a character lives in one of the CJK blocks.
@@ -378,9 +378,16 @@ impl TextRenderer {
     /// Measured on a probe string carrying both an ascender and a descender,
     /// so the fallback chain resolves the same way it will when the real text
     /// is laid out.
-    pub fn line_metrics(&mut self, font_size: f32, family: &str) -> (f32, f32, f32) {
-        const PROBE: &str = "Hgp";
-        let size_key = font_size.to_bits();
+    pub fn line_metrics(&mut self, font_size: f32, family: &str, sample: &str) -> (f32, f32, f32) {
+        // Which face answers depends on the script: a stack of Latin families
+        // has a CJK one appended for a Japanese run, and that face is taller
+        // above the baseline and deeper below it. Probing with Latin letters
+        // alone would take the metrics from a font the Japanese glyphs are not
+        // drawn in. The Latin letters stay in the probe so a mixed line gets
+        // the taller of the two, which is what it needs.
+        let cjk = sample.chars().any(is_cjk);
+        let probe = if cjk { "Hgp\u{65e5}" } else { "Hgp" };
+        let size_key = ((font_size.to_bits() as u64) << 1) | cjk as u64;
         if let Some(hit) = self
             .line_metrics_cache
             .get(family)
@@ -389,16 +396,16 @@ impl TextRenderer {
             return *hit;
         }
         let key = family.to_string();
-        let family = self.resolve_stack(family, PROBE);
+        let family = self.resolve_stack(family, probe);
         let mut builder = self
             .layout_ctx
-            .ranged_builder(&mut self.font_ctx, PROBE, 1.0);
+            .ranged_builder(&mut self.font_ctx, probe, 1.0);
         builder.push_default(parley::StyleProperty::FontSize(font_size));
         builder.push_default(parley::StyleProperty::FontStack(family.as_ref().into()));
         // The gap the font asks for, not a multiplier of our own: `line-height`
         // is the page's business and is applied by the caller.
         builder.push_default(parley::StyleProperty::LineHeight(1.0));
-        let mut layout: Layout<()> = builder.build(PROBE);
+        let mut layout: Layout<()> = builder.build(probe);
         layout.break_all_lines(None);
 
         let metrics = match layout.lines().next() {

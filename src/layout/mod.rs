@@ -195,6 +195,13 @@ pub struct LayoutNode {
     pub background_size: crate::css::BackgroundSize,
     pub background_position: crate::css::BackgroundPosition,
     pub background_repeat: crate::css::BackgroundRepeat,
+    /// `mask-image` URL, and how it is sized and placed over the box. Where
+    /// this is set, the box's colour is painted through the picture's alpha
+    /// rather than across the whole box.
+    pub mask_image: Option<String>,
+    pub mask_size: crate::css::BackgroundSize,
+    pub mask_position: crate::css::BackgroundPosition,
+    pub mask_repeat: crate::css::BackgroundRepeat,
     /// Foreground text color as RGBA (None = not explicitly set, defaults to black).
     pub color: Option<[u8; 4]>,
     /// Flex container properties
@@ -325,6 +332,10 @@ impl LayoutNode {
             background_size: crate::css::BackgroundSize::Auto,
             background_position: crate::css::BackgroundPosition::default(),
             background_repeat: crate::css::BackgroundRepeat::Repeat,
+            mask_image: None,
+            mask_size: crate::css::BackgroundSize::Auto,
+            mask_position: crate::css::BackgroundPosition::default(),
+            mask_repeat: crate::css::BackgroundRepeat::Repeat,
             color: None,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
@@ -726,6 +737,10 @@ fn build_layout_children<N, F>(
                     layout_node.margin = child_styles.margin;
                     layout_node.background_color = child_styles.background_color;
                     layout_node.background_image = child_styles.background_image.clone();
+                    layout_node.mask_image = child_styles.mask_image.clone();
+                    layout_node.mask_size = child_styles.mask_size;
+                    layout_node.mask_position = child_styles.mask_position;
+                    layout_node.mask_repeat = child_styles.mask_repeat;
                     layout_node.background_size = child_styles.background_size;
                     layout_node.background_position = child_styles.background_position;
                     layout_node.background_repeat = child_styles.background_repeat;
@@ -952,6 +967,10 @@ fn build_layout_children<N, F>(
                     layout_node.margin = child_styles.margin;
                     layout_node.background_color = child_styles.background_color;
                     layout_node.background_image = child_styles.background_image.clone();
+                    layout_node.mask_image = child_styles.mask_image.clone();
+                    layout_node.mask_size = child_styles.mask_size;
+                    layout_node.mask_position = child_styles.mask_position;
+                    layout_node.mask_repeat = child_styles.mask_repeat;
                     layout_node.background_size = child_styles.background_size;
                     layout_node.background_position = child_styles.background_position;
                     layout_node.background_repeat = child_styles.background_repeat;
@@ -984,6 +1003,31 @@ fn build_layout_children<N, F>(
                     layout_node.transform_origin = child_styles.transform_origin;
                     layout_node.text_align = child_styles.text_align;
                     layout_node.direction = child_styles.direction;
+
+                    // A width on a plain inline box does nothing — the box is
+                    // as wide as the words in it — but an inline-block is a box,
+                    // and a page that gives one a size means it. Without this an
+                    // empty `<span>` sized by CSS into an icon or a spacer came
+                    // out one pixel square and disappeared.
+                    if matches!(
+                        child_styles.display,
+                        DisplayType::InlineBlock | DisplayType::InlineTable
+                    ) {
+                        layout_node.box_sizing = child_styles.box_sizing;
+                        layout_node.explicit_width = child_styles.explicit_width;
+                        layout_node.explicit_height = child_styles.explicit_height;
+                        layout_node.min_width = child_styles.min_width;
+                        layout_node.max_width = child_styles.max_width;
+                        layout_node.width_percent = child_styles.width_percent;
+                        layout_node.min_width_percent = child_styles.min_width_percent;
+                        layout_node.max_width_percent = child_styles.max_width_percent;
+                        if let Some(w) = child_styles.explicit_width {
+                            layout_node.rect.width = w;
+                        }
+                        if let Some(h) = child_styles.explicit_height {
+                            layout_node.rect.height = h;
+                        }
+                    }
 
                     // Extract image src and dimensions from <img> and <svg> tags
                     if node.tag_name() == "img" {
@@ -4498,6 +4542,10 @@ fn generated_box(style: &ComputedValues, text: String) -> LayoutNode {
     node.border_radius = style.border_radius;
     node.background_color = style.background_color;
     node.background_image = style.background_image.clone();
+    node.mask_image = style.mask_image.clone();
+    node.mask_size = style.mask_size;
+    node.mask_position = style.mask_position;
+    node.mask_repeat = style.mask_repeat;
     node.background_size = style.background_size;
     node.background_position = style.background_position;
     node.background_repeat = style.background_repeat;
@@ -4771,6 +4819,12 @@ pub struct VisualDecoration {
     pub background_size: crate::css::BackgroundSize,
     pub background_position: crate::css::BackgroundPosition,
     pub background_repeat: crate::css::BackgroundRepeat,
+    /// `mask-image` and how it is laid over the box. When there is one, the
+    /// background colour is painted through it instead of across the box.
+    pub mask_image: Option<String>,
+    pub mask_size: crate::css::BackgroundSize,
+    pub mask_position: crate::css::BackgroundPosition,
+    pub mask_repeat: crate::css::BackgroundRepeat,
     pub border_width: [f32; 4],
     /// Per-side border colour: [top, right, bottom, left].
     pub border_color: [[u8; 4]; 4],
@@ -5376,7 +5430,9 @@ pub fn collect_decorations(node: &LayoutNode) -> Vec<VisualDecoration> {
 
 /// This box's own background and borders, if it paints any.
 pub fn collect_own_decoration(node: &LayoutNode) -> Option<VisualDecoration> {
-    let has_bg = node.background_color.is_some() || node.background_image.is_some();
+    let has_bg = node.background_color.is_some()
+        || node.background_image.is_some()
+        || node.mask_image.is_some();
     // `node.border` is already the *used* width, so a side with no style is 0.
     let has_border = (0..4).any(|i| node.border[i] > 0.0 && node.border_style[i].is_visible());
     if !(has_bg || has_border)
@@ -5397,6 +5453,10 @@ pub fn collect_own_decoration(node: &LayoutNode) -> Option<VisualDecoration> {
         background_size: node.background_size,
         background_position: node.background_position,
         background_repeat: node.background_repeat,
+        mask_image: node.mask_image.clone(),
+        mask_size: node.mask_size,
+        mask_position: node.mask_position,
+        mask_repeat: node.mask_repeat,
         border_width: node.border,
         border_color: node.border_color,
         border_style: node.border_style,

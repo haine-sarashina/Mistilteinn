@@ -55,7 +55,13 @@ pub fn paint_page<'cache>(
                         let dx = deco.x + origin.0;
                         let dy = deco.y + origin.1;
 
-                        if let Some(bg) = deco.background_color {
+                        // A masked box paints its colour only where the mask
+                        // is opaque, so the flat fill below is skipped: filling
+                        // first would put a solid rectangle where the icon is
+                        // meant to be, and the mask cannot take it back.
+                        let masked = deco.mask_image.is_some();
+
+                        if let Some(bg) = deco.background_color.filter(|_| !masked) {
                             if deco.border_radius > 0.0 {
                                 crate::render::draw_rounded_rect_fill(
                                     target_buffer,
@@ -80,6 +86,31 @@ pub fn paint_page<'cache>(
                                     bg,
                                 );
                             }
+                        }
+
+                        // The mask is the shape of the box's colour. Until the
+                        // picture arrives there is nothing to shape it with, so
+                        // nothing is painted rather than a placeholder block.
+                        if let Some(ref src) = deco.mask_image
+                            && let Some(cached) = lookup_image(src)
+                            && let Some(color) = deco.background_color
+                        {
+                            crate::render::draw_masked_color(
+                                &cached.rgba,
+                                cached.width,
+                                cached.height,
+                                target_buffer,
+                                width,
+                                height,
+                                dx,
+                                dy,
+                                deco.width,
+                                deco.height,
+                                deco.mask_size,
+                                deco.mask_position,
+                                deco.mask_repeat,
+                                color,
+                            );
                         }
 
                         // The image paints over the background colour and under the border.

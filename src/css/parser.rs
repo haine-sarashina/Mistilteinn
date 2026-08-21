@@ -1934,30 +1934,38 @@ mod tests {
         assert!(evaluate_supports_condition("(position:sticky)"));
     }
 
-    /// Saying yes to a property we ignore is the harmful answer: MediaWiki
-    /// pairs its mask-image icons with a `background-image` fallback and picks
-    /// between them on exactly this question.
+    /// MediaWiki pairs its masked icons with a `background-image` fallback and
+    /// picks between them on exactly this question. Now that a mask is painted,
+    /// the mask branch is the one to take — and the vendor spelling has to
+    /// answer the same, because a page writes both and asks about either.
+    #[test]
+    fn supports_holds_for_a_mask_now_that_we_paint_one() {
+        assert!(evaluate_supports_condition("(mask-image:none)"));
+        assert!(evaluate_supports_condition("(-webkit-mask-image:none)"));
+    }
+
+    /// Saying yes to a property we ignore is the harmful answer: it takes the
+    /// fallback away from a page that was offering us one.
     #[test]
     fn supports_admits_a_property_we_do_not_have() {
-        assert!(!evaluate_supports_condition("(mask-image:none)"));
-        assert!(!evaluate_supports_condition("(-webkit-mask-image:none)"));
         assert!(!evaluate_supports_condition("(overflow-wrap:anywhere)"));
         assert!(!evaluate_supports_condition("(word-break:break-word)"));
+        assert!(!evaluate_supports_condition("(container-type:inline-size)"));
     }
 
     #[test]
     fn supports_reads_not_and_or_and_nesting() {
         assert!(evaluate_supports_condition(
-            "not ((-webkit-mask-image:none) or (mask-image:none))"
+            "not ((word-break:break-word) or (overflow-wrap:anywhere))"
         ));
         assert!(!evaluate_supports_condition(
-            "((-webkit-mask-image:none) or (mask-image:none))"
+            "((word-break:break-word) or (overflow-wrap:anywhere))"
         ));
         assert!(evaluate_supports_condition(
-            "(display:grid) or (mask-image:none)"
+            "(display:grid) or (word-break:break-word)"
         ));
         assert!(!evaluate_supports_condition(
-            "(display:grid) and (mask-image:none)"
+            "(display:grid) and (word-break:break-word)"
         ));
         assert!(evaluate_supports_condition(
             "(display:grid) and (display:flex)"
@@ -1986,7 +1994,7 @@ mod tests {
 
     #[test]
     fn an_unsupported_block_contributes_nothing() {
-        let ss = parse_stylesheet("@supports (mask-image:none) { .a { color: red } }");
+        let ss = parse_stylesheet("@supports (word-break:break-word) { .a { color: red } }");
         assert_eq!(ss.rules.len(), 0);
     }
 

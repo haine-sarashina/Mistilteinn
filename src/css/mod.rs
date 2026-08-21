@@ -1734,6 +1734,16 @@ pub struct ComputedValues {
     /// `content` — what a `::before` or `::after` puts on the page. Empty on
     /// an ordinary element, which generates nothing.
     pub content: Content,
+    /// `mask-image` — the picture whose alpha decides where this box's colour
+    /// shows through. Still relative to the document base, like every other URL
+    /// the cascade carries.
+    ///
+    /// An icon set is often drawn this way: one shape, recoloured per state by
+    /// the box's own `background-color`, instead of one picture per colour.
+    pub mask_image: Option<String>,
+    pub mask_size: BackgroundSize,
+    pub mask_position: BackgroundPosition,
+    pub mask_repeat: BackgroundRepeat,
     /// Whether this box is a list item, and so is marked with a bullet or a
     /// number. Set by `display: list-item`; it is not a display type of its own
     /// here because a list item lays out as a block and only differs in having
@@ -2230,6 +2240,20 @@ impl Content {
     }
 }
 
+/// The picture a `mask` or `mask-image` value names, if it names one.
+///
+/// `none` and the shapes we cannot draw — gradients, `linear-gradient()` used
+/// as a fade — leave nothing to mask with, and a box with no mask paints its
+/// background the ordinary way.
+fn mask_url(value: &str) -> Option<String> {
+    if value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    split_top_level_commas(value)
+        .into_iter()
+        .find_map(parse_url_token)
+}
+
 /// Read one CSS escape sequence, having consumed the backslash.
 ///
 /// `\f101` is how icon fonts are addressed, so a hex escape has to become the
@@ -2514,6 +2538,10 @@ impl Default for ComputedValues {
             cursor: Cursor::Auto,
             z_index: None,
             content: Content::default(),
+            mask_image: None,
+            mask_size: BackgroundSize::Auto,
+            mask_position: BackgroundPosition::default(),
+            mask_repeat: BackgroundRepeat::Repeat,
             list_item: false,
             list_style_type: None,
             list_style_position: None,
@@ -3312,6 +3340,41 @@ impl ComputedValues {
             "content" => {
                 self.content = Content::parse(val);
             }
+            // The vendor-prefixed spellings are the ones a page written for
+            // Safari or an older Chrome sends, and the two are written side by
+            // side rather than either standing alone — so they are one property
+            // as far as we are concerned.
+            "mask-image" | "-webkit-mask-image" => {
+                self.mask_image = mask_url(val);
+            }
+            "mask-size" | "-webkit-mask-size" => {
+                if let Some(size) = parse_background_size(val, ctx) {
+                    self.mask_size = size;
+                }
+            }
+            "mask-position" | "-webkit-mask-position" => {
+                if let Some(pos) = BackgroundPosition::parse(val, ctx) {
+                    self.mask_position = pos;
+                }
+            }
+            "mask-repeat" | "-webkit-mask-repeat" => {
+                if let Some(repeat) = BackgroundRepeat::parse(val) {
+                    self.mask_repeat = repeat;
+                }
+            }
+            "mask" | "-webkit-mask" => {
+                // The shorthand resets what it does not mention, which is what
+                // makes `mask: none` clear an icon set further up the cascade.
+                self.mask_image = mask_url(val);
+                self.mask_size = BackgroundSize::Auto;
+                self.mask_position = BackgroundPosition::default();
+                self.mask_repeat = BackgroundRepeat::Repeat;
+                for part in split_components(val) {
+                    if let Some(repeat) = BackgroundRepeat::parse(part) {
+                        self.mask_repeat = repeat;
+                    }
+                }
+            }
             "list-style-type" => {
                 self.list_style_type = ListStyleType::parse(val);
             }
@@ -3562,9 +3625,10 @@ pub struct LengthContext {
 /// Every property name the cascade knows how to apply.
 ///
 /// This is what `@supports (prop: value)` answers from. Claiming a property we
-/// then ignore is worse than admitting we lack it: a page that asks whether we
-/// have `mask-image` has a `background-image` fallback ready for when we say
-/// no, and taking the mask branch leaves its icons blank.
+/// then ignore is worse than admitting we lack it: a page that asks about
+/// something it has a fallback for is offering us the fallback, and taking the
+/// branch we cannot paint gets us the blank version of the page. So a name
+/// belongs on this list once the property is painted, and not before.
 const SUPPORTED_PROPERTIES: &[&str] = &[
     "-webkit-animation",
     "align-content",
@@ -3640,6 +3704,16 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "list-style",
     "list-style-position",
     "list-style-type",
+    "-webkit-mask",
+    "-webkit-mask-image",
+    "-webkit-mask-position",
+    "-webkit-mask-repeat",
+    "-webkit-mask-size",
+    "mask",
+    "mask-image",
+    "mask-position",
+    "mask-repeat",
+    "mask-size",
     "margin",
     "margin-bottom",
     "margin-left",

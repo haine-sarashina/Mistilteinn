@@ -149,6 +149,11 @@ impl Page {
             if let Some(ref src) = decoration.background_image {
                 want(src, decoration.width, decoration.height, &mut requests);
             }
+            // A mask is a picture too, and an icon drawn as one does not appear
+            // at all until it arrives.
+            if let Some(ref src) = decoration.mask_image {
+                want(src, decoration.width, decoration.height, &mut requests);
+            }
         }
 
         requests
@@ -893,6 +898,96 @@ mod tests {
             "the bullet is on the same line as the text it marks"
         );
         assert!(runs[0].x < runs[1].x);
+    }
+
+    // -- Masked icons --
+
+    /// An icon drawn as a mask: one shape, coloured by the box it sits in.
+    /// This is how a whole toolbar's worth of icons is usually written.
+    fn masked_icon_page() -> Page {
+        Page::new(
+            "<html><body><span class='icon'></span></body></html>",
+            ".icon { display: inline-block; width: 20px; height: 20px;
+                     background-color: #202122;
+                     -webkit-mask-image: url(search.svg);
+                     mask-image: url(search.svg);
+                     mask-repeat: no-repeat; }",
+            800.0,
+            600.0,
+        )
+    }
+
+    /// An icon is an empty `<span>` with a size and a picture. The size used
+    /// to be dropped on the way into the layout tree — width and height do
+    /// nothing to a plain inline box, and inline-block was going down the same
+    /// path — so the box came out a pixel square and never appeared.
+    #[test]
+    fn an_inline_block_keeps_the_size_it_was_given() {
+        let page = Page::new(
+            "<html><body><span class='i'></span></body></html>",
+            ".i { display: inline-block; width: 20px; height: 20px; background-color: red }",
+            800.0,
+            600.0,
+        );
+        let deco = crate::layout::collect_decorations(&page.layout_root)
+            .into_iter()
+            .find(|d| d.background_color == Some([255, 0, 0, 255]))
+            .expect("the box should paint something");
+        assert_eq!((deco.width, deco.height), (20.0, 20.0));
+    }
+
+    #[test]
+    fn a_plain_inline_box_is_still_as_wide_as_its_words() {
+        // `width` does not apply to a non-replaced inline box, and helping
+        // ourselves to it would squeeze every styled `<span>` on a page into
+        // whatever a stylesheet meant for its block cousins asked for.
+        let page = Page::new(
+            "<html><body><span class='i'>some words here</span></body></html>",
+            ".i { display: inline; width: 20px }",
+            800.0,
+            600.0,
+        );
+        let runs = crate::layout::collect_text_nodes(&page.layout_root);
+        let right = runs
+            .iter()
+            .map(|run| run.x + run.width)
+            .fold(0.0f32, f32::max);
+        assert!(
+            right > 28.0,
+            "the words run past the 20px the rule asked for: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn a_masked_box_carries_its_mask_to_the_painter() {
+        let page = masked_icon_page();
+        let deco = crate::layout::collect_decorations(&page.layout_root)
+            .into_iter()
+            .find(|d| d.mask_image.is_some())
+            .expect("the icon should reach the paint list");
+        assert_eq!(deco.mask_image.as_deref(), Some("search.svg"));
+        assert_eq!(deco.mask_repeat, crate::css::BackgroundRepeat::NoRepeat);
+        assert_eq!(
+            deco.background_color,
+            Some([32, 33, 34, 255]),
+            "the colour the mask will be painted in"
+        );
+    }
+
+    /// The mask is a picture and has to be fetched like one. Without this the
+    /// box knows its shape and never gets it.
+    #[test]
+    fn a_mask_is_fetched_like_any_other_picture() {
+        let page = masked_icon_page();
+        let urls: Vec<String> = page
+            .pending_image_requests(Rect::new(0.0, 0.0, 800.0, 600.0))
+            .into_iter()
+            .map(|(url, _, _)| url)
+            .collect();
+        assert!(
+            urls.iter().any(|url| url.contains("search.svg")),
+            "{urls:?}"
+        );
     }
 
     #[test]

@@ -1278,6 +1278,88 @@ pub fn draw_background_image(
     position: BackgroundPosition,
     repeat: BackgroundRepeat,
 ) {
+    draw_image_layer(
+        src_rgba,
+        src_width,
+        src_height,
+        dest,
+        dest_width,
+        dest_height,
+        box_x,
+        box_y,
+        box_w,
+        box_h,
+        size,
+        position,
+        repeat,
+        None,
+    )
+}
+
+/// Paint one colour over a box, showing only where a picture is opaque.
+///
+/// This is `mask-image`: the picture supplies the shape and the box supplies
+/// the colour. An icon set drawn this way is one file recoloured per state,
+/// rather than one file per colour, so a page that uses it has nothing to fall
+/// back to — without this the box is either blank or a solid rectangle where
+/// the icon should be.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_masked_color(
+    mask_rgba: &[u8],
+    mask_width: u32,
+    mask_height: u32,
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    box_x: f32,
+    box_y: f32,
+    box_w: f32,
+    box_h: f32,
+    size: BackgroundSize,
+    position: BackgroundPosition,
+    repeat: BackgroundRepeat,
+    color: [u8; 4],
+) {
+    draw_image_layer(
+        mask_rgba,
+        mask_width,
+        mask_height,
+        dest,
+        dest_width,
+        dest_height,
+        box_x,
+        box_y,
+        box_w,
+        box_h,
+        size,
+        position,
+        repeat,
+        Some(color),
+    )
+}
+
+/// Lay a picture over a box, tiled and positioned as CSS says.
+///
+/// `tint` is what separates a background from a mask. Without one the picture
+/// paints itself; with one the picture supplies only its alpha and the colour
+/// comes from the caller.
+#[allow(clippy::too_many_arguments)]
+fn draw_image_layer(
+    src_rgba: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    box_x: f32,
+    box_y: f32,
+    box_w: f32,
+    box_h: f32,
+    size: BackgroundSize,
+    position: BackgroundPosition,
+    repeat: BackgroundRepeat,
+    tint: Option<[u8; 4]>,
+) {
     let Some((tile_w, tile_h)) =
         background_tile_size(size, src_width as f32, src_height as f32, box_w, box_h)
     else {
@@ -1324,6 +1406,7 @@ pub fn draw_background_image(
                 box_y,
                 box_w,
                 box_h,
+                tint,
             );
             if !repeat_x {
                 break;
@@ -1365,6 +1448,9 @@ fn composite_image_clipped(
     clip_y: f32,
     clip_w: f32,
     clip_h: f32,
+    // A colour to paint through the source's alpha instead of the source's own
+    // pixels — see `draw_masked_color`.
+    tint: Option<[u8; 4]>,
 ) {
     if src_width == 0 || src_height == 0 || tile_w <= 0.0 || tile_h <= 0.0 {
         return;
@@ -1400,12 +1486,18 @@ fn composite_image_clipped(
             if src_idx + 3 >= src_rgba.len() || dst_idx + 3 >= dest.len() {
                 continue;
             }
-            let color = [
-                src_rgba[src_idx],
-                src_rgba[src_idx + 1],
-                src_rgba[src_idx + 2],
-                src_rgba[src_idx + 3],
-            ];
+            let alpha = src_rgba[src_idx + 3];
+            let color = match tint {
+                // The mask's alpha decides how much of the colour lands, and
+                // the colour's own alpha still applies on top of it.
+                Some([r, g, b, a]) => [r, g, b, ((alpha as u16 * a as u16) / 255) as u8],
+                None => [
+                    src_rgba[src_idx],
+                    src_rgba[src_idx + 1],
+                    src_rgba[src_idx + 2],
+                    alpha,
+                ],
+            };
             blend_pixel(dest, dst_idx, color, 1.0);
         }
     }
@@ -2039,6 +2131,104 @@ mod tests {
             0, 0, 255, 255, // (0,1) blue
             255, 255, 255, 255, // (1,1) white
         ]
+    }
+
+    /// A 2x2 mask: the left column opaque, the right column clear.
+    fn tiny_mask() -> Vec<u8> {
+        vec![
+            9, 9, 9, 255, // (0,0) opaque — colour lands here
+            9, 9, 9, 0, // (1,0) clear
+            9, 9, 9, 255, // (0,1) opaque
+            9, 9, 9, 0, // (1,1) clear
+        ]
+    }
+
+    /// The colour comes from the box, the shape from the mask. An icon drawn
+    /// this way is one file recoloured per state, so painting the mask's own
+    /// pixels would give the icon whatever colour the file happened to be — and
+    /// filling the box first would leave a solid square behind the shape.
+    #[test]
+    fn a_mask_paints_the_box_colour_in_the_shape_of_the_picture() {
+        let mut dest = vec![0u8; 4 * 4 * 4];
+        draw_masked_color(
+            &tiny_mask(),
+            2,
+            2,
+            &mut dest,
+            4,
+            4,
+            0.0,
+            0.0,
+            4.0,
+            4.0,
+            BackgroundSize::Auto,
+            BackgroundPosition::default(),
+            BackgroundRepeat::NoRepeat,
+            [200, 100, 50, 255],
+        );
+
+        let pixel = |x: usize, y: usize| {
+            let i = (y * 4 + x) * 4;
+            [dest[i], dest[i + 1], dest[i + 2], dest[i + 3]]
+        };
+        assert_eq!(
+            pixel(0, 0),
+            [200, 100, 50, 255],
+            "the box's own colour, not the mask's"
+        );
+        assert_eq!(pixel(1, 1), [0, 0, 0, 0], "nothing where the mask is clear");
+    }
+
+    #[test]
+    fn a_translucent_mask_thins_the_colour_rather_than_hiding_it() {
+        // A soft edge on an icon is a half-opaque mask pixel. Painted over the
+        // page it has to come out part way between the page and the colour,
+        // which is what keeps the shape from looking cut out with scissors.
+        let half_opaque = vec![9, 9, 9, 128];
+        let mut dest = vec![255u8; 4]; // a white page
+        draw_masked_color(
+            &half_opaque,
+            1,
+            1,
+            &mut dest,
+            1,
+            1,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            BackgroundSize::Auto,
+            BackgroundPosition::default(),
+            BackgroundRepeat::NoRepeat,
+            [255, 0, 0, 255],
+        );
+        assert!(
+            (100..200).contains(&dest[1]),
+            "red at half strength over white is a pink, not a red and not a white: {dest:?}"
+        );
+    }
+
+    #[test]
+    fn a_background_image_still_paints_its_own_pixels() {
+        // The mask path and the background path share their tiling; this is the
+        // half that must not have picked up a tint.
+        let mut dest = vec![0u8; 4];
+        draw_background_image(
+            &[255, 0, 0, 255],
+            1,
+            1,
+            &mut dest,
+            1,
+            1,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            BackgroundSize::Auto,
+            BackgroundPosition::default(),
+            BackgroundRepeat::NoRepeat,
+        );
+        assert_eq!(dest, [255, 0, 0, 255]);
     }
 
     #[test]

@@ -978,6 +978,74 @@ mod tests {
         );
     }
 
+    /// A column stacks downwards. It used to be positioned the way a row is —
+    /// each item moved along the x axis by the *height* of the one before it —
+    /// so a column of boxes marched sideways across the page.
+    #[test]
+    fn a_flex_column_stacks_its_items_downwards() {
+        let page = Page::new(
+            "<html><body><div id='wrap'>
+                <div id='a'></div><div id='b'></div>
+             </div></body></html>",
+            "#wrap { display: flex; flex-direction: column; width: 200px }
+             #a { height: 20px } #b { height: 30px }",
+            800.0,
+            600.0,
+        );
+        let (a, b) = (rect_of(&page, "a"), rect_of(&page, "b"));
+        assert_eq!(a.x, b.x, "one above the other, not side by side");
+        assert_eq!(
+            b.y,
+            a.y + a.height,
+            "and the second starts where the first ends"
+        );
+        assert_eq!(
+            rect_of(&page, "wrap").height,
+            50.0,
+            "the column is as tall as what it stacked"
+        );
+    }
+
+    /// A flex container measured its height from its topmost child down. An
+    /// item pushed below the content edge — by alignment, or by a taller one
+    /// beside it — left that gap out, so the container came out shorter than
+    /// what it held and its content spilled past the bottom edge.
+    #[test]
+    fn a_flex_row_is_tall_enough_for_an_item_that_sits_low_in_it() {
+        let page = Page::new(
+            "<html><body><div id='wrap'>
+                <div id='tall'></div><div id='low'></div>
+             </div></body></html>",
+            "#wrap { display: flex; align-items: flex-end; width: 300px }
+             #tall { width: 50px; height: 80px }
+             #low { width: 50px; height: 20px }",
+            800.0,
+            600.0,
+        );
+        let wrap = rect_of(&page, "wrap");
+        let low = rect_of(&page, "low");
+        assert!(
+            low.y + low.height <= wrap.y + wrap.height + 0.5,
+            "the short item ends inside the container: item {low:?} in {wrap:?}"
+        );
+        assert!(wrap.height >= 80.0, "as tall as the tallest item: {wrap:?}");
+    }
+
+    #[test]
+    fn a_flex_item_with_a_top_margin_is_counted_from_above_it() {
+        // The outer edge of a box is its top less its margin. Adding the margin
+        // instead moved the edge inwards, and the container lost that much
+        // height.
+        let page = Page::new(
+            "<html><body><div id='wrap'><div id='a'></div></div></body></html>",
+            "#wrap { display: flex; width: 200px }
+             #a { width: 50px; height: 20px; margin-top: 30px }",
+            800.0,
+            600.0,
+        );
+        assert_eq!(rect_of(&page, "wrap").height, 50.0, "30 above, 20 of box");
+    }
+
     // -- Masked icons --
 
     /// An icon drawn as a mask: one shape, coloured by the box it sits in.

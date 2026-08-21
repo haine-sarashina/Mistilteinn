@@ -2439,12 +2439,13 @@ fn compute_flex_item_content_main_size(
 
 /// Compute the cross-axis size of a flex item.
 fn compute_flex_cross_size(item: &LayoutNode) -> f32 {
+    // The border box either way. Both callers want the size the item occupies
+    // across the line — one adds the cross margins to it for packing, the other
+    // writes it back as the item's height — and returning the content height in
+    // one branch and the border box in the other made the two disagree by the
+    // padding.
     if item.rect.height > 0.0 {
-        return item.rect.height
-            - item.padding[0]
-            - item.padding[2]
-            - item.border[0]
-            - item.border[2];
+        return item.rect.height;
     }
     compute_block_height(item, 0)
         + item.padding[0]
@@ -2719,10 +2720,19 @@ fn compute_flex_children(
     }
 
     // --- Step 5: Position children by line ---
-    let mut current_cross_pos = parent_y; // Tracks cross-axis position across lines
+    // Which way each axis runs depends on the direction. A row's main axis is
+    // horizontal and its lines stack downwards; a column's are the other way
+    // round. Positioning every item the row way regardless is what laid a
+    // column out sideways — its items marched across the page, each one moved
+    // along by the height of the one before it.
+    let mut current_cross_pos = if is_row { parent_y } else { parent_x };
 
     for line in &lines {
-        let mut current_main_pos = if is_reverse && is_row {
+        let mut current_main_pos = if !is_row {
+            // A column's height is auto, so `column-reverse` has no bottom edge
+            // to count back from and starts at the top like any other column.
+            parent_y
+        } else if is_reverse {
             parent_x + available_width // Start from right for row-reverse
         } else {
             parent_x
@@ -2742,15 +2752,17 @@ fn compute_flex_children(
                 child.rect.x = current_main_pos + child.margin[3];
                 child.rect.y = current_cross_pos + child.margin[0];
                 child.rect.width = main_content_size;
-                child.rect.height = cross_content + child.margin[0] + child.margin[2];
+                // The box, not the box plus the room around it: a margin is
+                // not part of what it measures.
+                child.rect.height = cross_content;
             } else {
                 // Column: main=vertical, cross=horizontal. The margins that
                 // eat into the width are the horizontal ones — the main-axis
                 // pair is top and bottom, which take nothing from it.
                 let cross_margin = child.margin[1] + child.margin[3];
                 let child_width = (available_width - cross_margin).max(0.0);
-                child.rect.x = current_main_pos + child.margin[3];
-                child.rect.y = current_cross_pos + child.margin[0];
+                child.rect.x = current_cross_pos + child.margin[3];
+                child.rect.y = current_main_pos + child.margin[0];
                 child.rect.width = child_width;
                 child.rect.height = main_content_size;
             }
@@ -3044,9 +3056,12 @@ fn compute_flex_children(
 
     // --- Step 10: Update parent height based on all children extent ---
     let mut min_child_y = f32::MAX;
-    let mut max_child_bottom = 0.0;
+    let mut max_child_bottom = parent_y;
     for child in &parent.children {
-        let top = child.rect.y + child.margin[0];
+        // A child's outer edges are its box less its top margin and plus its
+        // bottom one. Adding the top margin instead put the outer edge inside
+        // the box, which is the wrong direction.
+        let top = child.rect.y - child.margin[0];
         let bottom = child.rect.bottom() + child.margin[2];
         if top < min_child_y {
             min_child_y = top;
@@ -3063,10 +3078,13 @@ fn compute_flex_children(
             child.rect.y += shift;
         }
         max_child_bottom += shift;
-        min_child_y = parent_y;
     }
 
-    let content_height = (max_child_bottom - min_child_y).max(0.0);
+    // Measured from the container's own content edge rather than from its
+    // topmost child: a child pushed down — by alignment, or by a taller one
+    // beside it — still stands on the space above it, and a container measured
+    // from the child down comes out shorter than what it holds.
+    let content_height = (max_child_bottom - parent_y).max(0.0);
     parent.rect.height = content_height
         + parent.padding[0]
         + parent.border[0]

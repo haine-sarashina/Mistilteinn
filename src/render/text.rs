@@ -120,6 +120,13 @@ pub struct TextRenderer {
     /// System families that cover CJK, appended to the stack for runs that
     /// need them. See [`TextRenderer::resolve_stack`].
     cjk_fallback: Vec<String>,
+    /// Ascent/descent/leading by family, then by font size in bits.
+    ///
+    /// Inline layout asks for these once per line box, and the answer for a
+    /// given family and size never changes. Laying a probe string out each
+    /// time cost about 10ms over ja.wikipedia.org's 500-odd lines. Nested so
+    /// the outer lookup can borrow the family rather than build a key.
+    line_metrics_cache: rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<u32, (f32, f32, f32)>>,
 }
 
 /// Whether a character lives in one of the CJK blocks.
@@ -169,6 +176,7 @@ impl TextRenderer {
             layout_ctx: LayoutContext::new(),
             web_font_aliases: rustc_hash::FxHashMap::default(),
             cjk_fallback: Vec::new(),
+            line_metrics_cache: rustc_hash::FxHashMap::default(),
         };
         renderer.cjk_fallback = renderer.discover_cjk_fallback();
         renderer.install_web_fonts();
@@ -226,6 +234,9 @@ impl TextRenderer {
                     .insert(font.css_family.clone(), name.to_string());
             }
         }
+        // A stack that fell through to a system face may now resolve to a
+        // downloaded one with different metrics.
+        self.line_metrics_cache.clear();
     }
 
     /// Prepare a font stack for one run of text.
@@ -353,6 +364,57 @@ impl TextRenderer {
         let height = layout.height();
 
         (width, height)
+    }
+
+    /// What the chosen font says about the space a line of it needs:
+    /// `(ascent, descent, line_gap)` in pixels at `font_size`.
+    ///
+    /// Inline layout used `font_size * 0.8` for the ascent and `* 1.4` for the
+    /// height, which is a guess that happens to suit a Latin face at a default
+    /// size. A Japanese face is taller above the baseline and deeper below it,
+    /// so text sat high in its line and descenders were clipped by whatever
+    /// came after.
+    ///
+    /// Measured on a probe string carrying both an ascender and a descender,
+    /// so the fallback chain resolves the same way it will when the real text
+    /// is laid out.
+    pub fn line_metrics(&mut self, font_size: f32, family: &str) -> (f32, f32, f32) {
+        const PROBE: &str = "Hgp";
+        let size_key = font_size.to_bits();
+        if let Some(hit) = self
+            .line_metrics_cache
+            .get(family)
+            .and_then(|by_size| by_size.get(&size_key))
+        {
+            return *hit;
+        }
+        let key = family.to_string();
+        let family = self.resolve_stack(family, PROBE);
+        let mut builder = self
+            .layout_ctx
+            .ranged_builder(&mut self.font_ctx, PROBE, 1.0);
+        builder.push_default(parley::StyleProperty::FontSize(font_size));
+        builder.push_default(parley::StyleProperty::FontStack(family.as_ref().into()));
+        // The gap the font asks for, not a multiplier of our own: `line-height`
+        // is the page's business and is applied by the caller.
+        builder.push_default(parley::StyleProperty::LineHeight(1.0));
+        let mut layout: Layout<()> = builder.build(PROBE);
+        layout.break_all_lines(None);
+
+        let metrics = match layout.lines().next() {
+            Some(line) => {
+                let m = line.metrics();
+                (m.ascent, m.descent, m.leading)
+            }
+            // No line means no font answered. Fall back to the old ratios
+            // rather than to zero, which would collapse every line.
+            None => (font_size * 0.8, font_size * 0.2, 0.0),
+        };
+        self.line_metrics_cache
+            .entry(key)
+            .or_default()
+            .insert(size_key, metrics);
+        metrics
     }
 
     /// Layout text runs and return the computed dimensions.

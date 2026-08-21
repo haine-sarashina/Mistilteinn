@@ -347,7 +347,7 @@ fn inherit_properties(
         child.font_family = parent.font_family.clone();
     }
     // `line-height` inherits
-    if child.line_height == 1.2 && parent.line_height != 1.2 {
+    if child.line_height == DEFAULT_LINE_HEIGHT && parent.line_height != DEFAULT_LINE_HEIGHT {
         child.line_height = parent.line_height;
     }
     // `text-align` inherits
@@ -1719,6 +1719,13 @@ impl BorderStyle {
     }
 }
 
+/// What `line-height: normal` computes to, as a multiple of the font size.
+///
+/// The real answer is the font's own preferred line spacing, which varies by
+/// face; 1.2 is the conventional stand-in and what this engine uses until the
+/// metrics reach the cascade.
+pub const DEFAULT_LINE_HEIGHT: f32 = 1.2;
+
 /// The `medium` border width, used when a side declares a style but no width.
 const MEDIUM_BORDER_WIDTH: f32 = 3.0;
 
@@ -2629,7 +2636,7 @@ impl Default for ComputedValues {
             width_intrinsic: None,
             min_height: None,
             max_height: None,
-            line_height: 1.2,
+            line_height: DEFAULT_LINE_HEIGHT,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
             position: PositionType::Static,
@@ -3263,7 +3270,7 @@ impl ComputedValues {
             }
             "line-height" => {
                 if val.eq_ignore_ascii_case("normal") {
-                    self.line_height = 1.2; // CSS default for normal
+                    self.line_height = DEFAULT_LINE_HEIGHT; // CSS default for normal
                 } else if let Ok(v) = val.parse::<f32>() {
                     // Unitless number → normalized multiplier
                     self.line_height = v;

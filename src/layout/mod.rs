@@ -226,6 +226,13 @@ pub struct LayoutNode {
     /// Min/max width constraints
     pub min_width: Option<f32>,
     pub max_width: Option<f32>,
+    /// The container's `line-height`, as a multiple of its font size.
+    ///
+    /// A line box is this tall whatever the glyphs in it measure — that is what
+    /// the property is for. Inline layout used a fixed 1.4 and never read the
+    /// page's value at all, so ja.wikipedia.org's `line-height: 1.6` body text
+    /// came out a tenth too tight.
+    pub line_height: f32,
     /// Min/max height constraints, applied by [`clamp_height`] wherever a
     /// box's height has just been settled.
     pub min_height: Option<f32>,
@@ -384,6 +391,7 @@ impl LayoutNode {
             min_width_percent: None,
             max_width_percent: None,
             width_intrinsic: None,
+            line_height: crate::css::DEFAULT_LINE_HEIGHT,
             min_height: None,
             max_height: None,
             explicit_height: None,
@@ -815,6 +823,7 @@ fn build_layout_children<N, F>(
                     layout_node.min_width_percent = child_styles.min_width_percent;
                     layout_node.max_width_percent = child_styles.max_width_percent;
                     layout_node.width_intrinsic = child_styles.width_intrinsic;
+                    layout_node.line_height = child_styles.line_height;
                     layout_node.min_height = child_styles.min_height;
                     layout_node.max_height = child_styles.max_height;
 
@@ -1075,6 +1084,7 @@ fn build_layout_children<N, F>(
                         layout_node.min_width_percent = child_styles.min_width_percent;
                         layout_node.max_width_percent = child_styles.max_width_percent;
                         layout_node.width_intrinsic = child_styles.width_intrinsic;
+                        layout_node.line_height = child_styles.line_height;
                         layout_node.min_height = child_styles.min_height;
                         layout_node.max_height = child_styles.max_height;
                         if let Some(w) = child_styles.explicit_width {
@@ -1856,6 +1866,7 @@ fn compute_block_children(
                     float_ctx,
                     parent_x,
                     y,
+                    parent.line_height,
                 );
 
                 // Visual order first, then alignment: the shift is measured from
@@ -4781,10 +4792,13 @@ fn tokenize_text_for_line_breaking(text: &str) -> Vec<LineBreakToken<'_>> {
 /// Whitespace at line boundaries is collapsed.
 ///
 /// Baseline alignment:
-/// - The line's reference baseline is determined by the largest font size on the line.
-/// - `ascender` = max_font_size * 0.8, `descender` = max_font_size * 0.2.
-/// - Line height = ascender + descender + leading (= max_font_size * 1.2).
-/// - `baseline_y = y + ascender`.
+/// - The line's reference font is the largest one on it, and that font's own
+///   ascent and descent say where the baseline sits — not a fixed fraction of
+///   the size. The fraction was 0.8 for every face; a real one is nearer
+///   0.875 for a Latin sans and higher again for a Japanese face, so text sat
+///   over a pixel high in its line at body size.
+/// - The line is `line_height` tall, and the difference between that and what
+///   the glyphs need is split evenly above and below them — CSS half-leading.
 /// - Smaller text shares the same baseline; its shorter ascender means it sits
 ///   visually above the shared baseline, which matches CSS inline alignment.
 /// - Inline elements get `baseline_offset = element_height * 0.7` (typical vertical-align baseline).
@@ -4795,6 +4809,7 @@ pub fn break_into_lines(
     float_ctx: &mut FloatContext,
     parent_x: f32,
     parent_global_y: f32,
+    line_height: f32,
 ) -> Vec<LineBox> {
     let mut line_boxes = Vec::new();
     let mut current_line_boxes: Vec<InlineBox> = Vec::new();
@@ -4806,13 +4821,17 @@ pub fn break_into_lines(
     let (mut current_line_x_offset, mut current_available_width) =
         float_ctx.get_line_constraints(parent_global_y + line_y, 20.0, parent_x, available_width);
 
-    // Helper to flush the current line into a LineBox
+    // Helper to flush the current line into a LineBox.
+    //
+    // Takes the renderer rather than capturing it: measuring the line's font
+    // needs it mutably, and so does the wrapping loop below.
     let flush_line = |line_boxes: &mut Vec<LineBox>,
                       boxes: &mut Vec<InlineBox>,
                       width: &mut f32,
                       max_font_size: &mut f32,
                       line_y: &mut f32,
-                      current_line_x_offset: f32| {
+                      current_line_x_offset: f32,
+                      text_renderer: &mut crate::render::text::TextRenderer| {
         // Remove trailing collapsible whitespace before flushing
         while let Some(InlineBox::Whitespace {
             collapsible: true, ..
@@ -4834,19 +4853,46 @@ pub fn break_into_lines(
             }
         }
 
-        let ref_font = if *max_font_size > 0.0 {
-            *max_font_size
-        } else {
-            16.0
-        };
-        let font_ascender = ref_font * 0.8;
-        let font_height = ref_font * 1.4;
+        // The largest text on the line sets the baseline, and its own font
+        // says where that baseline falls.
+        let mut ref_font = 0.0f32;
+        let mut ref_family = crate::css::DEFAULT_FONT_FAMILY.to_string();
+        for b in boxes.iter() {
+            if let InlineBox::Text {
+                font_size,
+                font_family,
+                ..
+            } = b
+                && *font_size > ref_font
+            {
+                ref_font = *font_size;
+                ref_family = font_family.clone();
+            }
+        }
+        if ref_font <= 0.0 {
+            ref_font = if *max_font_size > 0.0 {
+                *max_font_size
+            } else {
+                16.0
+            };
+        }
+
+        let (ascent, descent, _) =
+            text_renderer.line_metrics(ref_font, crate::css::font_stack_or_default(&ref_family));
+        // The glyphs need `ascent + descent`; the line is `line-height` tall.
+        // The difference is leading, split evenly above and below — so raising
+        // `line-height` pushes the text down as much as it pushes the next
+        // line away, which is what keeps a paragraph looking centred in its
+        // leading rather than riding the top of every line.
+        let content_height = ascent + descent;
+        let font_height = (ref_font * line_height).max(content_height);
+        let half_leading = (font_height - content_height) / 2.0;
 
         let height = font_height.max(max_elem_height);
         let ascender = if max_elem_height > font_height {
             max_elem_height
         } else {
-            font_ascender
+            half_leading + ascent
         };
         let baseline_y = *line_y + ascender;
 
@@ -4911,6 +4957,7 @@ pub fn break_into_lines(
                                     &mut current_line_max_font_size,
                                     &mut line_y,
                                     current_line_x_offset,
+                                    text_renderer,
                                 );
                                 let constraints = float_ctx.get_line_constraints(
                                     parent_global_y + line_y,
@@ -4962,6 +5009,7 @@ pub fn break_into_lines(
                         &mut current_line_max_font_size,
                         &mut line_y,
                         current_line_x_offset,
+                        text_renderer,
                     );
                 }
 
@@ -5012,6 +5060,7 @@ pub fn break_into_lines(
                             &mut current_line_max_font_size,
                             &mut line_y,
                             current_line_x_offset,
+                            text_renderer,
                         );
                         let constraints = float_ctx.get_line_constraints(
                             parent_global_y + line_y,
@@ -5048,6 +5097,7 @@ pub fn break_into_lines(
                     &mut current_line_max_font_size,
                     &mut line_y,
                     current_line_x_offset,
+                    text_renderer,
                 );
                 let constraints = float_ctx.get_line_constraints(
                     parent_global_y + line_y,
@@ -5070,6 +5120,7 @@ pub fn break_into_lines(
             &mut current_line_max_font_size,
             &mut line_y,
             current_line_x_offset,
+            text_renderer,
         );
     }
 
@@ -5177,6 +5228,7 @@ fn generated_box(style: &ComputedValues, text: String) -> LayoutNode {
     node.min_width_percent = style.min_width_percent;
     node.max_width_percent = style.max_width_percent;
     node.width_intrinsic = style.width_intrinsic;
+    node.line_height = style.line_height;
     node.min_height = style.min_height;
     node.max_height = style.max_height;
     if let Some(width) = style.width {
@@ -8939,12 +8991,25 @@ mod tests {
         let boxes = vec![InlineBox::test_text("Hello", 16.0)];
 
         let mut float_ctx = FloatContext::new();
-        let lines = break_into_lines(boxes, 800.0, &mut renderer, &mut float_ctx, 0.0, 0.0);
+        let lines = break_into_lines(
+            boxes,
+            800.0,
+            &mut renderer,
+            &mut float_ctx,
+            0.0,
+            0.0,
+            crate::css::DEFAULT_LINE_HEIGHT,
+        );
 
         assert_eq!(lines.len(), 1, "Short text should fit on one line");
         assert!(!lines[0].boxes.is_empty(), "Line should contain boxes");
-        // Line height should be font_size * 1.4 = 22.4
-        assert!((lines[0].height - 16.0 * 1.4).abs() < 0.5);
+        // The line is as tall as `line-height` asks, which for the default
+        // 1.2 at 16px is 19.2 — unless the font's own glyphs need more.
+        assert!(
+            lines[0].height >= 16.0 * crate::css::DEFAULT_LINE_HEIGHT - 0.01,
+            "line height should honour line-height, got {}",
+            lines[0].height
+        );
     }
 
     #[test]
@@ -8960,7 +9025,15 @@ mod tests {
 
         // A narrow width that forces wrapping (each word ~30-70px)
         let mut float_ctx = FloatContext::new();
-        let lines = break_into_lines(boxes, 80.0, &mut renderer, &mut float_ctx, 0.0, 0.0);
+        let lines = break_into_lines(
+            boxes,
+            80.0,
+            &mut renderer,
+            &mut float_ctx,
+            0.0,
+            0.0,
+            crate::css::DEFAULT_LINE_HEIGHT,
+        );
 
         assert!(
             lines.len() > 1,
@@ -8988,7 +9061,15 @@ mod tests {
         ];
 
         let mut float_ctx = FloatContext::new();
-        let lines = break_into_lines(boxes, 800.0, &mut renderer, &mut float_ctx, 0.0, 0.0);
+        let lines = break_into_lines(
+            boxes,
+            800.0,
+            &mut renderer,
+            &mut float_ctx,
+            0.0,
+            0.0,
+            crate::css::DEFAULT_LINE_HEIGHT,
+        );
 
         assert_eq!(lines.len(), 1);
         // Leading whitespace should be skipped, trailing trimmed during flush
@@ -9011,7 +9092,15 @@ mod tests {
 
         // Very narrow container - word won't fit but should not be split
         let mut float_ctx = FloatContext::new();
-        let lines = break_into_lines(boxes, 30.0, &mut renderer, &mut float_ctx, 0.0, 0.0);
+        let lines = break_into_lines(
+            boxes,
+            30.0,
+            &mut renderer,
+            &mut float_ctx,
+            0.0,
+            0.0,
+            crate::css::DEFAULT_LINE_HEIGHT,
+        );
 
         assert_eq!(lines.len(), 1, "Single word should not be split");
         assert!(
@@ -9045,19 +9134,30 @@ mod tests {
         ];
 
         let mut float_ctx = FloatContext::new();
-        let lines = break_into_lines(boxes, 800.0, &mut renderer, &mut float_ctx, 0.0, 0.0);
+        let lines = break_into_lines(
+            boxes,
+            800.0,
+            &mut renderer,
+            &mut float_ctx,
+            0.0,
+            0.0,
+            crate::css::DEFAULT_LINE_HEIGHT,
+        );
 
         assert_eq!(lines.len(), 1, "Same-size text fits on one line");
-        // All text is 16px ↁEmax_font_size = 16.0
-        // ascender = 16.0 * 0.8 = 12.8, baseline_y = 0 + 12.8 = 12.8
+        // The baseline is where the reference font puts it: half the leading,
+        // then that font's ascent. Which font answers depends on the machine,
+        // so this checks the relationship rather than a number.
+        let (ascent, descent, _) = renderer.line_metrics(16.0, crate::css::DEFAULT_FONT_FAMILY);
+        let expected = ((lines[0].height - (ascent + descent)) / 2.0).max(0.0) + ascent;
         assert!(
-            (lines[0].baseline_y - 12.8).abs() < 0.5,
-            "Baseline should be at ascender (= font_size * 0.8)"
+            (lines[0].baseline_y - expected).abs() < 0.01,
+            "baseline should be half-leading + the font's ascent: got {}, expected {expected}",
+            lines[0].baseline_y
         );
-        // Line height = 16.0 * 1.4 = 22.4
         assert!(
-            (lines[0].height - 16.0 * 1.4).abs() < 0.5,
-            "Line height should be font_size * 1.4"
+            lines[0].baseline_y > 16.0 * 0.8,
+            "a real ascent is more than the 0.8 of the size this used to assume"
         );
     }
 
@@ -9076,20 +9176,31 @@ mod tests {
         ];
 
         let mut float_ctx = FloatContext::new();
-        let lines = break_into_lines(boxes, 800.0, &mut renderer, &mut float_ctx, 0.0, 0.0);
+        let lines = break_into_lines(
+            boxes,
+            800.0,
+            &mut renderer,
+            &mut float_ctx,
+            0.0,
+            0.0,
+            crate::css::DEFAULT_LINE_HEIGHT,
+        );
 
         assert_eq!(lines.len(), 1, "Mixed-size text fits on one line");
-        // max_font_size = 24.0 (largest)
-        // ascender = 24.0 * 0.8 = 19.2
-        // baseline_y = 0 + 19.2 = 19.2
+        // The largest text on the line sets both, so the answer must match
+        // what 24px alone would give — the 12px run changes nothing.
+        let (ascent, descent, _) = renderer.line_metrics(24.0, crate::css::DEFAULT_FONT_FAMILY);
+        let expected_height = (24.0f32 * crate::css::DEFAULT_LINE_HEIGHT).max(ascent + descent);
         assert!(
-            (lines[0].baseline_y - 19.2).abs() < 0.5,
-            "Baseline should be set by largest font (24px * 0.8 = 19.2)"
+            (lines[0].height - expected_height).abs() < 0.01,
+            "the tallest text sets the line height: got {}, expected {expected_height}",
+            lines[0].height
         );
-        // height = 24.0 * 1.4 = 33.6
+        let expected_baseline = ((expected_height - (ascent + descent)) / 2.0).max(0.0) + ascent;
         assert!(
-            (lines[0].height - 24.0 * 1.4).abs() < 0.5,
-            "Line height should be max_font_size * 1.4"
+            (lines[0].baseline_y - expected_baseline).abs() < 0.01,
+            "baseline should be set by the largest font: got {}, expected {expected_baseline}",
+            lines[0].baseline_y
         );
     }
 
@@ -9129,7 +9240,15 @@ mod tests {
         let boxes = vec![InlineBox::test_element(0, 50.0, 40.0)];
 
         let mut float_ctx = FloatContext::new();
-        let lines = break_into_lines(boxes, 800.0, &mut renderer, &mut float_ctx, 0.0, 0.0);
+        let lines = break_into_lines(
+            boxes,
+            800.0,
+            &mut renderer,
+            &mut float_ctx,
+            0.0,
+            0.0,
+            crate::css::DEFAULT_LINE_HEIGHT,
+        );
 
         assert_eq!(lines.len(), 1);
         match &lines[0].boxes[0] {
@@ -10672,6 +10791,80 @@ mod tests {
         assert_eq!(
             inner.rect.width, outer.rect.width,
             "the inner box fills its parent's content width"
+        );
+    }
+
+    // ------ W3-5: line height and baseline ------
+
+    #[test]
+    fn a_line_is_as_tall_as_line_height_asks() {
+        // The property was parsed and then dropped: inline layout used a fixed
+        // 1.4 whatever the page said, so ja.wikipedia.org's `line-height: 1.6`
+        // body text came out a tenth too tight.
+        let mut renderer = crate::render::text::TextRenderer::new();
+        let mut heights = Vec::new();
+        for lh in [1.0f32, 1.6, 2.4] {
+            let mut float_ctx = FloatContext::new();
+            let lines = break_into_lines(
+                vec![InlineBox::test_text("Hello", 16.0)],
+                800.0,
+                &mut renderer,
+                &mut float_ctx,
+                0.0,
+                0.0,
+                lh,
+            );
+            heights.push(lines[0].height);
+        }
+        assert!(
+            heights[0] < heights[1] && heights[1] < heights[2],
+            "a taller line-height must make a taller line: {heights:?}"
+        );
+        assert!(
+            (heights[2] - 16.0 * 2.4).abs() < 0.01,
+            "line-height 2.4 at 16px is 38.4, got {}",
+            heights[2]
+        );
+    }
+
+    #[test]
+    fn leading_is_split_evenly_above_and_below_the_text() {
+        // Raising `line-height` pushes the text down as much as it pushes the
+        // next line away. Adding it all below would ride every line's top.
+        let mut renderer = crate::render::text::TextRenderer::new();
+        let (ascent, descent, _) = renderer.line_metrics(16.0, crate::css::DEFAULT_FONT_FAMILY);
+        let mut float_ctx = FloatContext::new();
+        let lines = break_into_lines(
+            vec![InlineBox::test_text("Hello", 16.0)],
+            800.0,
+            &mut renderer,
+            &mut float_ctx,
+            0.0,
+            0.0,
+            3.0,
+        );
+        let line = &lines[0];
+        let above = line.baseline_y - ascent;
+        let below = line.height - line.baseline_y - descent;
+        assert!(
+            (above - below).abs() < 0.01,
+            "leading should be split evenly: {above} above, {below} below"
+        );
+    }
+
+    #[test]
+    fn the_baseline_follows_the_font_not_a_fixed_fraction() {
+        // Two faces with different metrics must put the baseline in different
+        // places at the same size. If they agree exactly, the metrics are not
+        // being read.
+        let mut renderer = crate::render::text::TextRenderer::new();
+        let (sans_a, sans_d, _) = renderer.line_metrics(16.0, "sans-serif");
+        let (mono_a, mono_d, _) = renderer.line_metrics(16.0, "monospace");
+        assert!(sans_a > 0.0 && sans_d > 0.0, "a font must report metrics");
+        assert!(mono_a > 0.0 && mono_d > 0.0, "a font must report metrics");
+        assert!(
+            sans_a > 16.0 * 0.8,
+            "a real sans ascent is more than the 0.8 of the size this used to assume, got {sans_a}"
         );
     }
 

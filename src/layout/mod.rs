@@ -299,6 +299,14 @@ pub struct LayoutNode {
     /// as one picture.
     pub filter: crate::css::Filter,
     pub is_line_break: bool,
+    /// Whether this box is a list item whose marker sits beside it rather than
+    /// in its text, and so needs its first line pulled left over the marker.
+    /// See [`place_list_markers`].
+    pub outside_marker: bool,
+    /// What the first list item inside this box is numbered — `<ol start>`.
+    /// Ordinary boxes carry 1, which is what an unnumbered list would count
+    /// from anyway.
+    pub list_start: i32,
 }
 
 impl LayoutNode {
@@ -372,6 +380,8 @@ impl LayoutNode {
             cursor: crate::css::Cursor::Auto,
             z_index: None,
             is_line_break: false,
+            outside_marker: false,
+            list_start: 1,
         }
     }
 
@@ -648,6 +658,9 @@ fn build_layout_children<N, F>(
         DisplayType::Flex | DisplayType::InlineFlex | DisplayType::Grid
     );
     let mut anon_block: Option<LayoutNode> = None;
+    // What the next list item among these siblings is numbered. `<ol start>`
+    // moves the first one; a `value` on an item moves it and everything after.
+    let mut next_ordinal = parent.list_start;
 
     for &child_id in child_ids {
         if let Some(node) = get_node(child_id) {
@@ -845,6 +858,15 @@ fn build_layout_children<N, F>(
 
                     // Handle <input> / <textarea> / <button> text and default sizing
                     apply_form_control_defaults(&tag, &node, &mut layout_node, get_node);
+                    // `<ol start="5">` numbers its first item 5. Read here
+                    // rather than by the items, which cannot see the list they
+                    // are in from where they are built.
+                    if let Some(start) = node
+                        .get_attr("start")
+                        .and_then(|v| v.trim().parse::<i32>().ok())
+                    {
+                        layout_node.list_start = start;
+                    }
                     apply_media_defaults(&tag, &node, &mut layout_node, &child_styles);
                     apply_canvas_defaults(&tag, &node, &mut layout_node, &child_styles);
                     apply_frame_defaults(&tag, &node, &mut layout_node, &child_styles);
@@ -876,6 +898,16 @@ fn build_layout_children<N, F>(
                             );
                         }
                         attach_generated_content(&mut layout_node, child_id, styles, &node);
+                        if child_styles.list_item {
+                            if let Some(value) = node
+                                .get_attr("value")
+                                .and_then(|v| v.trim().parse::<i32>().ok())
+                            {
+                                next_ordinal = value;
+                            }
+                            attach_list_marker(&mut layout_node, &child_styles, next_ordinal);
+                            next_ordinal += 1;
+                        }
                     }
 
                     let is_empty_whitespace = layout_node
@@ -1024,6 +1056,15 @@ fn build_layout_children<N, F>(
                         _ => InteractionType::None,
                     };
                     apply_form_control_defaults(&tag, &node, &mut layout_node, get_node);
+                    // `<ol start="5">` numbers its first item 5. Read here
+                    // rather than by the items, which cannot see the list they
+                    // are in from where they are built.
+                    if let Some(start) = node
+                        .get_attr("start")
+                        .and_then(|v| v.trim().parse::<i32>().ok())
+                    {
+                        layout_node.list_start = start;
+                    }
                     apply_media_defaults(&tag, &node, &mut layout_node, &child_styles);
                     apply_canvas_defaults(&tag, &node, &mut layout_node, &child_styles);
                     apply_frame_defaults(&tag, &node, &mut layout_node, &child_styles);
@@ -1055,6 +1096,16 @@ fn build_layout_children<N, F>(
                             );
                         }
                         attach_generated_content(&mut layout_node, child_id, styles, &node);
+                        if child_styles.list_item {
+                            if let Some(value) = node
+                                .get_attr("value")
+                                .and_then(|v| v.trim().parse::<i32>().ok())
+                            {
+                                next_ordinal = value;
+                            }
+                            attach_list_marker(&mut layout_node, &child_styles, next_ordinal);
+                            next_ordinal += 1;
+                        }
                     }
 
                     let is_empty_whitespace = layout_node
@@ -3535,6 +3586,128 @@ pub fn selected_option_label(options: &[(u32, String, bool)]) -> Option<String> 
         .find(|(_, _, selected)| *selected)
         .or_else(|| options.first())
         .map(|(_, label, _)| label.clone())
+}
+
+/// Put a list item's marker at the front of its content.
+///
+/// The marker is an ordinary inline text box, so it is measured, coloured and
+/// painted by the same machinery as the item's own words — nothing downstream
+/// has to know it is a marker.
+///
+/// Where it ends up is the difference between the two `list-style-position`
+/// values. `inside` is done here and needs nothing else: the marker is the
+/// first thing on the line and the text follows it. `outside` is finished after
+/// layout by [`place_list_markers`], which pulls the first line left by exactly
+/// the width of the marker and the gap after it, so the marker lands in the
+/// space the list's padding left for it and the item's text starts on the
+/// content edge like every wrapped line below it.
+fn attach_list_marker(item: &mut LayoutNode, style: &ComputedValues, ordinal: i32) {
+    let kind = style.list_style_type.unwrap_or_default();
+    let Some(text) = kind.marker_text(ordinal) else {
+        return;
+    };
+
+    let font_size = item.font_size;
+    let font_family = item.font_family.clone();
+    let color = item.color;
+    let text_style = item.text_style;
+    let dom_node_id = item.dom_node_id;
+    let outside =
+        style.list_style_position.unwrap_or_default() == crate::css::ListStylePosition::Outside;
+    let item = marker_host(item);
+
+    let mut marker =
+        LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Inline);
+    marker.text = Some(text);
+    marker.color = color;
+    marker.font_size = font_size;
+    marker.font_family = font_family.clone();
+    marker.dom_node_id = dom_node_id;
+
+    // The gap is its own box rather than a space in the marker's text: a
+    // trailing space would be collapsed away, and the width of the two
+    // together is what the outside pass has to measure.
+    let mut gap = LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Inline);
+    gap.text = Some(" ".to_string());
+    gap.font_size = font_size;
+    gap.font_family = font_family.clone();
+
+    // An item whose own text was flattened onto it needs that text in a box of
+    // its own first, or the marker would have nothing to sit in front of.
+    if let Some(own_text) = item.text.take() {
+        let mut text_box =
+            LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Inline);
+        text_box.text = Some(own_text);
+        text_box.color = color;
+        text_box.font_size = font_size;
+        text_box.font_family = font_family;
+        text_box.text_style = text_style;
+        text_box.dom_node_id = dom_node_id;
+        item.children.insert(0, text_box);
+    }
+
+    item.children.insert(0, gap);
+    item.children.insert(0, marker);
+    item.outside_marker = outside;
+}
+
+/// The box whose first line the marker belongs on.
+///
+/// Usually the item itself. An item built out of blocks — a `<li>` holding a
+/// `<p>` — has no line of its own for the marker to join, and putting it there
+/// anyway would make a line above the paragraph and push the whole item down by
+/// its height. The marker goes on the first line of the first block instead,
+/// which is where a reader expects to see it and where the item's text begins.
+fn marker_host(item: &mut LayoutNode) -> &mut LayoutNode {
+    let descend = item.children.first().is_some_and(|first| {
+        matches!(first.display, DisplayType::Block)
+            && first.position == PositionType::Static
+            && first.float == FloatType::None
+            && first.text.is_none()
+    });
+    if descend {
+        // Recursing rather than looping: the first block may itself be built
+        // out of blocks, and the line the marker wants is the first one that
+        // actually exists.
+        return marker_host(item.children.first_mut().expect("checked above"));
+    }
+    item
+}
+
+/// Pull every outside marker out of its item's text and into the margin.
+///
+/// Run after the lines are laid out, because that is when the marker's width is
+/// known — it is a measured text box like any other, and nothing before
+/// line breaking knows how wide a bullet or a two-digit number comes out.
+///
+/// Only the first line moves. The lines below it are the item's text wrapping,
+/// and they line up under the content edge rather than under the marker.
+pub fn place_list_markers(node: &mut LayoutNode) {
+    if node.outside_marker
+        && let Some(lines) = node.line_boxes.as_mut()
+        && let Some(first) = lines.first_mut()
+    {
+        // The marker and its gap are the first two boxes on the line, in the
+        // order they were put there.
+        let lead: f32 = first.boxes.iter().take(2).map(inline_box_width).sum();
+        first.x -= lead;
+    }
+    for child in node.children.iter_mut() {
+        place_list_markers(child);
+    }
+    for child in node.absolute_children.iter_mut() {
+        place_list_markers(child);
+    }
+}
+
+/// How much room one inline box takes along the line.
+fn inline_box_width(box_item: &InlineBox) -> f32 {
+    match box_item {
+        InlineBox::Text { width, .. } => *width,
+        InlineBox::Element { width, .. } => *width,
+        InlineBox::Whitespace { width, .. } => *width,
+        InlineBox::LineBreak => 0.0,
+    }
 }
 
 /// Apply the intrinsic text and default size of a form control.

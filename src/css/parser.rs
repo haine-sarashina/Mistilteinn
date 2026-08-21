@@ -554,20 +554,6 @@ pub struct MediaRule {
     pub rules: Vec<CSSRule>,
 }
 
-/// Whether a media query list matches the screen we are rendering to.
-///
-/// `condition` is everything after `@media`, or the value of a `<link>`'s
-/// `media` attribute — a comma-separated list of queries, matching if any one
-/// of them does.
-///
-/// Two rules matter more than the feature list:
-///
-/// * The **media type** is checked. Without that, `@media print` matched, and
-///   a page's print stylesheet — which is written to strip navigation and swap
-///   in a serif face — landed on top of its screen styles.
-/// * A feature whose value we cannot parse makes its query **false**, never
-///   true. CSS drops what it cannot understand; a query that fails open
-///   applies a `max-width: 640px` block to a 1280px window.
 /// What the media queries are being asked about: this window, right now.
 ///
 /// A struct rather than a pair of floats because a media feature can ask about
@@ -588,6 +574,20 @@ impl MediaContext {
     }
 }
 
+/// Whether a media query list matches the screen we are rendering to.
+///
+/// `condition` is everything after `@media`, or the value of a `<link>`'s
+/// `media` attribute — a comma-separated list of queries, matching if any one
+/// of them does.
+///
+/// Two rules matter more than the feature list:
+///
+/// * The **media type** is checked. Without that, `@media print` matched, and
+///   a page's print stylesheet — which is written to strip navigation and swap
+///   in a serif face — landed on top of its screen styles.
+/// * A feature whose value we cannot parse makes its query **false**, never
+///   true. CSS drops what it cannot understand; a query that fails open
+///   applies a `max-width: 640px` block to a 1280px window.
 pub fn evaluate_media_condition(condition: &str, ctx: MediaContext) -> bool {
     let condition = condition.trim();
     // `@media { … }` with nothing to say applies everywhere.

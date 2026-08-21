@@ -288,6 +288,14 @@ fn inherit_properties(
     if child.font_size == initial_font_size && parent.font_size != initial_font_size {
         child.font_size = parent.font_size;
     }
+    // The `list-style` properties inherit, which is how `ul { list-style-type:
+    // disc }` reaches the items rather than the list box that is never marked.
+    if child.list_style_type.is_none() {
+        child.list_style_type = parent.list_style_type;
+    }
+    if child.list_style_position.is_none() {
+        child.list_style_position = parent.list_style_position;
+    }
     // `font-family` inherits
     if child.font_family.is_empty() && !parent.font_family.is_empty() {
         child.font_family = parent.font_family.clone();
@@ -980,6 +988,143 @@ pub enum DisplayType {
     TableColumnGroup,
 }
 
+/// The computed `list-style-type` CSS property: what a list item is marked
+/// with.
+///
+/// The set a page actually reaches for. A keyword we do not know falls back to
+/// `Disc` rather than to nothing, because a list with no markers at all reads
+/// as a stack of paragraphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListStyleType {
+    None,
+    #[default]
+    Disc,
+    Circle,
+    Square,
+    Decimal,
+    DecimalLeadingZero,
+    LowerAlpha,
+    UpperAlpha,
+    LowerRoman,
+    UpperRoman,
+}
+
+impl ListStyleType {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Self::None,
+            "disc" => Self::Disc,
+            "circle" => Self::Circle,
+            "square" => Self::Square,
+            "decimal" => Self::Decimal,
+            "decimal-leading-zero" => Self::DecimalLeadingZero,
+            "lower-alpha" | "lower-latin" => Self::LowerAlpha,
+            "upper-alpha" | "upper-latin" => Self::UpperAlpha,
+            "lower-roman" => Self::LowerRoman,
+            "upper-roman" => Self::UpperRoman,
+            _ => return None,
+        })
+    }
+
+    /// The text drawn beside the item that is `ordinal` in its list.
+    ///
+    /// `None` where there is no marker to draw. The trailing dot on a number is
+    /// part of the marker, which is why this returns the whole string rather
+    /// than a glyph the caller has to dress.
+    pub fn marker_text(self, ordinal: i32) -> Option<String> {
+        Some(match self {
+            Self::None => return None,
+            Self::Disc => "\u{2022}".to_string(),
+            Self::Circle => "\u{25e6}".to_string(),
+            Self::Square => "\u{25aa}".to_string(),
+            Self::Decimal => format!("{ordinal}."),
+            Self::DecimalLeadingZero => {
+                if (0..10).contains(&ordinal) {
+                    format!("0{ordinal}.")
+                } else {
+                    format!("{ordinal}.")
+                }
+            }
+            Self::LowerAlpha => format!("{}.", alphabetic(ordinal, 'a')),
+            Self::UpperAlpha => format!("{}.", alphabetic(ordinal, 'A')),
+            Self::LowerRoman => format!("{}.", roman(ordinal).to_lowercase()),
+            Self::UpperRoman => format!("{}.", roman(ordinal)),
+        })
+    }
+}
+
+/// The bijective base-26 counter: a, b, … z, aa, ab, …
+///
+/// Out of range — zero or negative, which `start` and `value` can both ask for
+/// — falls back to the number, which is what browsers do rather than printing
+/// nothing.
+fn alphabetic(ordinal: i32, first: char) -> String {
+    if ordinal < 1 {
+        return ordinal.to_string();
+    }
+    let mut n = ordinal as u32;
+    let mut out = Vec::new();
+    while n > 0 {
+        let rem = (n - 1) % 26;
+        out.push((first as u8 + rem as u8) as char);
+        n = (n - 1) / 26;
+    }
+    out.iter().rev().collect()
+}
+
+/// Roman numerals, falling back to the number outside the range they cover.
+fn roman(ordinal: i32) -> String {
+    const NUMERALS: [(i32, &str); 13] = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    if !(1..4000).contains(&ordinal) {
+        return ordinal.to_string();
+    }
+    let mut left = ordinal;
+    let mut out = String::new();
+    for (value, numeral) in NUMERALS {
+        while left >= value {
+            out.push_str(numeral);
+            left -= value;
+        }
+    }
+    out
+}
+
+/// The computed `list-style-position` CSS property: whether the marker sits in
+/// the item's content or beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListStylePosition {
+    /// Beside the item, in the space the list's padding leaves for it. The
+    /// item's own text starts at the same place on every line.
+    #[default]
+    Outside,
+    /// The first thing on the item's first line, pushing the text along.
+    Inside,
+}
+
+impl ListStylePosition {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "outside" => Some(Self::Outside),
+            "inside" => Some(Self::Inside),
+            _ => None,
+        }
+    }
+}
+
 // ------ Flexbox Enums ------
 
 /// The computed `flex-direction` CSS property.
@@ -1589,6 +1734,19 @@ pub struct ComputedValues {
     /// `content` — what a `::before` or `::after` puts on the page. Empty on
     /// an ordinary element, which generates nothing.
     pub content: Content,
+    /// Whether this box is a list item, and so is marked with a bullet or a
+    /// number. Set by `display: list-item`; it is not a display type of its own
+    /// here because a list item lays out as a block and only differs in having
+    /// a marker.
+    pub list_item: bool,
+    /// `list-style-type`, or `None` where the page has not said.
+    ///
+    /// Held unresolved so that inheritance can tell "nobody said" from "this
+    /// element asked for a disc": both would otherwise look like the initial
+    /// value, and a disc inside a circled list would silently become a circle.
+    pub list_style_type: Option<ListStyleType>,
+    /// `list-style-position`, unresolved for the same reason.
+    pub list_style_position: Option<ListStylePosition>,
     /// `transform` — how the box is moved, scaled or turned when it is painted.
     pub transform: Transform,
     /// `transform-origin` — the point that is done about.
@@ -2356,6 +2514,9 @@ impl Default for ComputedValues {
             cursor: Cursor::Auto,
             z_index: None,
             content: Content::default(),
+            list_item: false,
+            list_style_type: None,
+            list_style_position: None,
             transform: Transform::default(),
             transform_origin: TransformOrigin::default(),
             filter: Filter::default(),
@@ -2707,8 +2868,19 @@ impl ComputedValues {
                     "table-caption" => DisplayType::TableCaption,
                     "table-column" => DisplayType::TableColumn,
                     "table-column-group" => DisplayType::TableColumnGroup,
+                    // A list item is a block that carries a marker. Keeping it
+                    // out of `DisplayType` means every layout path that already
+                    // handles a block handles this too, rather than each one
+                    // growing an arm that says "and list items as well".
+                    "list-item" => {
+                        self.list_item = true;
+                        DisplayType::Block
+                    }
                     _ => self.display,
                 };
+                if val != "list-item" {
+                    self.list_item = false;
+                }
             }
             "width" => {
                 self.width_percent = parse_percentage(val);
@@ -3140,6 +3312,24 @@ impl ComputedValues {
             "content" => {
                 self.content = Content::parse(val);
             }
+            "list-style-type" => {
+                self.list_style_type = ListStyleType::parse(val);
+            }
+            "list-style-position" => {
+                self.list_style_position = ListStylePosition::parse(val);
+            }
+            "list-style" => {
+                // The shorthand takes a type, a position and an image in any
+                // order. We have no marker images, so a `url(...)` is read as
+                // the type it is standing in for having none.
+                for part in val.split_whitespace() {
+                    if let Some(position) = ListStylePosition::parse(part) {
+                        self.list_style_position = Some(position);
+                    } else if let Some(kind) = ListStyleType::parse(part) {
+                        self.list_style_type = Some(kind);
+                    }
+                }
+            }
             "transform" => {
                 self.transform = Transform::parse(val, ctx);
             }
@@ -3447,6 +3637,9 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "left",
     "letter-spacing",
     "line-height",
+    "list-style",
+    "list-style-position",
+    "list-style-type",
     "margin",
     "margin-bottom",
     "margin-left",
@@ -4316,9 +4509,20 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
         ("h5", "display: block; margin: 1em 0; font-weight: bold"),
         ("h6", "display: block; margin: 1em 0; font-weight: bold"),
         ("p", "display: block; margin: 1em 0"),
-        ("ul", "display: block; padding-left: 40px; margin: 1em 0"),
-        ("ol", "display: block; padding-left: 40px; margin: 1em 0"),
-        ("li", "display: block"),
+        (
+            "ul",
+            "display: block; padding-left: 40px; margin: 1em 0; list-style-type: disc",
+        ),
+        (
+            "ol",
+            "display: block; padding-left: 40px; margin: 1em 0; list-style-type: decimal",
+        ),
+        // Nested bullets change shape, which is how a reader tells one level
+        // from the next when the indent alone is not enough.
+        ("ul ul", "list-style-type: circle"),
+        ("ul ul ul", "list-style-type: square"),
+        ("menu", "display: block; padding-left: 40px; margin: 1em 0"),
+        ("li", "display: list-item"),
         (
             "table",
             "display: table; border-collapse: collapse; margin: 0.5em 0",

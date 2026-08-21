@@ -310,6 +310,11 @@ impl Page {
         // Stage 6: Apply relative positioning offsets to shifted elements
         crate::layout::apply_relative_positioning(&mut layout_root);
 
+        // Stage 6.5: Move list markers out of the text and into the margin.
+        // After the lines are built, because that is when a marker's width is
+        // known.
+        crate::layout::place_list_markers(&mut layout_root);
+
         // Stage 7: Compute positions for absolutely positioned children
         let containing_block = Rect::new(
             layout_root.padding[3] + layout_root.border[3],
@@ -496,6 +501,7 @@ impl Page {
         let mut text_renderer = crate::render::text::TextRenderer::new();
         crate::layout::compute_layout(&mut self.layout_root, self.view_width, &mut text_renderer);
         crate::layout::apply_relative_positioning(&mut self.layout_root);
+        crate::layout::place_list_markers(&mut self.layout_root);
 
         // Recompute absolute positions
         let containing_block = Rect::new(
@@ -730,6 +736,163 @@ mod tests {
             ["no href", "[]"],
             "the brackets still print — only the attribute is empty"
         );
+    }
+
+    // -- List markers --
+
+    /// Every run of painted text, as `(x, text)` rounded to the pixel.
+    ///
+    /// Markers are ordinary text once they are laid out, so a list reads out of
+    /// here as the marker and the words beside it, at the places they will be
+    /// drawn.
+    fn painted_runs(page: &Page) -> Vec<(i32, String)> {
+        crate::layout::collect_text_nodes(&page.layout_root)
+            .into_iter()
+            .map(|run| (run.x.round() as i32, run.text))
+            .collect()
+    }
+
+    fn list_page(html: &str) -> Page {
+        Page::new(html, "", 800.0, 600.0)
+    }
+
+    /// The content edge of a list: the body's 8px margin plus the 40px of
+    /// padding the user-agent sheet gives `ul` and `ol` to hold the markers.
+    const CONTENT_EDGE: i32 = 48;
+
+    #[test]
+    fn a_bulleted_item_is_marked_beside_its_text() {
+        let page = list_page("<html><body><ul><li>Alpha</li><li>Beta</li></ul></body></html>");
+        let runs = painted_runs(&page);
+
+        assert_eq!(
+            runs.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+            ["\u{2022}", "Alpha", "\u{2022}", "Beta"]
+        );
+        assert!(
+            runs[0].0 < CONTENT_EDGE,
+            "the bullet sits in the padding, left of the text: {runs:?}"
+        );
+        assert_eq!(
+            (runs[1].0, runs[3].0),
+            (CONTENT_EDGE, CONTENT_EDGE),
+            "every item's text starts on the content edge, marker or not"
+        );
+    }
+
+    #[test]
+    fn an_ordered_list_counts_its_items() {
+        let page = list_page("<html><body><ol><li>a</li><li>b</li><li>c</li></ol></body></html>");
+        let markers: Vec<String> = painted_runs(&page)
+            .into_iter()
+            .map(|(_, text)| text)
+            .filter(|text| text.ends_with('.'))
+            .collect();
+        assert_eq!(markers, ["1.", "2.", "3."]);
+    }
+
+    #[test]
+    fn a_list_can_be_told_where_to_start_and_where_to_jump() {
+        let page = list_page(
+            "<html><body><ol start='3'><li>a</li><li value='7'>b</li><li>c</li></ol></body></html>",
+        );
+        let markers: Vec<String> = painted_runs(&page)
+            .into_iter()
+            .map(|(_, text)| text)
+            .filter(|text| text.ends_with('.'))
+            .collect();
+        assert_eq!(
+            markers,
+            ["3.", "7.", "8."],
+            "`value` moves the item it is on and everything after it"
+        );
+    }
+
+    #[test]
+    fn a_number_is_right_aligned_against_the_text_it_marks() {
+        // Two digits reach further left than one; what stays put is the edge
+        // the text starts on. Left-aligning the markers instead would stagger
+        // the text of a list that runs past nine.
+        let page = list_page("<html><body><ol start='9'><li>a</li><li>b</li></ol></body></html>");
+        let runs = painted_runs(&page);
+        let (nine, ten) = (runs[0].0, runs[2].0);
+        assert!(ten < nine, "`10.` starts further left than `9.`: {runs:?}");
+        assert_eq!((runs[1].0, runs[3].0), (CONTENT_EDGE, CONTENT_EDGE));
+    }
+
+    #[test]
+    fn nested_lists_change_the_shape_of_their_bullets() {
+        let page = list_page(
+            "<html><body><ul><li>A<ul><li>B<ul><li>C</li></ul></li></ul></li></ul></body></html>",
+        );
+        let markers: Vec<String> = painted_runs(&page)
+            .into_iter()
+            .map(|(_, text)| text)
+            .filter(|text| !text.chars().all(|c| c.is_ascii_alphabetic()))
+            .collect();
+        assert_eq!(
+            markers,
+            ["\u{2022}", "\u{25e6}", "\u{25aa}"],
+            "disc, then circle, then square, so the levels are told apart"
+        );
+    }
+
+    #[test]
+    fn an_inside_marker_pushes_the_text_along_instead() {
+        let page = list_page(
+            "<html><body><ul style='list-style-position: inside'><li>Alpha</li></ul></body></html>",
+        );
+        let runs = painted_runs(&page);
+        assert_eq!(runs[0].0, CONTENT_EDGE, "the marker is the text now");
+        assert!(
+            runs[1].0 > CONTENT_EDGE,
+            "and the words start after it: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn a_list_told_to_have_no_markers_has_none() {
+        // Site navigation is written as a list and styled out of looking like
+        // one. Marking it anyway would put a bullet beside every menu entry.
+        let page =
+            list_page("<html><body><ul style='list-style: none'><li>Alpha</li></ul></body></html>");
+        assert_eq!(painted_runs(&page), [(CONTENT_EDGE, "Alpha".to_string())]);
+    }
+
+    #[test]
+    fn only_the_first_line_of_an_item_makes_room_for_the_marker() {
+        let page = Page::new(
+            "<html><body><ul style='width:200px'><li>one two three four five six seven</li></ul></body></html>",
+            "",
+            800.0,
+            600.0,
+        );
+        let runs = painted_runs(&page);
+        let after_marker: Vec<i32> = runs
+            .iter()
+            .filter(|(_, text)| text == "one" || text == "five")
+            .map(|(x, _)| *x)
+            .collect();
+        assert_eq!(
+            after_marker,
+            [CONTENT_EDGE, CONTENT_EDGE],
+            "the wrapped line starts under the first, not under the bullet: {runs:?}"
+        );
+    }
+
+    /// A `<li>` holding a `<p>` has no line of its own. Putting the marker
+    /// there anyway made a line above the paragraph and pushed the item down by
+    /// its height; it belongs on the paragraph's first line.
+    #[test]
+    fn an_item_built_out_of_blocks_is_marked_beside_its_first_line() {
+        let page = list_page("<html><body><ul><li><p>Para</p></li></ul></body></html>");
+        let runs = crate::layout::collect_text_nodes(&page.layout_root);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs[0].y, runs[1].y,
+            "the bullet is on the same line as the text it marks"
+        );
+        assert!(runs[0].x < runs[1].x);
     }
 
     #[test]

@@ -319,6 +319,7 @@ impl Page {
         // After the lines are built, because that is when a marker's width is
         // known.
         crate::layout::place_list_markers(&mut layout_root);
+        crate::layout::place_inline_fragments(&mut layout_root);
 
         // Stage 7: Compute positions for absolutely positioned children
         let containing_block = Rect::new(
@@ -507,6 +508,7 @@ impl Page {
         crate::layout::compute_layout(&mut self.layout_root, self.view_width, &mut text_renderer);
         crate::layout::apply_relative_positioning(&mut self.layout_root);
         crate::layout::place_list_markers(&mut self.layout_root);
+        crate::layout::place_inline_fragments(&mut self.layout_root);
 
         // Recompute absolute positions
         let containing_block = Rect::new(
@@ -1044,6 +1046,98 @@ mod tests {
             600.0,
         );
         assert_eq!(rect_of(&page, "wrap").height, 50.0, "30 above, 20 of box");
+    }
+
+    // -- Inline backgrounds --
+
+    /// Where the highlight was painted, one rectangle per line it covers.
+    fn highlight_rects(html: &str) -> Vec<(i32, i32, i32)> {
+        let page = Page::new(
+            html,
+            "body { margin: 0 } .h { background-color: yellow }",
+            300.0,
+            600.0,
+        );
+        crate::layout::collect_decorations(&page.layout_root)
+            .into_iter()
+            .filter(|d| d.background_color == Some([255, 255, 0, 255]))
+            .map(|d| {
+                (
+                    d.x.round() as i32,
+                    d.y.round() as i32,
+                    d.width.round() as i32,
+                )
+            })
+            .collect()
+    }
+
+    /// An inline box has no rect of its own — its text is laid out in the lines
+    /// of the block around it — so a background on one was never painted at
+    /// all. Every highlighted phrase on a page came out unmarked.
+    #[test]
+    fn a_background_on_an_inline_box_is_painted_where_its_words_are() {
+        let marks = highlight_rects(
+            "<html><body><p>before <span class='h'>marked</span> after</p></body></html>",
+        );
+        assert_eq!(marks.len(), 1, "one phrase, one mark: {marks:?}");
+        let (x, _, width) = marks[0];
+        assert!(x > 0, "it starts after the word in front of it: {marks:?}");
+        assert!(width > 0);
+    }
+
+    #[test]
+    fn a_space_inside_the_phrase_is_covered_rather_than_cut_out() {
+        // The space between two words belongs to no element, so reading it as
+        // somebody else's would end the mark and start a second one, leaving a
+        // gap in the middle of the highlight.
+        let one = highlight_rects("<html><body><p><span class='h'>two</span></p></body></html>");
+        let two =
+            highlight_rects("<html><body><p><span class='h'>two words</span></p></body></html>");
+        assert_eq!(two.len(), 1, "still one mark: {two:?}");
+        assert!(two[0].2 > one[0].2, "and a wider one");
+    }
+
+    #[test]
+    fn a_phrase_broken_across_two_lines_is_marked_twice() {
+        // Not once: a single rectangle from the start of the first line to the
+        // end of the second would paint over everything in between.
+        let marks = highlight_rects(
+            "<html><body><p><span class='h'>one two three four five six seven eight nine</span></p></body></html>",
+        );
+        assert!(marks.len() >= 2, "one mark per line: {marks:?}");
+        assert!(
+            marks[0].1 < marks[1].1,
+            "and they are on different lines: {marks:?}"
+        );
+    }
+
+    #[test]
+    fn a_phrase_keeps_its_mark_across_something_nested_in_it() {
+        // A run carries the id of the innermost element it came from, so the
+        // bold part looks like somebody else's unless the span recognises its
+        // own descendants.
+        let marks = highlight_rects(
+            "<html><body><p><span class='h'>outer <b>bold</b> more</span></p></body></html>",
+        );
+        assert_eq!(marks.len(), 1, "one unbroken mark: {marks:?}");
+    }
+
+    #[test]
+    fn a_box_with_a_rect_of_its_own_is_still_painted_from_it() {
+        // Only boxes with nowhere to paint go through the fragment path; an
+        // inline-block has a rect and must not be measured out of the lines.
+        let page = Page::new(
+            "<html><body><span id='i'></span></body></html>",
+            "#i { display: inline-block; width: 30px; height: 10px; background-color: red }",
+            300.0,
+            600.0,
+        );
+        let marks: Vec<(f32, f32)> = crate::layout::collect_decorations(&page.layout_root)
+            .into_iter()
+            .filter(|d| d.background_color == Some([255, 0, 0, 255]))
+            .map(|d| (d.width, d.height))
+            .collect();
+        assert_eq!(marks, [(30.0, 10.0)]);
     }
 
     // -- Masked icons --

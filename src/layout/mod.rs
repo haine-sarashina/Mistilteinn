@@ -314,6 +314,16 @@ pub struct LayoutNode {
     /// Ordinary boxes carry 1, which is what an unnumbered list would count
     /// from anyway.
     pub list_start: i32,
+    /// Where an inline box actually sits, in the lines of the block that
+    /// contains it.
+    ///
+    /// An inline box has no box of its own — its text is laid out in its
+    /// container's lines and its own rect stays empty — so a background or a
+    /// border on it has nothing to be painted into. These are the rectangles
+    /// to paint it in: one per line it appears on, because a phrase broken
+    /// across two lines is two marks rather than one block covering everything
+    /// between them. Empty for every box that has a rect of its own.
+    pub inline_fragments: Vec<Rect>,
 }
 
 impl LayoutNode {
@@ -393,6 +403,7 @@ impl LayoutNode {
             is_line_break: false,
             outside_marker: false,
             list_start: 1,
+            inline_fragments: Vec::new(),
         }
     }
 
@@ -3769,6 +3780,182 @@ pub fn place_list_markers(node: &mut LayoutNode) {
     }
 }
 
+/// Work out where every inline box on the page is actually drawn.
+///
+/// Run after the lines are laid out, because that is what an inline box's
+/// position is. Only boxes that paint something are measured — for the rest
+/// there would be nothing to do with the answer.
+pub fn place_inline_fragments(node: &mut LayoutNode) {
+    if node.line_boxes.is_some() {
+        let base_x = node.rect.x + node.padding[3] + node.border[3];
+        let base_y = node.rect.y + node.padding[0] + node.border[0];
+
+        // The lines are borrowed while they are read and the boxes are what
+        // gets written, so every answer is worked out before any is stored.
+        // A box is named by the path to it rather than by a reference, which
+        // is what lets the two halves happen one after the other.
+        let mut paths = Vec::new();
+        let mut measured: Vec<(Vec<usize>, Vec<Rect>)> = Vec::new();
+        {
+            let lines = node.line_boxes.as_ref().expect("checked above");
+            collect_painting_inlines(node, &mut Vec::new(), &mut paths);
+            for path in paths {
+                let Some(inline) = box_at_path(node, &path) else {
+                    continue;
+                };
+                let mut ids = rustc_hash::FxHashSet::default();
+                subtree_dom_ids(inline, &mut ids);
+                if ids.is_empty() {
+                    continue;
+                }
+                let rects = fragments_in_lines(lines, base_x, base_y, &ids);
+                if !rects.is_empty() {
+                    measured.push((path, rects));
+                }
+            }
+        }
+        for (path, rects) in measured {
+            if let Some(inline) = box_at_path_mut(node, &path) {
+                inline.inline_fragments = rects;
+            }
+        }
+    }
+
+    for child in node.children.iter_mut() {
+        place_inline_fragments(child);
+    }
+    for child in node.absolute_children.iter_mut() {
+        place_inline_fragments(child);
+    }
+}
+
+/// The paths to the inline boxes inside this one that have something to paint.
+///
+/// The walk stops at a box with lines of its own: what is inside that one
+/// belongs to its lines, not to the ones being measured here.
+fn collect_painting_inlines(node: &LayoutNode, path: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+    for (i, child) in node.children.iter().enumerate() {
+        if child.line_boxes.is_some() || !matches!(child.display, DisplayType::Inline) {
+            continue;
+        }
+        let paints = child.background_color.is_some()
+            || child.background_image.is_some()
+            || child.mask_image.is_some()
+            || (0..4).any(|side| child.border[side] > 0.0 && child.border_style[side].is_visible());
+        path.push(i);
+        // A box with a rect of its own is painted from that rect, the ordinary
+        // way; this is only for the ones that have none.
+        if paints && child.rect.width < 2.0 {
+            out.push(path.clone());
+        }
+        collect_painting_inlines(child, path, out);
+        path.pop();
+    }
+}
+
+fn box_at_path<'a>(node: &'a LayoutNode, path: &[usize]) -> Option<&'a LayoutNode> {
+    let mut current = node;
+    for &step in path {
+        current = current.children.get(step)?;
+    }
+    Some(current)
+}
+
+fn box_at_path_mut<'a>(node: &'a mut LayoutNode, path: &[usize]) -> Option<&'a mut LayoutNode> {
+    let mut current = node;
+    for &step in path {
+        current = current.children.get_mut(step)?;
+    }
+    Some(current)
+}
+
+/// Every DOM node the runs of this box could be attributed to.
+///
+/// A run carries the id of the innermost element it came from, so a `<span>`
+/// holding a `<b>` never sees its own id on the run — it has to recognise its
+/// descendants' ids as its own.
+fn subtree_dom_ids(node: &LayoutNode, out: &mut rustc_hash::FxHashSet<u32>) {
+    if let Some(id) = node.dom_node_id {
+        out.insert(id);
+    }
+    for child in &node.children {
+        subtree_dom_ids(child, out);
+    }
+}
+
+/// The runs belonging to one box, gathered into a rectangle per line.
+///
+/// A space between two of its words carries no element of its own, so it is
+/// held back rather than ending the run — a highlight over "two words" is one
+/// mark, not two with a gap where the space was. A space that turns out to be
+/// the last thing before somebody else's text is left outside.
+fn fragments_in_lines(
+    lines: &[LineBox],
+    base_x: f32,
+    base_y: f32,
+    ids: &rustc_hash::FxHashSet<u32>,
+) -> Vec<Rect> {
+    let mut rects = Vec::new();
+    for line in lines {
+        let mut x = base_x + line.x;
+        let mut start: Option<f32> = None;
+        let mut run_end = x;
+
+        for item in &line.boxes {
+            let width = inline_box_width(item);
+            match inline_box_dom_id(item) {
+                Some(id) if ids.contains(&id) => {
+                    if start.is_none() {
+                        start = Some(x);
+                    }
+                    run_end = x + width;
+                }
+                Some(_) => {
+                    if let Some(from) = start.take() {
+                        push_fragment(
+                            &mut rects,
+                            from,
+                            base_y + line.y,
+                            run_end - from,
+                            line.height,
+                        );
+                    }
+                }
+                // Whitespace and line breaks belong to nobody; they neither
+                // start a run nor end one.
+                None => {}
+            }
+            x += width;
+        }
+        if let Some(from) = start {
+            push_fragment(
+                &mut rects,
+                from,
+                base_y + line.y,
+                run_end - from,
+                line.height,
+            );
+        }
+    }
+    rects
+}
+
+/// Keep a fragment if there is anything of it to see.
+fn push_fragment(rects: &mut Vec<Rect>, x: f32, y: f32, width: f32, height: f32) {
+    if width > 0.0 && height > 0.0 {
+        rects.push(Rect::new(x, y, width, height));
+    }
+}
+
+/// Which element a run on a line came from.
+fn inline_box_dom_id(item: &InlineBox) -> Option<u32> {
+    match item {
+        InlineBox::Text { dom_node_id, .. } => *dom_node_id,
+        InlineBox::Element { dom_node_id, .. } => *dom_node_id,
+        InlineBox::Whitespace { .. } | InlineBox::LineBreak => None,
+    }
+}
+
 /// How much room one inline box takes along the line.
 fn inline_box_width(box_item: &InlineBox) -> f32 {
     match box_item {
@@ -5262,7 +5449,8 @@ fn paint_stacking_context_inner(
     // does not clip these — a scroll container still paints its own background
     // and border — but an ancestor's clip does.
     out.extend(
-        collect_own_decoration(root)
+        collect_own_decorations(root)
+            .into_iter()
             .map(PaintItem::Decoration)
             .map(|item| DisplayItem {
                 item,
@@ -5390,7 +5578,8 @@ fn collect_into_layers<'a>(
         node.display,
         DisplayType::Inline | DisplayType::InlineBlock | DisplayType::InlineFlex
     );
-    let decoration = collect_own_decoration(node)
+    let decoration = collect_own_decorations(node)
+        .into_iter()
         .map(PaintItem::Decoration)
         .map(|item| DisplayItem {
             item,
@@ -5453,6 +5642,30 @@ pub fn collect_decorations(node: &LayoutNode) -> Vec<VisualDecoration> {
     decorations
 }
 
+/// This box's own backgrounds and borders, wherever they are painted.
+///
+/// One entry for an ordinary box. An inline box has no rect of its own — it
+/// lives in the lines of the block that contains it — so it gets one entry per
+/// line it appears on. See [`LayoutNode::inline_fragments`].
+pub fn collect_own_decorations(node: &LayoutNode) -> Vec<VisualDecoration> {
+    if node.inline_fragments.is_empty() {
+        return collect_own_decoration(node).into_iter().collect();
+    }
+    let Some(shape) = decoration_of(node, node.rect) else {
+        return Vec::new();
+    };
+    node.inline_fragments
+        .iter()
+        .map(|fragment| VisualDecoration {
+            x: fragment.x,
+            y: fragment.y,
+            width: fragment.width,
+            height: fragment.height,
+            ..shape.clone()
+        })
+        .collect()
+}
+
 /// This box's own background and borders, if it paints any.
 pub fn collect_own_decoration(node: &LayoutNode) -> Option<VisualDecoration> {
     let has_bg = node.background_color.is_some()
@@ -5468,11 +5681,22 @@ pub fn collect_own_decoration(node: &LayoutNode) -> Option<VisualDecoration> {
         return None;
     }
 
+    decoration_of(node, node.rect)
+}
+
+/// What this box paints, in a given rectangle.
+///
+/// Split out so that an inline box's fragments and an ordinary box's rect are
+/// described the same way — they differ only in where they are.
+fn decoration_of(node: &LayoutNode, rect: Rect) -> Option<VisualDecoration> {
+    if !node.visibility.is_painted() {
+        return None;
+    }
     Some(VisualDecoration {
-        x: node.rect.x,
-        y: node.rect.y,
-        width: node.rect.width,
-        height: node.rect.height,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
         background_color: node.background_color,
         background_image: node.background_image.clone(),
         background_size: node.background_size,
@@ -5490,7 +5714,7 @@ pub fn collect_own_decoration(node: &LayoutNode) -> Option<VisualDecoration> {
 }
 
 fn collect_decorations_internal(node: &LayoutNode, out: &mut Vec<VisualDecoration>) {
-    out.extend(collect_own_decoration(node));
+    out.extend(collect_own_decorations(node));
 
     for child in &node.children {
         collect_decorations_internal(child, out);

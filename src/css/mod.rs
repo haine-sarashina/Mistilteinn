@@ -684,13 +684,16 @@ where
         let simple_match = |id: u32, sel: &parser::SimpleSelector| -> bool {
             matches_for(id, sel, arena, &index, &is_hovered, &is_focused)
         };
+        let get_previous_sibling =
+            |id: u32| -> Option<u32> { index.previous_sibling.get(&id).copied() };
 
         // Collect all matching rules with their specificity
         let mut matched: Vec<(&parser::CSSRule, (u32, u32, u32))> = Vec::new();
 
         for rule in &active_rules {
             for selector in &rule.selectors {
-                if selector.full_matches(node_id, &get_parent, &simple_match) {
+                if selector.full_matches(node_id, &get_parent, &get_previous_sibling, &simple_match)
+                {
                     matched.push((rule, selector.specificity()));
                 }
             }
@@ -804,7 +807,14 @@ where
                             .get(crate::html::DomHandle(crate::html::NodeId::from_raw(id)))
                             .and_then(|n| n.parent_id())
                     };
-                    if element_part.full_matches(node_id, &get_parent, &simple_match) {
+                    let get_previous_sibling =
+                        |id: u32| -> Option<u32> { index.previous_sibling.get(&id).copied() };
+                    if element_part.full_matches(
+                        node_id,
+                        &get_parent,
+                        &get_previous_sibling,
+                        &simple_match,
+                    ) {
                         let spec = selector.specificity();
                         matched.extend(rule.declarations.iter().map(|decl| (decl, spec)));
                     }
@@ -855,6 +865,8 @@ struct DomIndex {
     empty: std::collections::HashSet<u32>,
     /// The element the document hangs off, for `:root`.
     root: Option<u32>,
+    /// The element before each one among its siblings, for `+` and `~`.
+    previous_sibling: rustc_hash::FxHashMap<u32, u32>,
 }
 
 impl DomIndex {
@@ -894,6 +906,9 @@ impl DomIndex {
                 rustc_hash::FxHashMap::default();
             for (i, &id) in siblings.iter().enumerate() {
                 index.child_index.insert(id, (i + 1, total - i));
+                if i > 0 {
+                    index.previous_sibling.insert(id, siblings[i - 1]);
+                }
                 if let Some(tag) = tag_of(arena, id) {
                     let seen = seen_of_type.entry(tag.clone()).or_insert(0);
                     *seen += 1;
@@ -4738,6 +4753,17 @@ pub fn user_agent_stylesheet() -> parser::Stylesheet {
             "textarea",
             "display: inline-block; padding: 4px 8px; border: 1px solid #767676; border-radius: 2px; background-color: #ffffff",
         ),
+        // A checkbox is a small square and a radio is a small circle. Neither
+        // has room inside for the padding a text field wants, and neither shows
+        // its `value` — the renderer draws the tick or the dot.
+        (
+            "input[type=\"checkbox\"]",
+            "width: 13px; height: 13px; padding: 0; border-radius: 2px",
+        ),
+        (
+            "input[type=\"radio\"]",
+            "width: 13px; height: 13px; padding: 0; border-radius: 6px",
+        ),
         // The extra right padding is room for the drop arrow the renderer draws.
         (
             "select",
@@ -7038,6 +7064,71 @@ mod tests {
                 r#"<html><body><div id="d">x</div></body></html>"#,
             ),
             Vec::<String>::new()
+        );
+    }
+
+    // -- Sibling combinators --
+
+    /// A row of elements, so a selector has siblings to walk back along.
+    const ROW: &str = r#"<html><body><div id="wrap">
+        <p id="a">one</p>
+        <span id="b">two</span>
+        <p id="c">three</p>
+    </div></body></html>"#;
+
+    #[test]
+    fn the_next_sibling_is_the_one_straight_after() {
+        assert_eq!(
+            selected("#a + span { background-color: rgb(1,2,3) }", ROW),
+            ["b"]
+        );
+        assert_eq!(
+            selected("#a + p { background-color: rgb(1,2,3) }", ROW),
+            Vec::<String>::new(),
+            "the p after #a is not next to it — the span is in between"
+        );
+    }
+
+    #[test]
+    fn a_later_sibling_can_be_any_distance_along() {
+        assert_eq!(
+            selected("#a ~ p { background-color: rgb(1,2,3) }", ROW),
+            ["c"],
+            "further along the row, with something in between"
+        );
+        assert_eq!(
+            selected("#c ~ p { background-color: rgb(1,2,3) }", ROW),
+            Vec::<String>::new(),
+            "a sibling combinator only ever looks backwards"
+        );
+    }
+
+    /// The pattern a page's menus are built on: a checkbox nobody sees and a
+    /// rule that reveals the panel further along the same row. Sibling
+    /// combinators were unimplemented, so no menu could ever open.
+    #[test]
+    fn a_checked_box_can_reveal_the_panel_beside_it() {
+        let page = r#"<html><body>
+            <input type="checkbox" id="cb" checked>
+            <label for="cb">Menu</label>
+            <div id="panel">contents</div>
+        </body></html>"#;
+        assert_eq!(
+            selected(
+                "#cb:checked ~ #panel { background-color: rgb(1,2,3) }",
+                page
+            ),
+            ["panel"]
+        );
+
+        let unchecked = page.replace(" checked", "");
+        assert_eq!(
+            selected(
+                "#cb:checked ~ #panel { background-color: rgb(1,2,3) }",
+                &unchecked
+            ),
+            Vec::<String>::new(),
+            "and leaves it alone while the box is clear"
         );
     }
 

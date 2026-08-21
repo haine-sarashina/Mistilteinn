@@ -410,3 +410,84 @@ mod tests {
         assert_eq!(painted(&buffer), 0);
     }
 }
+
+/// The tick inside a checked checkbox.
+///
+/// Two strokes meeting at the low point, which is what a tick is: a short one
+/// down to the left and a long one up to the right.
+pub fn checkmark(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    x: f32,
+    y: f32,
+    size: f32,
+    color: [u8; 4],
+) {
+    // A stroke half as thick as a tenth of the box keeps the tick crisp at the
+    // 13px a checkbox usually is, and still solid if a page enlarges one.
+    let thickness = (size * 0.16).max(1.2);
+
+    fill_shape(
+        dest,
+        dest_width,
+        dest_height,
+        x,
+        y,
+        size,
+        size,
+        color,
+        |px, py| {
+            let (px, py) = (px / size, py / size);
+            // The corner the two strokes meet at, and their far ends.
+            let elbow = (0.42, 0.72);
+            let start = (0.22, 0.52);
+            let end = (0.78, 0.30);
+            let width = thickness / size;
+            near_segment(px, py, start, elbow, width) || near_segment(px, py, elbow, end, width)
+        },
+    );
+}
+
+/// Whether a point is within `width` of the line between two others.
+fn near_segment(px: f32, py: f32, a: (f32, f32), b: (f32, f32), width: f32) -> bool {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let length_squared = dx * dx + dy * dy;
+    if length_squared <= f32::EPSILON {
+        return false;
+    }
+    // How far along the segment the nearest point is, clamped to its ends so a
+    // stroke stops rather than running on forever.
+    let t = (((px - a.0) * dx + (py - a.1) * dy) / length_squared).clamp(0.0, 1.0);
+    let (nx, ny) = (a.0 + dx * t, a.1 + dy * t);
+    let (ox, oy) = (px - nx, py - ny);
+    ox * ox + oy * oy <= (width / 2.0) * (width / 2.0)
+}
+
+/// The dot inside a chosen radio button.
+pub fn radio_dot(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    x: f32,
+    y: f32,
+    size: f32,
+    color: [u8; 4],
+) {
+    let centre = size / 2.0;
+    let radius = size * 0.26;
+    fill_shape(
+        dest,
+        dest_width,
+        dest_height,
+        x,
+        y,
+        size,
+        size,
+        color,
+        |px, py| {
+            let (dx, dy) = (px - centre, py - centre);
+            dx * dx + dy * dy <= radius * radius
+        },
+    );
+}

@@ -314,6 +314,9 @@ pub struct LayoutNode {
     /// Ordinary boxes carry 1, which is what an unnumbered list would count
     /// from anyway.
     pub list_start: i32,
+    /// The on/off state of this box, when it is a checkbox or a radio button.
+    /// `None` for everything else.
+    pub toggle: Option<ToggleState>,
     /// Whether this box draws its own content instead of flowing it.
     ///
     /// A form control's value belongs inside the control. Left to the ordinary
@@ -410,6 +413,7 @@ impl LayoutNode {
             is_line_break: false,
             outside_marker: false,
             list_start: 1,
+            toggle: None,
             replaced: false,
             inline_fragments: Vec::new(),
         }
@@ -3995,12 +3999,66 @@ fn inline_box_width(box_item: &InlineBox) -> f32 {
     }
 }
 
+/// A control that is either on or off: a checkbox or a radio button.
+///
+/// Both are drawn rather than written — a tick and a dot are shapes, and
+/// spelling them with characters leaves them at the mercy of whether the
+/// system font covers that code point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToggleState {
+    pub kind: ToggleKind,
+    pub checked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToggleKind {
+    /// One box, on or off by itself.
+    Checkbox,
+    /// One of a set, where turning this one on turns the others off.
+    Radio,
+}
+
+/// Every checkbox and radio button in the tree, with the box to draw it in.
+pub fn collect_toggle_boxes(node: &LayoutNode) -> Vec<(Rect, ToggleState)> {
+    let mut out = Vec::new();
+    collect_toggle_boxes_inner(node, &mut out);
+    out
+}
+
+fn collect_toggle_boxes_inner(node: &LayoutNode, out: &mut Vec<(Rect, ToggleState)>) {
+    if matches!(node.display, DisplayType::None) {
+        return;
+    }
+    if let Some(state) = node.toggle
+        && node.visibility.is_painted()
+        && node.rect.width > 0.0
+        && node.rect.height > 0.0
+    {
+        out.push((node.rect, state));
+    }
+    for child in node.children.iter().chain(node.absolute_children.iter()) {
+        collect_toggle_boxes_inner(child, out);
+    }
+}
+
 /// The colour a field's placeholder is drawn in.
 ///
 /// Grey rather than the field's own colour: the text is a prompt, not something
 /// the reader typed, and a page that has not styled `::placeholder` still
 /// expects the two to look different.
 const PLACEHOLDER_COLOR: [u8; 4] = [117, 117, 117, 255];
+
+/// How big a checkbox or radio button is when the page does not say.
+const TOGGLE_SIZE: f32 = 13.0;
+
+/// Which kind of toggle an `<input type>` names, if it names one.
+fn toggle_kind(input_type: &str) -> Option<ToggleKind> {
+    match input_type.trim().to_ascii_lowercase().as_str() {
+        "checkbox" => Some(ToggleKind::Checkbox),
+        "radio" => Some(ToggleKind::Radio),
+        _ => None,
+    }
+}
 
 /// Apply the intrinsic text and default size of a form control.
 ///
@@ -4014,6 +4072,26 @@ where
     if matches!(tag, "input" | "textarea" | "select") {
         layout_node.replaced = true;
     }
+    // A checkbox or a radio is a small square of its own, and has no text: the
+    // `value` on one is what gets submitted, not what is drawn.
+    if tag == "input"
+        && let Some(kind) = node.get_attr("type").and_then(|t| toggle_kind(&t))
+    {
+        layout_node.toggle = Some(ToggleState {
+            kind,
+            checked: node.get_attr("checked").is_some(),
+        });
+        if layout_node.explicit_width.is_none() {
+            layout_node.explicit_width = Some(TOGGLE_SIZE);
+            layout_node.rect.width = TOGGLE_SIZE;
+        }
+        if layout_node.explicit_height.is_none() {
+            layout_node.explicit_height = Some(TOGGLE_SIZE);
+            layout_node.rect.height = TOGGLE_SIZE;
+        }
+        return;
+    }
+
     match tag {
         "input" | "textarea" => {
             // A value is the reader's own text; a placeholder is the page

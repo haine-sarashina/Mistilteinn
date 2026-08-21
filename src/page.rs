@@ -645,6 +645,117 @@ impl Page {
         self.recompute_with_hover(&[]);
     }
 
+    /// Turn a checkbox or radio button on or off, and relayout.
+    ///
+    /// Written back as the `checked` attribute rather than kept beside the DOM,
+    /// so the change survives the layout rebuild the way a typed value does —
+    /// and so `:checked` sees it, which is the whole point: a page's menus are
+    /// often a hidden checkbox and a rule that reveals the panel next to it.
+    ///
+    /// Returns whether anything changed.
+    pub fn toggle_control_and_recompute(&mut self, node_id: u32) -> bool {
+        let Some(kind) = self.control_kind(node_id) else {
+            return false;
+        };
+        let was_checked = self.arena.get_attribute(node_id, "checked").is_some();
+
+        match kind {
+            crate::layout::ToggleKind::Checkbox => {
+                if was_checked {
+                    self.arena.remove_attribute(node_id, "checked");
+                } else {
+                    self.arena.set_attribute(node_id, "checked", "");
+                }
+            }
+            crate::layout::ToggleKind::Radio => {
+                // A radio cannot be turned off by clicking it, and turning one
+                // on turns off the others that answer the same question.
+                if was_checked {
+                    return false;
+                }
+                for other in self.radio_group(node_id) {
+                    self.arena.remove_attribute(other, "checked");
+                }
+                self.arena.set_attribute(node_id, "checked", "");
+            }
+        }
+
+        self.refresh_styles();
+        true
+    }
+
+    /// Which kind of toggle this element is, if it is one.
+    pub fn control_kind(&self, node_id: u32) -> Option<crate::layout::ToggleKind> {
+        let node = self.arena.get(DomHandle(NodeId::from_raw(node_id)))?;
+        if node.tag_name()? != "input" {
+            return None;
+        }
+        match node.get_attr("type")?.trim().to_ascii_lowercase().as_str() {
+            "checkbox" => Some(crate::layout::ToggleKind::Checkbox),
+            "radio" => Some(crate::layout::ToggleKind::Radio),
+            _ => None,
+        }
+    }
+
+    /// The radio buttons that answer the same question as this one.
+    ///
+    /// Grouped by `name`, which is what the browser submits and what makes them
+    /// exclusive. A radio with no name is a group of one.
+    fn radio_group(&self, node_id: u32) -> Vec<u32> {
+        let Some(name) = self
+            .arena
+            .get(DomHandle(NodeId::from_raw(node_id)))
+            .and_then(|n| n.get_attr("name").map(|v| v.to_string()))
+        else {
+            return vec![node_id];
+        };
+        (0..self.arena.len() as u32)
+            .filter(|&id| {
+                self.control_kind(id) == Some(crate::layout::ToggleKind::Radio)
+                    && self
+                        .arena
+                        .get(DomHandle(NodeId::from_raw(id)))
+                        .and_then(|n| n.get_attr("name").map(|v| v.to_string()))
+                        .as_deref()
+                        == Some(name.as_str())
+            })
+            .collect()
+    }
+
+    /// The control a `<label>` stands for, if this element is one.
+    ///
+    /// Either the one it names with `for`, or the one inside it. Clicking a
+    /// label is how most of a page's checkboxes are actually reached — the box
+    /// itself is often hidden under it.
+    pub fn label_target(&self, node_id: u32) -> Option<u32> {
+        let node = self.arena.get(DomHandle(NodeId::from_raw(node_id)))?;
+        if node.tag_name()? != "label" {
+            return None;
+        }
+        if let Some(target) = node.get_attr("for") {
+            let target = target.to_string();
+            if let Some(id) = self.arena.find_by_id(&target) {
+                return Some(id);
+            }
+        }
+        self.first_control_within(node_id)
+    }
+
+    /// The first form control inside this element, in document order.
+    fn first_control_within(&self, node_id: u32) -> Option<u32> {
+        let node = self.arena.get(DomHandle(NodeId::from_raw(node_id)))?;
+        let children: Vec<u32> = node.children.iter().map(|h| h.index() as u32).collect();
+        for child in children {
+            if self.control_kind(child).is_some() {
+                return Some(child);
+            }
+            if let Some(found) = self.first_control_within(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     /// The options of a `<select>`, as (dom id, label, selected).
     pub fn select_options(&self, select_id: u32) -> Vec<(u32, String, bool)> {
         let get_node = |id: u32| self.arena.get(DomHandle(NodeId::from_raw(id)));
@@ -1046,6 +1157,150 @@ mod tests {
             600.0,
         );
         assert_eq!(rect_of(&page, "wrap").height, 50.0, "30 above, 20 of box");
+    }
+
+    // -- Checkboxes and radio buttons --
+
+    fn menu_page(markup: &str) -> Page {
+        Page::new(
+            markup,
+            "#panel { display: none } #cb:checked ~ #panel { display: block }",
+            400.0,
+            300.0,
+        )
+    }
+
+    fn panel_is_open(page: &Page) -> bool {
+        page.arena
+            .find_by_id("panel")
+            .and_then(|id| page.styles.get(&id))
+            .is_some_and(|style| style.display != crate::css::DisplayType::None)
+    }
+
+    const MENU: &str = r#"<html><body>
+        <input type="checkbox" id="cb"><label for="cb">Menu</label>
+        <div id="panel">contents</div>
+    </body></html>"#;
+
+    /// Clicking the box writes the state back as an attribute, which is what
+    /// `:checked` reads and what survives the layout rebuild.
+    #[test]
+    fn ticking_a_box_opens_the_panel_it_controls() {
+        let mut page = menu_page(MENU);
+        assert!(!panel_is_open(&page), "closed to begin with");
+
+        let cb = page.arena.find_by_id("cb").expect("the checkbox");
+        assert!(page.toggle_control_and_recompute(cb));
+        assert!(panel_is_open(&page), "and open once the box is ticked");
+
+        assert!(page.toggle_control_and_recompute(cb));
+        assert!(!panel_is_open(&page), "and shut again on the second click");
+    }
+
+    /// The box itself is usually invisible under the control the reader sees,
+    /// so the label is what actually gets clicked.
+    #[test]
+    fn a_label_stands_for_the_box_it_names() {
+        let page = menu_page(MENU);
+        let label = (0..page.arena.len() as u32)
+            .find(|&id| page.label_target(id).is_some())
+            .expect("a label pointing at something");
+        assert_eq!(page.label_target(label), page.arena.find_by_id("cb"));
+    }
+
+    #[test]
+    fn a_label_wrapped_round_a_box_stands_for_it_too() {
+        let page = menu_page(
+            r#"<html><body>
+                <label id="l"><input type="checkbox" id="cb"> Menu</label>
+                <div id="panel">contents</div>
+            </body></html>"#,
+        );
+        let label = page.arena.find_by_id("l").expect("the label");
+        assert_eq!(page.label_target(label), page.arena.find_by_id("cb"));
+    }
+
+    /// Turning one radio on turns off the others that answer the same question,
+    /// and clicking the one that is already on does nothing — you cannot clear
+    /// a radio by clicking it.
+    #[test]
+    fn a_radio_turns_the_others_in_its_group_off() {
+        let mut page = Page::new(
+            r#"<html><body>
+                <input type="radio" name="size" id="s" checked>
+                <input type="radio" name="size" id="m">
+                <input type="radio" name="colour" id="red">
+            </body></html>"#,
+            "",
+            400.0,
+            300.0,
+        );
+        let checked = |page: &Page, id: &str| {
+            page.arena
+                .find_by_id(id)
+                .and_then(|node| page.arena.get_attribute(node, "checked"))
+                .is_some()
+        };
+
+        let medium = page.arena.find_by_id("m").expect("the second size");
+        assert!(page.toggle_control_and_recompute(medium));
+        assert!(checked(&page, "m"));
+        assert!(!checked(&page, "s"), "the other size is off now");
+
+        assert!(
+            !page.toggle_control_and_recompute(medium),
+            "clicking the chosen one again changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_radio_in_another_group_is_left_alone() {
+        let mut page = Page::new(
+            r#"<html><body>
+                <input type="radio" name="size" id="s">
+                <input type="radio" name="colour" id="red" checked>
+            </body></html>"#,
+            "",
+            400.0,
+            300.0,
+        );
+        let size = page.arena.find_by_id("s").expect("the size");
+        page.toggle_control_and_recompute(size);
+        assert!(
+            page.arena
+                .find_by_id("red")
+                .and_then(|id| page.arena.get_attribute(id, "checked"))
+                .is_some(),
+            "a different question keeps its answer"
+        );
+    }
+
+    #[test]
+    fn a_toggle_is_a_small_square_rather_than_a_text_field() {
+        // Sized like a field, a checkbox came out 160px wide with room in it
+        // for text it never shows.
+        let page = Page::new(
+            "<html><body><input type='checkbox' id='cb'></body></html>",
+            "body { margin: 0 }",
+            400.0,
+            300.0,
+        );
+        let rect = rect_of(&page, "cb");
+        assert_eq!((rect.width, rect.height), (13.0, 13.0));
+    }
+
+    #[test]
+    fn the_mark_is_only_drawn_when_the_box_is_ticked() {
+        let marks = |markup: &str| {
+            let page = Page::new(markup, "body { margin: 0 }", 400.0, 300.0);
+            crate::layout::collect_toggle_boxes(&page.layout_root)
+        };
+        let off = marks("<html><body><input type='checkbox'></body></html>");
+        let on = marks("<html><body><input type='checkbox' checked></body></html>");
+        assert_eq!(off.len(), 1);
+        assert!(!off[0].1.checked);
+        assert!(on[0].1.checked);
+        assert_eq!(on[0].1.kind, crate::layout::ToggleKind::Checkbox);
     }
 
     // -- Form controls --

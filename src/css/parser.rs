@@ -466,10 +466,18 @@ impl Selector {
     }
 
     /// Recursively evaluate a complex selector against the DOM structure.
+    /// Whether the whole selector matches, walking the tree for its
+    /// combinators.
+    ///
+    /// `get_parent` and `get_previous_sibling` are how the matcher moves: up
+    /// for a descendant or child combinator, back along the row for a sibling
+    /// one. The previous sibling is the previous *element* — the text between
+    /// two tags is not something a selector can name.
     pub fn full_matches(
         &self,
         node_id: u32,
         get_parent: &impl Fn(u32) -> Option<u32>,
+        get_previous_sibling: &impl Fn(u32) -> Option<u32>,
         simple_match: &impl Fn(u32, &SimpleSelector) -> bool,
     ) -> bool {
         if self.complex.is_empty() {
@@ -515,8 +523,32 @@ impl Selector {
                         return false;
                     }
                 }
-                // Sibling combinators not fully supported in this simple engine
-                _ => return false,
+                // `a + b`: b comes straight after a.
+                Combinator::AdjacentSibling => match get_previous_sibling(current_node) {
+                    Some(previous) => {
+                        current_node = previous;
+                        if !simple_match(current_node, sel) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                },
+                // `a ~ b`: b comes after a, with anything in between. This is
+                // what a page's menus are built on — a hidden checkbox and a
+                // rule that reveals the panel further along the same row.
+                Combinator::GeneralSibling => {
+                    let mut matched = false;
+                    while let Some(previous) = get_previous_sibling(current_node) {
+                        current_node = previous;
+                        if simple_match(current_node, sel) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        return false;
+                    }
+                }
             }
             target_combinator = *combinator;
         }

@@ -1584,6 +1584,22 @@ impl MistilteinnApp {
             );
         }
 
+        // The tick in a checkbox and the dot in a radio, drawn over the frame
+        // the box already painted for itself.
+        for (rect, state) in crate::layout::collect_toggle_boxes(&page.layout_root) {
+            let (tx, ty) = to_screen(rect.x, rect.y);
+            crate::render::draw_toggle(
+                &mut composite_buffer,
+                win_w,
+                win_h,
+                tx,
+                ty,
+                rect.width,
+                rect.height,
+                state,
+            );
+        }
+
         for select in crate::layout::collect_select_boxes(&page.layout_root) {
             let (sx, sy) = to_screen(select.x, select.y);
             crate::render::draw_select_arrow(
@@ -4565,6 +4581,7 @@ impl ApplicationHandler for MistilteinnApp {
                                         let mut link_to_navigate: Option<String> = None;
                                         let mut anchor_jump_target: Option<String> = None;
                                         let mut focus_moved = false;
+                                        let mut control_to_toggle: Option<u32> = None;
 
                                         if let Some(tab) = self.tab_manager.active_tab_mut() {
                                             if let Some(ref mut page) = tab.page {
@@ -4586,6 +4603,21 @@ impl ApplicationHandler for MistilteinnApp {
                                                 // from the page has to be read after this.
                                                 let script_outcome =
                                                     page.dispatch_event_along(&dom_path, "click");
+
+                                                // A checkbox flips when it is clicked, and
+                                                // so does the label that stands for it — a
+                                                // page's menus are usually a hidden checkbox
+                                                // with the visible control sitting on top of
+                                                // it. The innermost one wins, so a label
+                                                // inside another label picks the right box.
+                                                control_to_toggle =
+                                                    dom_path.iter().rev().find_map(|&node_id| {
+                                                        if page.control_kind(node_id).is_some() {
+                                                            Some(node_id)
+                                                        } else {
+                                                            page.label_target(node_id)
+                                                        }
+                                                    });
 
                                                 // A <select> swallows the click: it opens
                                                 // its list rather than focusing anything.
@@ -4701,6 +4733,19 @@ impl ApplicationHandler for MistilteinnApp {
                                             self.load_url(&target_url);
                                             return;
                                         }
+                                        if let Some(control) = control_to_toggle
+                                            && let Some(page) = self
+                                                .tab_manager
+                                                .active_tab_mut()
+                                                .and_then(|tab| tab.page.as_mut())
+                                            && page.toggle_control_and_recompute(control)
+                                        {
+                                            // The styles the change unlocks — a `:checked`
+                                            // rule revealing a panel — are already in the
+                                            // recompute the toggle did.
+                                            focus_moved = false;
+                                        }
+
                                         if focus_moved {
                                             // `:focus` picks out a different
                                             // element now, so the styles that

@@ -955,6 +955,45 @@ pub fn with_scissor(
     }
 }
 
+/// Draw the mark inside a checkbox or a radio button.
+///
+/// The frame around it is an ordinary background and border from the
+/// user-agent sheet, painted with every other box; this is only the tick or the
+/// dot, which is not something a box can be given.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_toggle(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    state: crate::layout::ToggleState,
+) {
+    if !state.checked {
+        return;
+    }
+    let size = width.min(height);
+    if size < 6.0 {
+        return;
+    }
+    // Centred, so a page that gives the control a rectangle rather than a
+    // square still gets its mark in the middle of it.
+    let x = x + (width - size) / 2.0;
+    let y = y + (height - size) / 2.0;
+    let color = [51, 102, 204, 255];
+
+    match state.kind {
+        crate::layout::ToggleKind::Checkbox => {
+            icons::checkmark(dest, dest_width, dest_height, x, y, size, color)
+        }
+        crate::layout::ToggleKind::Radio => {
+            icons::radio_dot(dest, dest_width, dest_height, x, y, size, color)
+        }
+    }
+}
+
 /// Draw the drop arrow of a `<select>`, inside the padding the UA style
 /// reserves on its right edge.
 pub fn draw_select_arrow(

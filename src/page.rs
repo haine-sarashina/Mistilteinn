@@ -1048,6 +1048,107 @@ mod tests {
         assert_eq!(rect_of(&page, "wrap").height, 50.0, "30 above, 20 of box");
     }
 
+    // -- Form controls --
+
+    /// Every painted run as `(text, x, colour)`, rounded to the pixel.
+    fn runs_of(page: &Page) -> Vec<(String, i32, [u8; 4])> {
+        crate::layout::collect_text_nodes(&page.layout_root)
+            .into_iter()
+            .map(|run| (run.text, run.x.round() as i32, run.color))
+            .collect()
+    }
+
+    fn field_page(html: &str) -> Page {
+        Page::new(
+            html,
+            "body { margin: 0 }
+             input { width: 200px; height: 30px; padding: 4px 8px; border: 1px solid #767676 }",
+            600.0,
+            200.0,
+        )
+    }
+
+    /// A field's text is its content, painted inside it. Read as an ordinary
+    /// run it joined the line of the block around it — the search box's
+    /// placeholder was laid out across its neighbours and the field itself came
+    /// out ten pixels wide.
+    #[test]
+    fn a_field_holds_its_own_text() {
+        let page =
+            field_page("<html><body><div><input placeholder='Search'>after</div></body></html>");
+        let field = rect_of_tag(&page, "input");
+        assert_eq!((field.width, field.height), (200.0, 30.0));
+
+        let runs = runs_of(&page);
+        let hint = runs
+            .iter()
+            .find(|(text, _, _)| text.contains("Search"))
+            .unwrap_or_else(|| panic!("the placeholder should be painted: {runs:?}"));
+        assert!(
+            (hint.1 as f32) >= field.x && (hint.1 as f32) < field.x + field.width,
+            "and painted inside the field: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn a_field_is_a_box_on_the_line_beside_it() {
+        // The words after a field start after the whole control, not after the
+        // width of whatever text happens to be in it.
+        let with_hint =
+            field_page("<html><body><div><input placeholder='Search'>after</div></body></html>");
+        let without = field_page("<html><body><div><input>after</div></body></html>");
+        let after_x = |page: &Page| {
+            runs_of(page)
+                .into_iter()
+                .find(|(text, _, _)| text.contains("after"))
+                .map(|(_, x, _)| x)
+                .expect("the word after the field")
+        };
+        assert_eq!(
+            after_x(&with_hint),
+            after_x(&without),
+            "what is in the field does not move what is beside it"
+        );
+    }
+
+    #[test]
+    fn a_placeholder_is_muted_and_a_value_is_not() {
+        let hint = field_page("<html><body><input placeholder='Search'></body></html>");
+        let typed = field_page("<html><body><input value='Search'></body></html>");
+        let colour_of = |page: &Page| runs_of(page)[0].2;
+        assert_ne!(
+            colour_of(&hint),
+            colour_of(&typed),
+            "a prompt and something the reader typed should not look the same"
+        );
+        assert_eq!(colour_of(&typed), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_fields_text_starts_inside_its_frame() {
+        let page = field_page("<html><body><input value='typed'></body></html>");
+        let (_, x, _) = runs_of(&page)[0];
+        assert_eq!(x, 9, "past the 1px border and the 8px of padding");
+    }
+
+    /// The rect of the first box built from this tag.
+    fn rect_of_tag(page: &Page, tag: &str) -> Rect {
+        fn walk(node: &crate::layout::LayoutNode, page: &Page, tag: &str) -> Option<Rect> {
+            let is_it = node.dom_node_id.is_some_and(|id| {
+                page.arena
+                    .get(crate::html::DomHandle(crate::html::NodeId::from_raw(id)))
+                    .and_then(|n| n.tag_name().map(|t| t.to_string()))
+                    .as_deref()
+                    == Some(tag)
+            });
+            if is_it {
+                return Some(node.rect);
+            }
+            node.children.iter().find_map(|c| walk(c, page, tag))
+        }
+        walk(&page.layout_root, page, tag).unwrap_or_else(|| panic!("no <{tag}> laid out"))
+    }
+
     // -- Inline backgrounds --
 
     /// Where the highlight was painted, one rectangle per line it covers.

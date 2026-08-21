@@ -314,6 +314,13 @@ pub struct LayoutNode {
     /// Ordinary boxes carry 1, which is what an unnumbered list would count
     /// from anyway.
     pub list_start: i32,
+    /// Whether this box draws its own content instead of flowing it.
+    ///
+    /// A form control's value belongs inside the control. Left to the ordinary
+    /// inline path, the text on a `<input>` joined the line of the block around
+    /// it — so a search field's placeholder was laid out across its neighbours
+    /// and the field itself came out a few pixels wide.
+    pub replaced: bool,
     /// Where an inline box actually sits, in the lines of the block that
     /// contains it.
     ///
@@ -403,6 +410,7 @@ impl LayoutNode {
             is_line_break: false,
             outside_marker: false,
             list_start: 1,
+            replaced: false,
             inline_fragments: Vec::new(),
         }
     }
@@ -3196,6 +3204,21 @@ fn collect_inline_boxes_recursive(
         return;
     }
 
+    // A replaced box takes room on the line and draws its own content inside
+    // itself. Reading its text as a run would lay the control's own value out
+    // across the line beside it.
+    if child.replaced {
+        boxes.push(InlineBox::Element {
+            child_index: child_idx,
+            width: child.explicit_width.unwrap_or(child.rect.width),
+            height: child.explicit_height.unwrap_or(child.rect.height),
+            baseline_offset: 0.0,
+            dom_node_id: dom_id,
+            interaction_type: interaction,
+        });
+        return;
+    }
+
     if let Some(ref text) = child.text {
         if is_collapsible_whitespace(text) {
             boxes.push(InlineBox::Whitespace {
@@ -3472,9 +3495,15 @@ fn position_inline_children_in_lines(
                 InlineBox::Text {
                     width, font_size, ..
                 } => {
-                    // Map this text box to the corresponding text child
+                    // Map this text box to the corresponding text child. A
+                    // replaced box has text of its own but puts an element on
+                    // the line rather than a run, so it is not a candidate —
+                    // matching one here handed a field the size of somebody
+                    // else's words.
                     while text_child_idx < children.len() {
-                        if children[text_child_idx].text.is_some() {
+                        if children[text_child_idx].text.is_some()
+                            && !children[text_child_idx].replaced
+                        {
                             let line_h = *font_size * 1.2;
                             positions.push((
                                 text_child_idx,
@@ -3966,6 +3995,13 @@ fn inline_box_width(box_item: &InlineBox) -> f32 {
     }
 }
 
+/// The colour a field's placeholder is drawn in.
+///
+/// Grey rather than the field's own colour: the text is a prompt, not something
+/// the reader typed, and a page that has not styled `::placeholder` still
+/// expects the two to look different.
+const PLACEHOLDER_COLOR: [u8; 4] = [117, 117, 117, 255];
+
 /// Apply the intrinsic text and default size of a form control.
 ///
 /// Shared by both layout-building paths so the controls cannot drift apart
@@ -3975,15 +4011,23 @@ where
     N: LayoutDomNode,
     F: Copy + Fn(u32) -> Option<N>,
 {
+    if matches!(tag, "input" | "textarea" | "select") {
+        layout_node.replaced = true;
+    }
     match tag {
         "input" | "textarea" => {
-            let val = node
-                .get_attr("value")
-                .or_else(|| node.get_attr("placeholder"));
-            if let Some(t) = val {
-                if !t.is_empty() {
-                    layout_node.text = Some(t);
+            // A value is the reader's own text; a placeholder is the page
+            // telling them what to put there, and is drawn muted so the two are
+            // not mistaken for each other.
+            let value = node.get_attr("value").filter(|v| !v.is_empty());
+            let placeholder = node.get_attr("placeholder").filter(|p| !p.is_empty());
+            match (value, placeholder) {
+                (Some(value), _) => layout_node.text = Some(value),
+                (None, Some(hint)) => {
+                    layout_node.text = Some(hint);
+                    layout_node.color = Some(PLACEHOLDER_COLOR);
                 }
+                (None, None) => {}
             }
             if layout_node.explicit_width.is_none() {
                 let default_w = if tag == "textarea" { 240.0 } else { 160.0 };
@@ -5778,7 +5822,10 @@ pub fn collect_text_nodes(node: &LayoutNode) -> Vec<TextInfo> {
 /// it again from the child stacks a second copy on top, at whatever stale rect
 /// the child was left with.
 fn text_flattened_into_parent(parent: &LayoutNode, child: &LayoutNode) -> bool {
-    parent.line_boxes.is_some()
+    // A replaced box is never flattened: its text is its content, painted
+    // inside it, and the line around it only knows how much room it takes.
+    !child.replaced
+        && parent.line_boxes.is_some()
         && (matches!(
             child.display,
             DisplayType::Inline | DisplayType::InlineBlock
@@ -5866,10 +5913,27 @@ pub fn collect_own_text(node: &LayoutNode) -> Vec<TextInfo> {
             // Use CSS `color` (foreground) as text color, default to black
             let color = node.color.unwrap_or([0, 0, 0, 255]);
 
+            // Text starts inside the box, not on its border. A field with 8px
+            // of padding drew its value tight against the frame without this.
+            let inset_x = node.padding[3] + node.border[3];
+            let mut inset_y = node.padding[0] + node.border[0];
+
+            // A control's one line of text sits in the middle of it. Anything
+            // else starts at the top of its content, as a block does.
+            if node.replaced {
+                let inner = node.rect.height
+                    - node.padding[0]
+                    - node.padding[2]
+                    - node.border[0]
+                    - node.border[2];
+                let line = node.font_size * 1.2;
+                inset_y += ((inner - line) / 2.0).max(0.0);
+            }
+
             texts.push(TextInfo {
-                x: node.rect.x,
-                y: node.rect.y,
-                width: node.rect.width,
+                x: node.rect.x + inset_x,
+                y: node.rect.y + inset_y,
+                width: (node.rect.width - inset_x - node.padding[1] - node.border[1]).max(0.0),
                 text: node.text_style.transform.apply(text).into_owned(),
                 color,
                 font_size: node.font_size,

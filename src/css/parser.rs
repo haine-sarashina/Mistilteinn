@@ -76,21 +76,78 @@ pub struct Selector {
 ///
 /// The fields are trait objects rather than generics so that `:not(...)` can
 /// call back into the matcher without the compiler chasing an unbounded chain
-/// of instantiations.
-struct MatchCtx<'a> {
-    tag_name: &'a str,
-    classes: &'a dyn Fn(&str) -> bool,
-    has_id: &'a dyn Fn(&str) -> bool,
-    matches_attr: &'a dyn Fn(&str, &AttrOperator, Option<&str>) -> bool,
-    is_first_child: &'a dyn Fn() -> bool,
-    is_last_child: &'a dyn Fn() -> bool,
-    is_only_child: &'a dyn Fn() -> bool,
-    child_index_1based: &'a dyn Fn() -> usize,
-    is_hovered: &'a dyn Fn() -> bool,
+/// of instantiations. They are also why this is a struct and not an argument
+/// list: a pseudo-class is a question about the element, and there are a lot
+/// of questions.
+///
+/// Build one with [`ElementFacts::for_tag`] and fill in the answers the caller
+/// actually has. Anything left alone answers "no", which is the right default
+/// for a browser that does not know: an unanswered question should not make a
+/// rule match.
+pub struct ElementFacts<'a> {
+    pub tag_name: &'a str,
+    pub classes: &'a dyn Fn(&str) -> bool,
+    pub has_id: &'a dyn Fn(&str) -> bool,
+    pub matches_attr: &'a dyn Fn(&str, &AttrOperator, Option<&str>) -> bool,
+    /// Where the element sits among its element siblings, counted from the
+    /// start and from the end, both 1-based.
+    ///
+    /// `(0, 0)` means the position is not known, and nothing positional
+    /// matches — as opposed to `(1, 1)`, which is a genuine only child.
+    pub child_index: &'a dyn Fn() -> (usize, usize),
+    /// The same, counting only the siblings that share this element's tag.
+    pub type_index: &'a dyn Fn() -> (usize, usize),
+    /// Whether this is the element the document hangs off — `<html>`.
+    pub is_root: &'a dyn Fn() -> bool,
+    /// Whether the element has no children at all, text included.
+    pub is_empty: &'a dyn Fn() -> bool,
+    pub is_hovered: &'a dyn Fn() -> bool,
+    pub is_focused: &'a dyn Fn() -> bool,
+    pub is_checked: &'a dyn Fn() -> bool,
+    pub is_disabled: &'a dyn Fn() -> bool,
+    /// Whether this link has been followed before. We keep no history, so this
+    /// is always false — see the `:visited` arm for why that is the answer and
+    /// not a gap.
+    pub is_visited: &'a dyn Fn() -> bool,
+}
+
+/// The answer to a question nobody supplied: no.
+const NO: &dyn Fn() -> bool = &|| false;
+
+impl<'a> ElementFacts<'a> {
+    /// An element known only by its tag name.
+    pub fn for_tag(tag_name: &'a str) -> Self {
+        Self {
+            tag_name,
+            classes: &|_| false,
+            has_id: &|_| false,
+            matches_attr: &|_, _, _| false,
+            child_index: &|| (0, 0),
+            type_index: &|| (0, 0),
+            is_root: NO,
+            is_empty: NO,
+            is_hovered: NO,
+            is_focused: NO,
+            is_checked: NO,
+            is_disabled: NO,
+            is_visited: NO,
+        }
+    }
+}
+
+/// Tags that can carry `disabled`, and so can answer `:enabled`.
+///
+/// `:enabled` is not "not disabled": a `<div>` is neither, and a rule written
+/// for enabled controls should not paint every element on the page.
+fn is_form_control(tag: &str) -> bool {
+    matches!(
+        tag,
+        "button" | "input" | "select" | "textarea" | "option" | "optgroup" | "fieldset"
+    )
 }
 
 /// Match one simple selector against the element `ctx` describes.
-fn matches_simple(sel: &SimpleSelector, ctx: &MatchCtx<'_>) -> bool {
+fn matches_simple(sel: &SimpleSelector, ctx: &ElementFacts<'_>) -> bool {
     match sel {
         SimpleSelector::Universal => true,
         SimpleSelector::Type(t) => ctx.tag_name.eq_ignore_ascii_case(t),
@@ -101,23 +158,58 @@ fn matches_simple(sel: &SimpleSelector, ctx: &MatchCtx<'_>) -> bool {
             operator,
             value,
         } => (ctx.matches_attr)(name, operator, value.as_deref()),
-        SimpleSelector::PseudoClass { name, arguments } => match name.as_str() {
-            "first-child" => (ctx.is_first_child)(),
-            "last-child" => (ctx.is_last_child)(),
-            "only-child" => (ctx.is_only_child)(),
-            "nth-child" => arguments
-                .as_deref()
-                .is_some_and(|arg| matches_nth_child(arg, (ctx.child_index_1based)())),
-            "hover" => (ctx.is_hovered)(),
-            "not" => arguments
-                .as_deref()
-                .is_some_and(|args| !nested_list_matches(args, ctx)),
-            "is" | "where" | "matches" | "any" | "-moz-any" | "-webkit-any" => arguments
-                .as_deref()
-                .is_some_and(|args| nested_list_matches(args, ctx)),
-            _ => false,
-        },
+        SimpleSelector::PseudoClass { name, arguments } => {
+            matches_pseudo_class(name, arguments.as_deref(), ctx)
+        }
         SimpleSelector::PseudoElement(_) => false,
+    }
+}
+
+/// Match one `:pseudo-class`, with its parenthesised argument if it had one.
+fn matches_pseudo_class(name: &str, arguments: Option<&str>, ctx: &ElementFacts<'_>) -> bool {
+    // Positions are 1-based from each end; 0 means we were not told.
+    let position = || (ctx.child_index)();
+    let type_position = || (ctx.type_index)();
+    let nth =
+        |index: usize| index > 0 && arguments.is_some_and(|arg| matches_nth_child(arg, index));
+    let has_href = || (ctx.matches_attr)("href", &AttrOperator::Existence, None);
+
+    match name {
+        "first-child" => position().0 == 1,
+        "last-child" => position().1 == 1,
+        "only-child" => position() == (1, 1),
+        "nth-child" => nth(position().0),
+        "nth-last-child" => nth(position().1),
+
+        "first-of-type" => type_position().0 == 1,
+        "last-of-type" => type_position().1 == 1,
+        "only-of-type" => type_position() == (1, 1),
+        "nth-of-type" => nth(type_position().0),
+        "nth-last-of-type" => nth(type_position().1),
+
+        "root" => (ctx.is_root)(),
+        "empty" => (ctx.is_empty)(),
+
+        "hover" => (ctx.is_hovered)(),
+        // `:focus-visible` is `:focus` arrived at by keyboard. We have one way
+        // of focusing something, so the two say the same thing here.
+        "focus" | "focus-visible" => (ctx.is_focused)(),
+        "checked" => (ctx.is_checked)(),
+        "disabled" => is_form_control(ctx.tag_name) && (ctx.is_disabled)(),
+        "enabled" => is_form_control(ctx.tag_name) && !(ctx.is_disabled)(),
+
+        // We keep no browsing history, so no link has been visited. That is
+        // also what a browser with history disabled reports, and pages are
+        // built to survive it — the unvisited colour is the one that shows.
+        "visited" => (ctx.is_visited)(),
+        "link" => has_href() && !(ctx.is_visited)(),
+        "any-link" => has_href(),
+
+        "not" => arguments.is_some_and(|args| !nested_list_matches(args, ctx)),
+        "is" | "where" | "matches" | "any" | "-moz-any" | "-webkit-any" => {
+            arguments.is_some_and(|args| nested_list_matches(args, ctx))
+        }
+        _ => false,
     }
 }
 
@@ -128,7 +220,7 @@ fn matches_simple(sel: &SimpleSelector, ctx: &MatchCtx<'_>) -> bool {
 /// whether the element is both at once, which is stricter than the descendant
 /// test it stands for — and a `:not()` that is too strict lets its rule
 /// through rather than dropping it, which is the safer way to be wrong.
-fn nested_list_matches(arguments: &str, ctx: &MatchCtx<'_>) -> bool {
+fn nested_list_matches(arguments: &str, ctx: &ElementFacts<'_>) -> bool {
     nested_selectors(arguments).iter().any(|sel| {
         !sel.complex.is_empty()
             && sel
@@ -290,10 +382,27 @@ impl Selector {
         (ids, classes, types)
     }
 
-    /// Check if this selector matches a DOM node (by tag/class/id lookup).
+    /// Whether this selector's rightmost compound matches one element.
     ///
-    /// Simplified — does not handle combinators fully (only checks the last
-    /// simple-selector chain component).
+    /// Combinators are not walked here; [`Selector::full_matches`] is what
+    /// climbs the tree. This answers the "is this the element on the right of
+    /// the selector" half.
+    pub fn matches_facts(&self, facts: &ElementFacts<'_>) -> bool {
+        match self.complex.last() {
+            Some((_, last)) => matches_simple(last, facts),
+            None => false,
+        }
+    }
+
+    /// Match one simple selector against an element.
+    pub fn simple_matches_facts(sel: &SimpleSelector, facts: &ElementFacts<'_>) -> bool {
+        matches_simple(sel, facts)
+    }
+
+    /// Check if this selector matches a DOM node by tag, class and id alone.
+    ///
+    /// The short form, for callers that have nothing else to say about the
+    /// element. Everything a pseudo-class would ask about answers "no".
     pub fn matches_element(
         &self,
         tag_name: &str,
@@ -301,35 +410,16 @@ impl Selector {
         has_id: impl Fn(&str) -> bool,
         is_first_child: impl Fn() -> bool,
     ) -> bool {
-        if let Some((_, last)) = self.complex.last() {
-            Self::simple_matches(last, tag_name, classes, has_id, is_first_child)
-        } else {
-            false
-        }
+        let child_index = || if is_first_child() { (1, 0) } else { (2, 0) };
+        self.matches_facts(&ElementFacts {
+            classes: &classes,
+            has_id: &has_id,
+            child_index: &child_index,
+            ..ElementFacts::for_tag(tag_name)
+        })
     }
 
-    fn simple_matches(
-        sel: &SimpleSelector,
-        tag_name: &str,
-        classes: impl Fn(&str) -> bool,
-        has_id: impl Fn(&str) -> bool,
-        is_first_child: impl Fn() -> bool,
-    ) -> bool {
-        Self::simple_matches_with_context(
-            sel,
-            tag_name,
-            classes,
-            has_id,
-            |_, _, _| false,
-            is_first_child,
-            || false,
-            || false,
-            || 1,
-            || false,
-        )
-    }
-
-    /// Like [`matches_element`] but also evaluates `:hover` at runtime.
+    /// Like [`Selector::matches_element`] but also evaluates `:hover`.
     pub fn matches_element_with_hover(
         &self,
         tag_name: &str,
@@ -338,72 +428,14 @@ impl Selector {
         is_first_child: impl Fn() -> bool,
         is_hovered: impl Fn() -> bool,
     ) -> bool {
-        if let Some((_, last)) = self.complex.last() {
-            Self::simple_matches_with_hover(
-                last,
-                tag_name,
-                classes,
-                has_id,
-                is_first_child,
-                is_hovered,
-            )
-        } else {
-            false
-        }
-    }
-
-    pub fn simple_matches_with_hover(
-        sel: &SimpleSelector,
-        tag_name: &str,
-        classes: impl Fn(&str) -> bool,
-        has_id: impl Fn(&str) -> bool,
-        is_first_child: impl Fn() -> bool,
-        is_hovered: impl Fn() -> bool,
-    ) -> bool {
-        Self::simple_matches_with_context(
-            sel,
-            tag_name,
-            classes,
-            has_id,
-            |_, _, _| false,
-            is_first_child,
-            || false,
-            || false,
-            || 1,
-            is_hovered,
-        )
-    }
-
-    /// Comprehensive selector matcher evaluating types, classes, IDs, attribute operators, and pseudo-classes.
-    pub fn simple_matches_with_context(
-        sel: &SimpleSelector,
-        tag_name: &str,
-        classes: impl Fn(&str) -> bool,
-        has_id: impl Fn(&str) -> bool,
-        matches_attr: impl Fn(&str, &AttrOperator, Option<&str>) -> bool,
-        is_first_child: impl Fn() -> bool,
-        is_last_child: impl Fn() -> bool,
-        is_only_child: impl Fn() -> bool,
-        child_index_1based: impl Fn() -> usize,
-        is_hovered: impl Fn() -> bool,
-    ) -> bool {
-        // Every caller brings its own closure types, but `:not()` has to
-        // re-enter the matcher on the same element. Trait objects give it one
-        // type to recurse through.
-        matches_simple(
-            sel,
-            &MatchCtx {
-                tag_name,
-                classes: &classes,
-                has_id: &has_id,
-                matches_attr: &matches_attr,
-                is_first_child: &is_first_child,
-                is_last_child: &is_last_child,
-                is_only_child: &is_only_child,
-                child_index_1based: &child_index_1based,
-                is_hovered: &is_hovered,
-            },
-        )
+        let child_index = || if is_first_child() { (1, 0) } else { (2, 0) };
+        self.matches_facts(&ElementFacts {
+            classes: &classes,
+            has_id: &has_id,
+            child_index: &child_index,
+            is_hovered: &is_hovered,
+            ..ElementFacts::for_tag(tag_name)
+        })
     }
 
     /// The pseudo-element this selector targets, if it ends in one.
@@ -536,7 +568,27 @@ pub struct MediaRule {
 /// * A feature whose value we cannot parse makes its query **false**, never
 ///   true. CSS drops what it cannot understand; a query that fails open
 ///   applies a `max-width: 640px` block to a 1280px window.
-pub fn evaluate_media_condition(condition: &str, viewport_width: f32) -> bool {
+/// What the media queries are being asked about: this window, right now.
+///
+/// A struct rather than a pair of floats because a media feature can ask about
+/// anything, and the ones we grow into next should not each rewrite the
+/// signature of every function between here and the cascade.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MediaContext {
+    pub viewport_width: f32,
+    pub viewport_height: f32,
+}
+
+impl MediaContext {
+    pub fn new(viewport_width: f32, viewport_height: f32) -> Self {
+        Self {
+            viewport_width,
+            viewport_height,
+        }
+    }
+}
+
+pub fn evaluate_media_condition(condition: &str, ctx: MediaContext) -> bool {
     let condition = condition.trim();
     // `@media { … }` with nothing to say applies everywhere.
     if condition.is_empty() {
@@ -544,14 +596,14 @@ pub fn evaluate_media_condition(condition: &str, viewport_width: f32) -> bool {
     }
     split_top_level(condition, ',')
         .iter()
-        .any(|query| evaluate_media_query(query, viewport_width))
+        .any(|query| evaluate_media_query(query, ctx))
 }
 
 /// One query out of a comma-separated list.
 ///
 /// Shape: `[not | only] <media-type> [and <feature>]*`, or a bare list of
 /// features with the type left implicit (`all`).
-fn evaluate_media_query(query: &str, viewport_width: f32) -> bool {
+fn evaluate_media_query(query: &str, ctx: MediaContext) -> bool {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
         return false;
@@ -569,30 +621,30 @@ fn evaluate_media_query(query: &str, viewport_width: f32) -> bool {
 
     let matched = split_top_level_and(rest)
         .iter()
-        .all(|part| evaluate_media_part(part, viewport_width));
+        .all(|part| evaluate_media_part(part, ctx));
 
     matched != negated
 }
 
 /// One `and`-joined term: either a media type or a parenthesised feature.
-fn evaluate_media_part(part: &str, viewport_width: f32) -> bool {
+fn evaluate_media_part(part: &str, ctx: MediaContext) -> bool {
     let part = part.trim();
     if part.is_empty() {
         return false;
     }
     if part.starts_with('(') {
-        evaluate_media_feature(part, viewport_width)
+        evaluate_media_feature(part, ctx)
     } else {
         // We are a screen. `print`, `speech` and the deprecated types are not us.
         matches!(part, "all" | "screen")
     }
 }
 
-/// A single `(feature: value)` term.
+/// A single `(feature: value)` term, or a bare `(feature)`.
 ///
 /// An unrecognised feature is false, per the CSS rule that an unknown media
 /// feature never matches.
-fn evaluate_media_feature(feature: &str, viewport_width: f32) -> bool {
+fn evaluate_media_feature(feature: &str, ctx: MediaContext) -> bool {
     let inner = feature
         .trim()
         .strip_prefix('(')
@@ -605,13 +657,11 @@ fn evaluate_media_feature(feature: &str, viewport_width: f32) -> bool {
 
     // A parenthesised group rather than a feature: `((a) and (b))`.
     if inner.starts_with('(') {
-        return evaluate_media_query(inner, viewport_width);
+        return evaluate_media_query(inner, ctx);
     }
 
     let Some((name, value)) = inner.split_once(':') else {
-        // A boolean feature — `(color)`, `(hover)`. None of the ones we could
-        // answer for are worth guessing at.
-        return false;
+        return evaluate_boolean_media_feature(inner, ctx);
     };
     let name = name.trim();
     let value = value.trim();
@@ -621,23 +671,53 @@ fn evaluate_media_feature(feature: &str, viewport_width: f32) -> bool {
         crate::css::parse_length_ctx(
             value,
             crate::css::LengthContext {
-                viewport_width,
+                viewport_width: ctx.viewport_width,
+                viewport_height: ctx.viewport_height,
                 ..crate::css::LengthContext::default()
             },
         )
     };
 
+    let (width, height) = (ctx.viewport_width, ctx.viewport_height);
     match name {
-        "min-width" => length().is_some_and(|v| viewport_width >= v),
-        "max-width" => length().is_some_and(|v| viewport_width <= v),
-        "width" => length().is_some_and(|v| (viewport_width - v).abs() < 0.5),
+        "min-width" => length().is_some_and(|v| width >= v),
+        "max-width" => length().is_some_and(|v| width <= v),
+        "width" => length().is_some_and(|v| (width - v).abs() < 0.5),
+        "min-height" => length().is_some_and(|v| height >= v),
+        "max-height" => length().is_some_and(|v| height <= v),
+        "height" => length().is_some_and(|v| (height - v).abs() < 0.5),
         // We paint a light page and animate freely.
         "prefers-color-scheme" => value == "light",
         "prefers-reduced-motion" => value == "no-preference",
         // A desktop window with a mouse in it.
         "hover" | "any-hover" => value == "hover",
         "pointer" | "any-pointer" => value == "fine",
-        "orientation" => value == "landscape",
+        "orientation" => {
+            if width >= height {
+                value == "landscape"
+            } else {
+                value == "portrait"
+            }
+        }
+        _ => false,
+    }
+}
+
+/// A feature named with no value: `(width)`, `(hover)`, `(color)`.
+///
+/// The rule is that the feature is true unless its value would be zero or
+/// `none`, which is how a page asks "do you have this at all". A feature we
+/// have no answer for stays false, the same as anywhere else.
+fn evaluate_boolean_media_feature(name: &str, ctx: MediaContext) -> bool {
+    match name.trim() {
+        "width" => ctx.viewport_width != 0.0,
+        "height" => ctx.viewport_height != 0.0,
+        // 8 bits a channel, a pointer that can hover, and an orientation.
+        "color" | "any-hover" | "hover" | "pointer" | "any-pointer" | "orientation" => true,
+        // Named with no value, these ask whether there is a preference at all.
+        // We render light, and we do not hold back animation.
+        "prefers-color-scheme" => true,
+        "prefers-reduced-motion" => false,
         _ => false,
     }
 }
@@ -1612,20 +1692,38 @@ mod tests {
     /// mincho with no search box.
     #[test]
     fn print_only_rules_do_not_apply_to_the_screen() {
-        assert!(!evaluate_media_condition("print", 1280.0));
+        assert!(!evaluate_media_condition(
+            "print",
+            MediaContext::new(1280.0, 800.0)
+        ));
         assert!(!evaluate_media_condition(
             "print and (min-width: 100px)",
-            1280.0
+            MediaContext::new(1280.0, 800.0)
         ));
-        assert!(evaluate_media_condition("not print", 1280.0));
+        assert!(evaluate_media_condition(
+            "not print",
+            MediaContext::new(1280.0, 800.0)
+        ));
     }
 
     #[test]
     fn screen_and_all_apply() {
-        assert!(evaluate_media_condition("screen", 1280.0));
-        assert!(evaluate_media_condition("all", 1280.0));
-        assert!(evaluate_media_condition("only screen", 1280.0));
-        assert!(evaluate_media_condition("", 1280.0));
+        assert!(evaluate_media_condition(
+            "screen",
+            MediaContext::new(1280.0, 800.0)
+        ));
+        assert!(evaluate_media_condition(
+            "all",
+            MediaContext::new(1280.0, 800.0)
+        ));
+        assert!(evaluate_media_condition(
+            "only screen",
+            MediaContext::new(1280.0, 800.0)
+        ));
+        assert!(evaluate_media_condition(
+            "",
+            MediaContext::new(1280.0, 800.0)
+        ));
     }
 
     /// MediaWiki writes its breakpoints as `calc(640px - 1px)`. Read as a bare
@@ -1636,19 +1734,19 @@ mod tests {
     fn a_breakpoint_written_as_calc_is_evaluated() {
         assert!(!evaluate_media_condition(
             "all and (max-width:calc(640px - 1px))",
-            1280.0
+            MediaContext::new(1280.0, 800.0)
         ));
         assert!(evaluate_media_condition(
             "all and (max-width:calc(640px - 1px))",
-            500.0
+            MediaContext::new(500.0, 800.0)
         ));
         assert!(!evaluate_media_condition(
             "screen and (max-width:calc(1120px - 1px))",
-            1280.0
+            MediaContext::new(1280.0, 800.0)
         ));
         assert!(evaluate_media_condition(
             "screen and (min-width:calc(640px - 1px))",
-            1280.0
+            MediaContext::new(1280.0, 800.0)
         ));
     }
 
@@ -1656,28 +1754,138 @@ mod tests {
     fn plain_width_breakpoints_still_work() {
         assert!(evaluate_media_condition(
             "screen and (min-width:1120px)",
-            1280.0
+            MediaContext::new(1280.0, 800.0)
         ));
         assert!(!evaluate_media_condition(
             "screen and (min-width:1680px)",
-            1280.0
+            MediaContext::new(1280.0, 800.0)
         ));
-        assert!(evaluate_media_condition("(max-width: 1399px)", 1280.0));
-        assert!(!evaluate_media_condition("(max-width: 640px)", 1280.0));
+        assert!(evaluate_media_condition(
+            "(max-width: 1399px)",
+            MediaContext::new(1280.0, 800.0)
+        ));
+        assert!(!evaluate_media_condition(
+            "(max-width: 640px)",
+            MediaContext::new(1280.0, 800.0)
+        ));
     }
 
     #[test]
     fn both_ends_of_a_range_must_hold() {
         let range = "screen and (min-width:640px) and (max-width:1120px)";
-        assert!(evaluate_media_condition(range, 800.0));
-        assert!(!evaluate_media_condition(range, 1280.0));
-        assert!(!evaluate_media_condition(range, 400.0));
+        assert!(evaluate_media_condition(
+            range,
+            MediaContext::new(800.0, 800.0)
+        ));
+        assert!(!evaluate_media_condition(
+            range,
+            MediaContext::new(1280.0, 800.0)
+        ));
+        assert!(!evaluate_media_condition(
+            range,
+            MediaContext::new(400.0, 800.0)
+        ));
+    }
+
+    /// A window is as tall as it is wide, and a page is entitled to ask.
+    /// Height used not to reach the evaluator at all, so every one of these
+    /// was false and the blocks behind them never applied.
+    #[test]
+    fn height_breakpoints_are_measured_against_the_window() {
+        let window = MediaContext::new(1280.0, 800.0);
+        assert!(evaluate_media_condition("(min-height: 720px)", window));
+        assert!(!evaluate_media_condition("(min-height: 900px)", window));
+        assert!(evaluate_media_condition("(max-height: 900px)", window));
+        assert!(!evaluate_media_condition("(max-height: 720px)", window));
+        assert!(evaluate_media_condition("(height: 800px)", window));
+        assert!(!evaluate_media_condition("(height: 799px)", window));
+    }
+
+    #[test]
+    fn a_height_may_be_written_as_arithmetic_too() {
+        let window = MediaContext::new(1280.0, 800.0);
+        assert!(evaluate_media_condition(
+            "screen and (max-height:calc(900px - 1px))",
+            window
+        ));
+        assert!(!evaluate_media_condition(
+            "screen and (min-height:calc(900px - 1px))",
+            window
+        ));
+    }
+
+    #[test]
+    fn width_and_height_can_be_asked_about_together() {
+        assert!(evaluate_media_condition(
+            "screen and (min-width: 1000px) and (min-height: 600px)",
+            MediaContext::new(1280.0, 800.0)
+        ));
+        assert!(
+            !evaluate_media_condition(
+                "screen and (min-width: 1000px) and (min-height: 600px)",
+                MediaContext::new(1280.0, 500.0)
+            ),
+            "a wide short window fails the half of the query it fails"
+        );
+    }
+
+    /// `(width)` with no value asks whether there is a width at all, not
+    /// whether it equals something. Read as a malformed `(name: value)` it was
+    /// false, which dropped blocks a page meant for everyone.
+    #[test]
+    fn a_feature_named_with_no_value_asks_whether_we_have_it() {
+        let window = MediaContext::new(1280.0, 800.0);
+        assert!(evaluate_media_condition("(width)", window));
+        assert!(evaluate_media_condition("(height)", window));
+        assert!(evaluate_media_condition("(color)", window));
+        assert!(evaluate_media_condition("(hover)", window));
+        assert!(evaluate_media_condition("(pointer)", window));
+        assert!(
+            !evaluate_media_condition("(prefers-reduced-motion)", window),
+            "asked bare, this is whether motion is being held back — it is not"
+        );
+        assert!(
+            !evaluate_media_condition("(monochrome)", window),
+            "a feature we cannot answer for is still no match"
+        );
+    }
+
+    #[test]
+    fn a_window_with_no_area_has_no_width_to_speak_of() {
+        // A minimized window is measured as 0×0, and `(width)` is the one
+        // question that has to notice.
+        assert!(!evaluate_media_condition(
+            "(width)",
+            MediaContext::new(0.0, 0.0)
+        ));
+    }
+
+    #[test]
+    fn orientation_follows_the_shape_of_the_window() {
+        assert!(evaluate_media_condition(
+            "(orientation: landscape)",
+            MediaContext::new(1280.0, 800.0)
+        ));
+        assert!(!evaluate_media_condition(
+            "(orientation: portrait)",
+            MediaContext::new(1280.0, 800.0)
+        ));
+        assert!(
+            evaluate_media_condition("(orientation: portrait)", MediaContext::new(600.0, 900.0)),
+            "a window dragged taller than it is wide is a portrait window"
+        );
     }
 
     #[test]
     fn a_query_list_matches_if_any_query_does() {
-        assert!(evaluate_media_condition("print, screen", 1280.0));
-        assert!(!evaluate_media_condition("print, speech", 1280.0));
+        assert!(evaluate_media_condition(
+            "print, screen",
+            MediaContext::new(1280.0, 800.0)
+        ));
+        assert!(!evaluate_media_condition(
+            "print, speech",
+            MediaContext::new(1280.0, 800.0)
+        ));
     }
 
     /// We render a light page and do not honour a motion preference, so the
@@ -1687,15 +1895,15 @@ mod tests {
     fn preference_features_answer_for_how_we_actually_render() {
         assert!(!evaluate_media_condition(
             "screen and (prefers-color-scheme:dark)",
-            1280.0
+            MediaContext::new(1280.0, 800.0)
         ));
         assert!(evaluate_media_condition(
             "screen and (prefers-color-scheme:light)",
-            1280.0
+            MediaContext::new(1280.0, 800.0)
         ));
         assert!(!evaluate_media_condition(
             "(prefers-reduced-motion:reduce)",
-            1280.0
+            MediaContext::new(1280.0, 800.0)
         ));
     }
 
@@ -1703,14 +1911,17 @@ mod tests {
     /// narrow-screen block style a wide window.
     #[test]
     fn an_unreadable_feature_fails_closed() {
-        assert!(!evaluate_media_condition("(min-resolution: 2dppx)", 1280.0));
+        assert!(!evaluate_media_condition(
+            "(min-resolution: 2dppx)",
+            MediaContext::new(1280.0, 800.0)
+        ));
         assert!(!evaluate_media_condition(
             "screen and (max-width: banana)",
-            1280.0
+            MediaContext::new(1280.0, 800.0)
         ));
         assert!(!evaluate_media_condition(
             "screen and (min-width: 100px) and (min-resolution: 2dppx)",
-            1280.0
+            MediaContext::new(1280.0, 800.0)
         ));
     }
 

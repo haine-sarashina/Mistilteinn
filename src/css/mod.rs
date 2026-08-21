@@ -456,7 +456,7 @@ pub fn compute_styles_for_tree(
     stylesheet: &parser::Stylesheet,
     viewport: (f32, f32),
 ) -> FxHashMap<u32, ComputedValues> {
-    compute_styles_for_tree_internal(arena, stylesheet, viewport, 1.0, |_| false)
+    compute_styles_for_tree_internal(arena, stylesheet, viewport, 1.0, |_| false, |_| false)
 }
 
 /// Compute styles with both a hover context and a page zoom factor.
@@ -470,10 +470,50 @@ pub fn compute_styles_for_tree_with_hover_zoom(
     hovered_ids: &[u32],
     zoom: f32,
 ) -> FxHashMap<u32, ComputedValues> {
-    let hover_set: std::collections::HashSet<u32> = hovered_ids.iter().copied().collect();
-    compute_styles_for_tree_internal(arena, stylesheet, viewport, zoom, |id| {
-        hover_set.contains(&id)
-    })
+    compute_styles_for_tree_with_state(
+        arena,
+        stylesheet,
+        viewport,
+        &InteractionState {
+            hovered: hovered_ids,
+            focused: None,
+        },
+        zoom,
+    )
+}
+
+/// What the pointer and the keyboard are doing to the page right now.
+///
+/// The dynamic half of the cascade. Everything else a selector asks about can
+/// be read off the document; these two change while the document stands still,
+/// and a style recompute is how the page finds out.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct InteractionState<'a> {
+    /// Elements under the cursor, ancestors included, so that `div:hover > a`
+    /// can be answered from the element the rule is about.
+    pub hovered: &'a [u32],
+    /// The element holding keyboard focus, if there is one.
+    pub focused: Option<u32>,
+}
+
+/// Compute styles against the page's current pointer and keyboard state.
+pub fn compute_styles_for_tree_with_state(
+    arena: &crate::html::DomArena,
+    stylesheet: &parser::Stylesheet,
+    viewport: (f32, f32),
+    state: &InteractionState<'_>,
+    zoom: f32,
+) -> FxHashMap<u32, ComputedValues> {
+    let hover_set: std::collections::HashSet<u32> = state.hovered.iter().copied().collect();
+    let focused = state.focused;
+    compute_styles_for_tree_internal(
+        arena,
+        stylesheet,
+        viewport,
+        zoom,
+        |id| hover_set.contains(&id),
+        move |id| focused == Some(id),
+    )
 }
 
 /// Compute styles with runtime hover context.
@@ -489,19 +529,22 @@ pub fn compute_styles_for_tree_with_hover(
     compute_styles_for_tree_with_hover_zoom(arena, stylesheet, viewport, hovered_ids, 1.0)
 }
 
-/// Internal implementation of style computation with a configurable hover predicate.
+/// Internal implementation of style computation with the dynamic state as
+/// predicates.
 ///
-/// The `is_hovered` closure returns `true` for elements that should match `:hover`.
-/// Pass `|_id| false` for static (no-hover) computation.
-fn compute_styles_for_tree_internal<F>(
+/// `is_hovered` and `is_focused` answer `:hover` and `:focus` for one element.
+/// Pass `|_id| false` for a static computation.
+fn compute_styles_for_tree_internal<F, G>(
     arena: &crate::html::DomArena,
     stylesheet: &parser::Stylesheet,
     viewport: (f32, f32),
     zoom: f32,
     is_hovered: F,
+    is_focused: G,
 ) -> FxHashMap<u32, ComputedValues>
 where
     F: Fn(u32) -> bool,
+    G: Fn(u32) -> bool,
 {
     let mut result = FxHashMap::default();
 
@@ -520,52 +563,7 @@ where
         })
         .collect();
 
-    // Pre-compute child relationships for pseudo-classes (:first-child, :last-child, :only-child, :nth-child)
-    let mut first_children: std::collections::HashSet<u32> =
-        std::collections::HashSet::with_capacity(element_ids.len());
-    let mut last_children: std::collections::HashSet<u32> =
-        std::collections::HashSet::with_capacity(element_ids.len());
-    let mut only_children: std::collections::HashSet<u32> =
-        std::collections::HashSet::with_capacity(element_ids.len());
-    let mut child_indices: rustc_hash::FxHashMap<u32, usize> = rustc_hash::FxHashMap::default();
-
-    let mut node_classes: rustc_hash::FxHashMap<u32, Vec<String>> =
-        rustc_hash::FxHashMap::default();
-    let mut node_ids: rustc_hash::FxHashMap<u32, String> = rustc_hash::FxHashMap::default();
-
-    for node in &*nodes_ref {
-        let elem_children: Vec<u32> = node
-            .children
-            .iter()
-            .map(|h| h.index() as u32)
-            .filter(|&id| element_ids.contains(&id))
-            .collect();
-
-        if let Some(&first_child) = elem_children.first() {
-            first_children.insert(first_child);
-        }
-        if let Some(&last_child) = elem_children.last() {
-            last_children.insert(last_child);
-        }
-        if elem_children.len() == 1 {
-            only_children.insert(elem_children[0]);
-        }
-        for (idx, &cid) in elem_children.iter().enumerate() {
-            child_indices.insert(cid, idx + 1); // 1-based index
-        }
-    }
-
-    for &node_id in &element_ids {
-        let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(node_id));
-        if let Some(node) = arena.get(handle) {
-            if let Some(attr) = node.get_attr("class") {
-                node_classes.insert(node_id, attr.split_whitespace().map(String::from).collect());
-            }
-            if let Some(id) = node.get_attr("id") {
-                node_ids.insert(node_id, id.to_string());
-            }
-        }
-    }
+    let index = DomIndex::build(arena, &nodes_ref, &element_ids);
 
     drop(nodes_ref);
 
@@ -576,7 +574,10 @@ where
     // Collect active rules from the stylesheet based on viewport width
     let mut active_rules: Vec<&parser::CSSRule> = stylesheet.rules.iter().collect();
     for media_rule in &stylesheet.media_rules {
-        if parser::evaluate_media_condition(&media_rule.condition, viewport.0) {
+        if parser::evaluate_media_condition(
+            &media_rule.condition,
+            parser::MediaContext::new(viewport.0, viewport.1),
+        ) {
             active_rules.extend(media_rule.rules.iter());
         }
     }
@@ -627,46 +628,7 @@ where
         };
 
         let simple_match = |id: u32, sel: &parser::SimpleSelector| -> bool {
-            let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(id));
-            let node = match arena.get(handle) {
-                Some(n) => n,
-                None => return false,
-            };
-            let tag = match node.tag_name() {
-                Some(t) => t,
-                None => return false,
-            };
-            let has_class = |c: &str| -> bool {
-                node_classes
-                    .get(&id)
-                    .map_or(false, |classes| classes.iter().any(|cls| cls == c))
-            };
-            let has_id_val =
-                |i: &str| -> bool { node_ids.get(&id).map_or(false, |id_str| id_str == i) };
-            let matches_attr = |name: &str, op: &parser::AttrOperator, val: Option<&str>| -> bool {
-                if let Some(attr_val) = node.get_attr(name) {
-                    parser::evaluate_attr_operator(attr_val, op, val)
-                } else {
-                    false
-                }
-            };
-            let is_first = || first_children.contains(&id);
-            let is_last = || last_children.contains(&id);
-            let is_only = || only_children.contains(&id);
-            let child_idx = || *child_indices.get(&id).unwrap_or(&1);
-            let hover = || is_hovered(id);
-            parser::Selector::simple_matches_with_context(
-                sel,
-                tag,
-                has_class,
-                has_id_val,
-                matches_attr,
-                is_first,
-                is_last,
-                is_only,
-                child_idx,
-                hover,
-            )
+            matches_for(id, sel, arena, &index, &is_hovered, &is_focused)
         };
 
         // Collect all matching rules with their specificity
@@ -781,18 +743,7 @@ where
                     }
                     let element_part = selector.without_pseudo_element();
                     let simple_match = |id: u32, sel: &parser::SimpleSelector| -> bool {
-                        matches_for(
-                            id,
-                            sel,
-                            arena,
-                            &node_classes,
-                            &node_ids,
-                            &first_children,
-                            &last_children,
-                            &only_children,
-                            &child_indices,
-                            &is_hovered,
-                        )
+                        matches_for(id, sel, arena, &index, &is_hovered, &is_focused)
                     };
                     let get_parent = |id: u32| -> Option<u32> {
                         arena
@@ -831,23 +782,137 @@ where
     result
 }
 
+/// Everything about the shape of the document that the selectors ask about.
+///
+/// Worked out once for the whole tree rather than per element per selector: a
+/// page has a few hundred distinct selectors and thousands of elements, and
+/// every one of `:first-child`, `:nth-of-type` and `:empty` is a question about
+/// where an element sits rather than about the rule asking.
+#[derive(Default)]
+struct DomIndex {
+    classes: rustc_hash::FxHashMap<u32, Vec<String>>,
+    ids: rustc_hash::FxHashMap<u32, String>,
+    /// Position among element siblings: `(from the start, from the end)`,
+    /// 1-based. An element missing from the map has no known position.
+    child_index: rustc_hash::FxHashMap<u32, (usize, usize)>,
+    /// The same, counting only siblings that share a tag name.
+    type_index: rustc_hash::FxHashMap<u32, (usize, usize)>,
+    /// Elements with nothing inside them, for `:empty`.
+    empty: std::collections::HashSet<u32>,
+    /// The element the document hangs off, for `:root`.
+    root: Option<u32>,
+}
+
+impl DomIndex {
+    fn build(
+        arena: &crate::html::DomArena,
+        nodes: &[crate::html::DomNode],
+        element_ids: &[u32],
+    ) -> Self {
+        let mut index = DomIndex {
+            root: element_ids.first().copied(),
+            ..Default::default()
+        };
+
+        // A set, not a scan of the list: this is asked once per child of every
+        // node in the document, and the list is as long as the document.
+        let elements: std::collections::HashSet<u32> = element_ids.iter().copied().collect();
+
+        for node in nodes {
+            let siblings: Vec<u32> = node
+                .children
+                .iter()
+                .map(|h| h.index() as u32)
+                .filter(|id| elements.contains(id))
+                .collect();
+            let total = siblings.len();
+
+            // Of-type positions are counted per tag name within this parent.
+            let mut total_of_type: rustc_hash::FxHashMap<String, usize> =
+                rustc_hash::FxHashMap::default();
+            for &id in &siblings {
+                if let Some(tag) = tag_of(arena, id) {
+                    *total_of_type.entry(tag).or_insert(0) += 1;
+                }
+            }
+
+            let mut seen_of_type: rustc_hash::FxHashMap<String, usize> =
+                rustc_hash::FxHashMap::default();
+            for (i, &id) in siblings.iter().enumerate() {
+                index.child_index.insert(id, (i + 1, total - i));
+                if let Some(tag) = tag_of(arena, id) {
+                    let seen = seen_of_type.entry(tag.clone()).or_insert(0);
+                    *seen += 1;
+                    let of_type_total = total_of_type.get(&tag).copied().unwrap_or(*seen);
+                    index
+                        .type_index
+                        .insert(id, (*seen, of_type_total + 1 - *seen));
+                }
+            }
+        }
+
+        for &id in element_ids {
+            let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(id));
+            let Some(node) = arena.get(handle) else {
+                continue;
+            };
+            if let Some(attr) = node.get_attr("class") {
+                index
+                    .classes
+                    .insert(id, attr.split_whitespace().map(String::from).collect());
+            }
+            if let Some(id_attr) = node.get_attr("id") {
+                index.ids.insert(id, id_attr.to_string());
+            }
+            if is_empty_element(arena, id) {
+                index.empty.insert(id);
+            }
+        }
+
+        index
+    }
+}
+
+/// One element's tag name.
+fn tag_of(arena: &crate::html::DomArena, id: u32) -> Option<String> {
+    arena
+        .get(crate::html::DomHandle(crate::html::NodeId::from_raw(id)))
+        .and_then(|n| n.tag_name().map(|t| t.to_string()))
+}
+
+/// Whether an element has nothing in it, for `:empty`.
+///
+/// Whitespace between tags does not count as content. That is the Selectors 4
+/// reading and what browsers do; taking the older reading would mean a page
+/// laid out with newlines between its tags has no empty elements at all.
+fn is_empty_element(arena: &crate::html::DomArena, id: u32) -> bool {
+    let handle = crate::html::DomHandle(crate::html::NodeId::from_raw(id));
+    let Some(node) = arena.get(handle) else {
+        return false;
+    };
+    node.children.iter().all(|child| {
+        let child_handle =
+            crate::html::DomHandle(crate::html::NodeId::from_raw(child.index() as u32));
+        match arena.get(child_handle) {
+            Some(child_node) => child_node
+                .text_content()
+                .is_some_and(|text| text.trim().is_empty()),
+            None => true,
+        }
+    })
+}
+
 /// Match one simple selector against one element.
 ///
-/// The element cascade builds this as a closure over its own bookkeeping; the
-/// pseudo-element pass needs the same test, so the part that does not depend on
-/// hover or sibling position lives here.
-#[allow(clippy::too_many_arguments)]
+/// Both cascade passes — elements and their `::before` / `::after` boxes — ask
+/// the same question, so the facts are assembled in one place.
 fn matches_for(
     id: u32,
     sel: &parser::SimpleSelector,
     arena: &crate::html::DomArena,
-    node_classes: &rustc_hash::FxHashMap<u32, Vec<String>>,
-    node_ids: &rustc_hash::FxHashMap<u32, String>,
-    first_children: &std::collections::HashSet<u32>,
-    last_children: &std::collections::HashSet<u32>,
-    only_children: &std::collections::HashSet<u32>,
-    child_indices: &rustc_hash::FxHashMap<u32, usize>,
+    index: &DomIndex,
     is_hovered: &impl Fn(u32) -> bool,
+    is_focused: &impl Fn(u32) -> bool,
 ) -> bool {
     let Some(node) = arena.get(crate::html::DomHandle(crate::html::NodeId::from_raw(id))) else {
         return false;
@@ -855,24 +920,39 @@ fn matches_for(
     let Some(tag) = node.tag_name() else {
         return false;
     };
-    parser::Selector::simple_matches_with_context(
+    let tag: &str = tag;
+
+    // A control is checked or disabled if it says so in the markup. Nothing
+    // toggles a control yet, so the attribute is the whole story.
+    let checked = || match tag {
+        "option" => node.get_attr("selected").is_some(),
+        _ => node.get_attr("checked").is_some(),
+    };
+
+    parser::Selector::simple_matches_facts(
         sel,
-        tag,
-        |c| {
-            node_classes
-                .get(&id)
-                .is_some_and(|classes| classes.iter().any(|cls| cls == c))
+        &parser::ElementFacts {
+            classes: &|c| {
+                index
+                    .classes
+                    .get(&id)
+                    .is_some_and(|classes| classes.iter().any(|cls| cls == c))
+            },
+            has_id: &|i| index.ids.get(&id).is_some_and(|id_str| id_str == i),
+            matches_attr: &|name, op, val| match node.get_attr(name) {
+                Some(attr_val) => parser::evaluate_attr_operator(attr_val, op, val),
+                None => false,
+            },
+            child_index: &|| index.child_index.get(&id).copied().unwrap_or((0, 0)),
+            type_index: &|| index.type_index.get(&id).copied().unwrap_or((0, 0)),
+            is_root: &|| index.root == Some(id),
+            is_empty: &|| index.empty.contains(&id),
+            is_hovered: &|| is_hovered(id),
+            is_focused: &|| is_focused(id),
+            is_checked: &checked,
+            is_disabled: &|| node.get_attr("disabled").is_some(),
+            ..parser::ElementFacts::for_tag(tag)
         },
-        |i| node_ids.get(&id).is_some_and(|id_str| id_str == i),
-        |name, op, val| match node.get_attr(name) {
-            Some(attr_val) => parser::evaluate_attr_operator(attr_val, op, val),
-            None => false,
-        },
-        || first_children.contains(&id),
-        || last_children.contains(&id),
-        || only_children.contains(&id),
-        || *child_indices.get(&id).unwrap_or(&1),
-        || is_hovered(id),
     )
 }
 
@@ -6329,6 +6409,312 @@ mod tests {
     fn test_order_default() {
         let computed = ComputedValues::default();
         assert_eq!(computed.order, 0);
+    }
+
+    // -- Pseudo-class selection --
+
+    /// A colour no user-agent rule produces, so a match is unambiguous.
+    ///
+    /// Set as a background rather than a text colour: `color` is inherited, so
+    /// a rule that picks out one element would appear to have picked out
+    /// everything inside it too.
+    const MARK: [u8; 4] = [1, 2, 3, 255];
+
+    /// The `id`s of the elements a rule picks out, in document order.
+    ///
+    /// The rule under test sets one distinctive colour; everything else about
+    /// the cascade is beside the point here, so the assertion reads as the list
+    /// of elements the selector chose.
+    fn selected(css_text: &str, html_text: &str) -> Vec<String> {
+        selected_with_state(css_text, html_text, &InteractionState::default())
+    }
+
+    /// The same, with the page in a given pointer and keyboard state.
+    fn selected_with_state(
+        css_text: &str,
+        html_text: &str,
+        state: &InteractionState<'_>,
+    ) -> Vec<String> {
+        let arena = crate::html::parse_html(html_text);
+        let stylesheet = merge_stylesheets_with_author(
+            &user_agent_stylesheet(),
+            &parser::parse_stylesheet(css_text),
+        );
+        let styles =
+            compute_styles_for_tree_with_state(&arena, &stylesheet, (1024.0, 768.0), state, 1.0);
+
+        let nodes = arena.nodes.borrow();
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, node)| {
+                node.is_element()
+                    && styles.get(&(*i as u32)).and_then(|c| c.background_color) == Some(MARK)
+            })
+            .filter_map(|(i, _)| {
+                arena
+                    .get(crate::html::DomHandle(crate::html::NodeId::from_raw(
+                        i as u32,
+                    )))
+                    .and_then(|n| n.get_attr("id").map(|id| id.to_string()))
+            })
+            .collect()
+    }
+
+    /// The node id of the element carrying this `id` attribute.
+    fn node_with_id(arena: &crate::html::DomArena, wanted: &str) -> u32 {
+        let nodes = arena.nodes.borrow();
+        (0..nodes.len() as u32)
+            .find(|&i| {
+                arena
+                    .get(crate::html::DomHandle(crate::html::NodeId::from_raw(i)))
+                    .and_then(|n| n.get_attr("id").map(|id| id.to_string()))
+                    .is_some_and(|id| id == wanted)
+            })
+            .expect("no element with that id")
+    }
+
+    /// A list whose items differ in tag, so of-type and nth-child disagree.
+    const MIXED: &str = r#"<html><body><div id="wrap">
+        <p id="p1">one</p>
+        <span id="s1">two</span>
+        <p id="p2">three</p>
+        <span id="s2">four</span>
+        <p id="p3">five</p>
+    </div></body></html>"#;
+
+    #[test]
+    fn root_selects_the_element_the_document_hangs_off() {
+        let styles_for = |css: &str| {
+            selected(
+                css,
+                r#"<html id="doc"><body id="body"><div id="d">x</div></body></html>"#,
+            )
+        };
+        assert_eq!(
+            styles_for(":root { background-color: rgb(1,2,3) }"),
+            ["doc"]
+        );
+        assert_eq!(
+            styles_for(":root div { background-color: rgb(1,2,3) }"),
+            ["d"],
+            ":root is an ancestor like any other, not only a rule of its own"
+        );
+    }
+
+    #[test]
+    fn empty_selects_elements_with_nothing_in_them() {
+        assert_eq!(
+            selected(
+                ":empty { background-color: rgb(1,2,3) }",
+                r#"<html><body>
+                    <div id="hollow"></div>
+                    <div id="spaces">   </div>
+                    <div id="worded">x</div>
+                    <div id="nested"><span id="inner"></span></div>
+                </body></html>"#,
+            ),
+            ["hollow", "spaces", "inner"],
+            "whitespace between tags is not content, but an element is"
+        );
+    }
+
+    #[test]
+    fn of_type_counts_only_the_siblings_that_share_a_tag() {
+        assert_eq!(
+            selected("p:first-of-type { background-color: rgb(1,2,3) }", MIXED),
+            ["p1"]
+        );
+        assert_eq!(
+            selected("p:last-of-type { background-color: rgb(1,2,3) }", MIXED),
+            ["p3"]
+        );
+        assert_eq!(
+            selected("p:nth-of-type(2) { background-color: rgb(1,2,3) }", MIXED),
+            ["p2"],
+            "the second p, which is the third child"
+        );
+        assert_eq!(
+            selected("p:nth-child(2) { background-color: rgb(1,2,3) }", MIXED),
+            Vec::<String>::new(),
+            "the second child is a span, so no p matches"
+        );
+        assert_eq!(
+            selected(
+                "span:nth-last-of-type(1) { background-color: rgb(1,2,3) }",
+                MIXED
+            ),
+            ["s2"]
+        );
+    }
+
+    #[test]
+    fn only_of_type_needs_to_be_the_one_and_only() {
+        let page = r#"<html><body><div id="wrap">
+            <h1 id="h">title</h1>
+            <p id="a">one</p>
+            <p id="b">two</p>
+        </div></body></html>"#;
+        assert_eq!(
+            selected("h1:only-of-type { background-color: rgb(1,2,3) }", page),
+            ["h"]
+        );
+        assert_eq!(
+            selected("p:only-of-type { background-color: rgb(1,2,3) }", page),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn nth_last_child_counts_from_the_end() {
+        assert_eq!(
+            selected(
+                "#wrap > :nth-last-child(2) { background-color: rgb(1,2,3) }",
+                MIXED
+            ),
+            ["s2"]
+        );
+        assert_eq!(
+            selected(
+                "#wrap > :last-child { background-color: rgb(1,2,3) }",
+                MIXED
+            ),
+            ["p3"]
+        );
+    }
+
+    /// An element whose position among its siblings was never worked out must
+    /// not fall through to "first". Nothing positional should match it.
+    #[test]
+    fn an_element_with_no_known_position_matches_nothing_positional() {
+        let facts = parser::ElementFacts::for_tag("li");
+        for selector in [
+            "li:first-child",
+            "li:last-child",
+            "li:only-child",
+            "li:nth-child(1)",
+            "li:first-of-type",
+            "li:nth-of-type(1)",
+        ] {
+            let parsed = parser::parse_stylesheet(&format!("{selector} {{ color: red }}"));
+            assert!(
+                !parsed.rules[0].selectors[0].matches_facts(&facts),
+                "{selector} matched an element with no position"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_follows_the_markup() {
+        assert_eq!(
+            selected(
+                ":checked { background-color: rgb(1,2,3) }",
+                r#"<html><body>
+                    <input id="on" type="checkbox" checked>
+                    <input id="off" type="checkbox">
+                </body></html>"#,
+            ),
+            ["on"]
+        );
+    }
+
+    #[test]
+    fn disabled_and_enabled_are_both_only_about_controls() {
+        let page = r#"<html><body>
+            <input id="live">
+            <input id="dead" disabled>
+            <div id="neither">text</div>
+        </body></html>"#;
+        assert_eq!(
+            selected(":disabled { background-color: rgb(1,2,3) }", page),
+            ["dead"]
+        );
+        assert_eq!(
+            selected(":enabled { background-color: rgb(1,2,3) }", page),
+            ["live"],
+            "a div is neither enabled nor disabled — it is not a control"
+        );
+    }
+
+    #[test]
+    fn a_link_is_unvisited_because_we_keep_no_history() {
+        let page = r#"<html><body>
+            <a id="linked" href="/somewhere">go</a>
+            <a id="anchor">no href</a>
+        </body></html>"#;
+        assert_eq!(
+            selected("a:link { background-color: rgb(1,2,3) }", page),
+            ["linked"]
+        );
+        assert_eq!(
+            selected("a:any-link { background-color: rgb(1,2,3) }", page),
+            ["linked"]
+        );
+        assert_eq!(
+            selected("a:visited { background-color: rgb(1,2,3) }", page),
+            Vec::<String>::new(),
+            "with no history nothing has been visited, and the unvisited colour shows"
+        );
+    }
+
+    #[test]
+    fn focus_selects_the_element_holding_it() {
+        let page = r#"<html><body>
+            <input id="one">
+            <input id="two">
+        </body></html>"#;
+        let arena = crate::html::parse_html(page);
+        let two = node_with_id(&arena, "two");
+
+        assert_eq!(
+            selected(":focus { background-color: rgb(1,2,3) }", page),
+            Vec::<String>::new(),
+            "nothing is focused until something is"
+        );
+        assert_eq!(
+            selected_with_state(
+                ":focus { background-color: rgb(1,2,3) }",
+                page,
+                &InteractionState {
+                    hovered: &[],
+                    focused: Some(two),
+                },
+            ),
+            ["two"]
+        );
+    }
+
+    /// We have one way of focusing something, so the keyboard-only spelling of
+    /// `:focus` says the same thing rather than nothing.
+    #[test]
+    fn focus_visible_answers_the_same_as_focus() {
+        let page = r#"<html><body><input id="one"></body></html>"#;
+        let arena = crate::html::parse_html(page);
+        let one = node_with_id(&arena, "one");
+        assert_eq!(
+            selected_with_state(
+                ":focus-visible { background-color: rgb(1,2,3) }",
+                page,
+                &InteractionState {
+                    hovered: &[],
+                    focused: Some(one),
+                },
+            ),
+            ["one"]
+        );
+    }
+
+    #[test]
+    fn a_pseudo_class_we_cannot_answer_for_never_matches() {
+        // Fail-closed: a rule guarded by something we do not implement should
+        // not apply to everything, which is what a permissive default would do.
+        assert_eq!(
+            selected(
+                "div:target { background-color: rgb(1,2,3) }",
+                r#"<html><body><div id="d">x</div></body></html>"#,
+            ),
+            Vec::<String>::new()
+        );
     }
 
     // -- Hover style computation tests --

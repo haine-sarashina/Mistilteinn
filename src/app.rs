@@ -3130,7 +3130,7 @@ impl MistilteinnApp {
         self.address_input.clear();
         self.address_cursor = 0;
         self.is_address_focused = true;
-        self.focused_page_input = None;
+        self.set_page_focus(None);
         self.recompose();
         log::info!("Created and activated new tab {:?}", id);
         id
@@ -3151,7 +3151,7 @@ impl MistilteinnApp {
         }
         self.address_cursor = self.address_input.len();
         self.is_address_focused = false;
-        self.focused_page_input = None;
+        self.set_page_focus(None);
         self.recompose();
         log::info!("Closed tab {:?}", tab_id);
     }
@@ -4119,6 +4119,26 @@ impl MistilteinnApp {
         );
     }
 
+    /// Move keyboard focus to a page element, or clear it.
+    ///
+    /// The app tracks which field takes typed characters and the page needs the
+    /// same answer for `:focus` to select anything, so one call sets both and
+    /// the two cannot drift apart. The styles are recomputed only when the
+    /// focus actually moved — clicking twice in the field you are already in
+    /// should not cost a cascade.
+    fn set_page_focus(&mut self, node_id: Option<u32>) {
+        self.focused_page_input = node_id;
+        if let Some(page) = self
+            .tab_manager
+            .active_tab_mut()
+            .and_then(|tab| tab.page.as_mut())
+        {
+            if page.set_focus(node_id) {
+                page.refresh_styles();
+            }
+        }
+    }
+
     /// Note where the window is now, so the next run can put it back.
     ///
     /// Read while the window is alive rather than once on the way out: by the
@@ -4544,6 +4564,7 @@ impl ApplicationHandler for MistilteinnApp {
 
                                         let mut link_to_navigate: Option<String> = None;
                                         let mut anchor_jump_target: Option<String> = None;
+                                        let mut focus_moved = false;
 
                                         if let Some(tab) = self.tab_manager.active_tab_mut() {
                                             if let Some(ref mut page) = tab.page {
@@ -4607,7 +4628,15 @@ impl ApplicationHandler for MistilteinnApp {
                                                         content_y,
                                                     );
                                                 }
+                                                // The page is borrowed here, so the two
+                                                // halves of `set_page_focus` are done in
+                                                // place; the recompute the styles need is
+                                                // the `recompose` this click already ends
+                                                // with.
                                                 self.focused_page_input = clicked_input;
+                                                if page.set_focus(clicked_input) {
+                                                    focus_moved = true;
+                                                }
                                                 self.open_select = clicked_select;
 
                                                 if let Some(href) = clicked_href {
@@ -4672,8 +4701,21 @@ impl ApplicationHandler for MistilteinnApp {
                                             self.load_url(&target_url);
                                             return;
                                         }
+                                        if focus_moved {
+                                            // `:focus` picks out a different
+                                            // element now, so the styles that
+                                            // paint it have to be worked out
+                                            // again before the frame goes out.
+                                            if let Some(page) = self
+                                                .tab_manager
+                                                .active_tab_mut()
+                                                .and_then(|tab| tab.page.as_mut())
+                                            {
+                                                page.refresh_styles();
+                                            }
+                                        }
                                     } else {
-                                        self.focused_page_input = None;
+                                        self.set_page_focus(None);
                                     }
                                     self.recompose();
                                 }
@@ -5010,7 +5052,7 @@ impl ApplicationHandler for MistilteinnApp {
                                 // Ctrl+L: Focus address bar
                                 self.is_address_focused = true;
                                 self.address_cursor = self.address_input.len();
-                                self.focused_page_input = None;
+                                self.set_page_focus(None);
                                 self.recompose();
                             }
                             PhysicalKey::Code(KeyCode::Tab) => {
@@ -5051,7 +5093,7 @@ impl ApplicationHandler for MistilteinnApp {
                                 // Ctrl+F: open the find bar and type into it
                                 self.find_bar.active = true;
                                 self.is_address_focused = false;
-                                self.focused_page_input = None;
+                                self.set_page_focus(None);
                                 self.refresh_find_matches();
                                 self.recompose();
                             }

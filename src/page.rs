@@ -79,6 +79,13 @@ pub struct Page {
     /// The hover path the styles were last computed with, so a frame driven by
     /// an animation does not silently drop `:hover`.
     last_hover: Vec<u32>,
+    /// The element holding keyboard focus, for `:focus`.
+    ///
+    /// Kept on the page rather than passed in with the hover path: focus
+    /// survives everything that redraws the page, so every one of those callers
+    /// would otherwise have to carry it, and any one of them forgetting would
+    /// make the focus ring blink out for a frame.
+    focused_id: Option<u32>,
 }
 
 /// How far outside the viewport a `loading="lazy"` image is still worth
@@ -351,6 +358,7 @@ impl Page {
             js_context,
             animator,
             last_hover: Vec::new(),
+            focused_id: None,
             canvases,
             frames: rustc_hash::FxHashMap::default(),
             storage,
@@ -432,11 +440,14 @@ impl Page {
     /// (equivalent to initial load).
     pub fn recompute_with_hover(&mut self, hovered_ids: &[u32]) {
         // Recompute styles with hover awareness
-        self.styles = css::compute_styles_for_tree_with_hover_zoom(
+        self.styles = css::compute_styles_for_tree_with_state(
             &self.arena,
             &self.stylesheet,
             (self.view_width, self.view_height),
-            hovered_ids,
+            &css::InteractionState {
+                hovered: hovered_ids,
+                focused: self.focused_id,
+            },
             self.zoom,
         );
         if hovered_ids != self.last_hover.as_slice() {
@@ -579,14 +590,35 @@ impl Page {
         self.animator.is_active()
     }
 
-    /// Advance every running animation to the current moment and relayout.
+    /// Give keyboard focus to an element, or take it away.
     ///
-    /// The hover path is the one the last recompute used, so an element being
-    /// pointed at does not lose `:hover` on the next animation frame.
-    pub fn advance_animations(&mut self) {
+    /// Returns whether this changed anything, so the caller can skip the
+    /// recompute when the reader clicks the field they were already in.
+    pub fn set_focus(&mut self, node_id: Option<u32>) -> bool {
+        let changed = self.focused_id != node_id;
+        self.focused_id = node_id;
+        changed
+    }
+
+    /// The element holding keyboard focus, if any.
+    pub fn focused(&self) -> Option<u32> {
+        self.focused_id
+    }
+
+    /// Recompute styles against the state the page is already in.
+    ///
+    /// The hover path is the one the last recompute used, so a redraw caused by
+    /// something else — a running animation, focus moving to a field — does not
+    /// silently drop `:hover` from whatever the pointer is resting on.
+    pub fn refresh_styles(&mut self) {
         let hovered = std::mem::take(&mut self.last_hover);
         self.recompute_with_hover(&hovered);
         self.last_hover = hovered;
+    }
+
+    /// Advance every running animation to the current moment and relayout.
+    pub fn advance_animations(&mut self) {
+        self.refresh_styles();
     }
 
     /// Collect renderable rectangles with colors from the layout tree.
@@ -650,6 +682,54 @@ mod tests {
             800.0,
             600.0,
         )
+    }
+
+    /// Every text run in the page, in the order it was laid out.
+    fn laid_out_text(page: &Page) -> Vec<String> {
+        fn walk(node: &crate::layout::LayoutNode, out: &mut Vec<String>) {
+            if let Some(text) = &node.text {
+                out.push(text.clone());
+            }
+            for child in &node.children {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&page.layout_root, &mut out);
+        out
+    }
+
+    /// Vector prints an external link's target after it, built out of the
+    /// element's own `href`. The generated box has to read the attribute off
+    /// the element it hangs from, not off the box being generated.
+    #[test]
+    fn generated_content_can_quote_an_attribute_of_its_element() {
+        let page = Page::new(
+            r#"<html><body><a href="https://example.com/p">link</a></body></html>"#,
+            r#"a::after { content: ' (' attr(href) ')' }"#,
+            800.0,
+            600.0,
+        );
+        assert_eq!(
+            laid_out_text(&page),
+            ["link", " (https://example.com/p)"],
+            "the literal pieces and the attribute come out as one run of text"
+        );
+    }
+
+    #[test]
+    fn an_attribute_that_is_not_there_contributes_nothing() {
+        let page = Page::new(
+            r#"<html><body><a>no href</a></body></html>"#,
+            r#"a::after { content: '[' attr(href) ']' }"#,
+            800.0,
+            600.0,
+        );
+        assert_eq!(
+            laid_out_text(&page),
+            ["no href", "[]"],
+            "the brackets still print — only the attribute is empty"
+        );
     }
 
     #[test]

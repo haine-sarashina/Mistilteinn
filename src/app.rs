@@ -2214,8 +2214,12 @@ impl MistilteinnApp {
         let requests =
             framed.pending_image_requests(crate::layout::Rect::new(0.0, 0.0, width, height));
         framed.mark_images_requested(requests.iter().map(|(url, _, _)| url.clone()));
-        for (src, image) in Self::fetch_images(requests).await {
+        let (arrived, missing) = Self::fetch_images(requests).await;
+        for (src, image) in arrived {
             framed.image_cache.insert(src, image);
+        }
+        for src in missing {
+            framed.note_image_failed(&src);
         }
         if !framed.image_cache.is_empty() {
             framed.recompute_with_hover(&[]);
@@ -2227,9 +2231,14 @@ impl MistilteinnApp {
     ///
     /// The requested size is only consulted for an SVG, which has no pixels of
     /// its own and has to be rasterised at whatever the box asks for.
+    /// Fetch a batch of pictures, and say which ones did not arrive.
+    ///
+    /// The failures matter: a URL is marked as asked-for before the request, so
+    /// unless the caller hears about a failure the picture is never asked for
+    /// again. See [`crate::page::Page::note_image_failed`].
     async fn fetch_images(
         requests: Vec<(String, f32, f32)>,
-    ) -> Vec<(String, crate::page::CachedImage)> {
+    ) -> (Vec<(String, crate::page::CachedImage)>, Vec<String>) {
         use futures::StreamExt;
 
         let results =
@@ -2240,42 +2249,47 @@ impl MistilteinnApp {
                             let rgba = img.to_rgba8();
                             let (iw, ih) = rgba.dimensions();
                             log::info!("Decoded image: {} ({}x{})", src, iw, ih);
-                            Some((src, rgba.into_raw(), iw, ih))
+                            Ok((src, rgba.into_raw(), iw, ih))
                         } else if let Ok(svg_str) = std::str::from_utf8(&bytes) {
                             if let Some((rgba, iw, ih)) =
                                 crate::render::render_svg_to_rgba(svg_str, req_w, req_h)
                             {
                                 log::info!("Rendered SVG: {} ({}x{})", src, iw, ih);
-                                Some((src, rgba, iw, ih))
+                                Ok((src, rgba, iw, ih))
                             } else {
                                 log::warn!("Failed to render SVG: {}", src);
-                                None
+                                Err(src)
                             }
                         } else {
-                            None
+                            Err(src)
                         }
                     }
-                    Err(_) => None,
+                    Err(e) => {
+                        log::warn!("image fetch failed: {src} ({e:?})");
+                        Err(src)
+                    }
                 }
             }))
             .buffer_unordered(6)
             .collect::<Vec<_>>()
             .await;
 
-        results
-            .into_iter()
-            .flatten()
-            .map(|(src, rgba, width, height)| {
-                (
+        let mut arrived = Vec::new();
+        let mut missing = Vec::new();
+        for result in results {
+            match result {
+                Ok((src, rgba, width, height)) => arrived.push((
                     src,
                     crate::page::CachedImage {
                         rgba,
                         width,
                         height,
                     },
-                )
-            })
-            .collect()
+                )),
+                Err(src) => missing.push(src),
+            }
+        }
+        (arrived, missing)
     }
 
     /// Fetch the `loading="lazy"` images the reader has just scrolled near.
@@ -2322,15 +2336,22 @@ impl MistilteinnApp {
             requests.len()
         );
 
-        let fetched = Self::fetch_images(requests).await;
-        if fetched.is_empty() {
+        let (arrived, missing) = Self::fetch_images(requests).await;
+        if arrived.is_empty() && missing.is_empty() {
             return false;
         }
         let Some(page) = self.tab_manager.get_active_tab_page_mut() else {
             return false;
         };
-        for (src, image) in fetched {
+        let anything_arrived = !arrived.is_empty();
+        for (src, image) in arrived {
             page.image_cache.insert(src, image);
+        }
+        for src in missing {
+            page.note_image_failed(&src);
+        }
+        if !anything_arrived {
+            return false;
         }
         // The boxes were laid out at whatever size the markup claimed — often
         // none at all — so the arrival of a picture moves everything after it.
@@ -2481,8 +2502,14 @@ impl MistilteinnApp {
         )
         .await;
 
-        for (src, image) in Self::fetch_images(resolved_images).await {
+        let (arrived, missing) = Self::fetch_images(resolved_images).await;
+        for (src, image) in arrived {
             new_page.image_cache.insert(src, image);
+        }
+        // A picture that did not arrive gets one more chance on the next pass
+        // over the document, rather than being lost for the life of the page.
+        for src in missing {
+            new_page.note_image_failed(&src);
         }
 
         // The first layout ran before any of this page's assets existed: text

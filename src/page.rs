@@ -43,6 +43,9 @@ pub struct Page {
     /// which is a check that runs every frame the page moves; without this, a
     /// picture that 404s would be requested again on each of them.
     pub requested_images: rustc_hash::FxHashSet<String>,
+    /// URLs that failed once and were allowed a second try. See
+    /// [`Page::note_image_failed`].
+    pub retried_images: rustc_hash::FxHashSet<String>,
     /// Where the page was scrolled to when the lazy-image walk last ran, so
     /// the walk is not repeated for a scroll that cannot have changed its
     /// answer. Starts far away, so the first check always runs.
@@ -162,6 +165,26 @@ impl Page {
     /// Note that these URLs have been asked for, so they are not asked for again.
     pub fn mark_images_requested(&mut self, urls: impl IntoIterator<Item = String>) {
         self.requested_images.extend(urls);
+    }
+
+    /// A picture did not arrive. Say whether it is worth asking again.
+    ///
+    /// A URL is marked as asked-for *before* the fetch, so that two boxes
+    /// sharing a picture do not both request it. Nothing cleared that mark when
+    /// the request failed, so one bad response lost the picture for the life of
+    /// the page — and a page that wants fourteen of them from one host does see
+    /// the occasional bad response.
+    ///
+    /// The mark is dropped once, which lets the next pass over the document ask
+    /// again. A second failure keeps it, so a picture that is simply not there
+    /// is not chased on every scroll.
+    pub fn note_image_failed(&mut self, url: &str) -> bool {
+        if self.retried_images.contains(url) {
+            return false;
+        }
+        self.retried_images.insert(url.to_string());
+        self.requested_images.remove(url);
+        true
     }
 }
 
@@ -363,6 +386,7 @@ impl Page {
             zoom: 1.0,
             image_cache: FxHashMap::default(),
             requested_images: rustc_hash::FxHashSet::default(),
+            retried_images: rustc_hash::FxHashSet::default(),
             lazy_scan_y: f32::NEG_INFINITY,
             csp: csp.clone(),
             stylesheet,
@@ -826,6 +850,32 @@ mod tests {
     /// Vector prints an external link's target after it, built out of the
     /// element's own `href`. The generated box has to read the attribute off
     /// the element it hangs from, not off the box being generated.
+    #[test]
+    fn a_picture_that_failed_once_is_asked_for_again() {
+        // A URL is marked as asked-for before the request, so two boxes sharing
+        // a picture do not both fetch it. Nothing cleared that mark on failure,
+        // so one bad response lost the picture for the life of the page.
+        let mut page = Page::new("<body><img src='a.png'></body>", "", 400.0, 300.0);
+        page.mark_images_requested(["a.png".to_string()]);
+        assert!(page.requested_images.contains("a.png"));
+
+        assert!(
+            page.note_image_failed("a.png"),
+            "the first failure earns a retry"
+        );
+        assert!(
+            !page.requested_images.contains("a.png"),
+            "and the mark is dropped so the next pass asks again"
+        );
+
+        page.mark_images_requested(["a.png".to_string()]);
+        assert!(
+            !page.note_image_failed("a.png"),
+            "a second failure gives up, so a missing picture is not chased forever"
+        );
+        assert!(page.requested_images.contains("a.png"));
+    }
+
     #[test]
     fn generated_content_can_quote_an_attribute_of_its_element() {
         let page = Page::new(

@@ -285,6 +285,10 @@ pub struct LayoutNode {
     /// Grid container properties
     pub grid_columns: Vec<GridTrack>,
     pub grid_rows: Vec<GridTrack>,
+    /// The named areas a grid container lays out, row by row.
+    pub grid_areas: Vec<Vec<String>>,
+    /// The area this item asked for by name, from `grid-area`.
+    pub grid_area: Option<String>,
     pub grid_column_gap: f32,
     pub grid_row_gap: f32,
     /// CSS order property (for flex/grid item ordering)
@@ -416,6 +420,8 @@ impl LayoutNode {
             font_family: String::new(),
             grid_columns: Vec::new(),
             grid_rows: Vec::new(),
+            grid_areas: Vec::new(),
+            grid_area: None,
             grid_column_gap: 0.0,
             grid_row_gap: 0.0,
             order: 0,
@@ -679,6 +685,8 @@ where
     // Copy grid properties
     root_layout.grid_columns = root_styles.grid_template_columns.clone();
     root_layout.grid_rows = root_styles.grid_template_rows.clone();
+    root_layout.grid_areas = root_styles.grid_template_areas.clone();
+    root_layout.grid_area = root_styles.grid_area.clone();
     root_layout.grid_column_gap = root_styles.grid_column_gap;
     root_layout.grid_row_gap = root_styles.grid_row_gap;
     root_layout.order = root_styles.order;
@@ -830,6 +838,8 @@ fn build_layout_children<N, F>(
                     // Copy grid properties
                     layout_node.grid_columns = child_styles.grid_template_columns.clone();
                     layout_node.grid_rows = child_styles.grid_template_rows.clone();
+                    layout_node.grid_areas = child_styles.grid_template_areas.clone();
+                    layout_node.grid_area = child_styles.grid_area.clone();
                     layout_node.grid_column_gap = child_styles.grid_column_gap;
                     layout_node.grid_row_gap = child_styles.grid_row_gap;
                     layout_node.order = child_styles.order;
@@ -2468,6 +2478,143 @@ fn measure_item_content_widths(
     (default_w, default_w)
 }
 
+/// What one grid track resolves to once the content in it has been measured.
+enum TrackSize {
+    /// A definite width, taken out of the space before `fr` tracks share the rest.
+    Fixed(f32),
+    /// A share of whatever is left over.
+    Flexible(f32),
+}
+
+/// Whether a track wants a share of the leftover space, looking through
+/// `minmax()` to the track that actually decides.
+fn track_carries_fr(track: &GridTrack) -> bool {
+    match track {
+        GridTrack::Fr(_) => true,
+        GridTrack::MinMax(_, max) => track_carries_fr(max),
+        _ => false,
+    }
+}
+
+/// Size one track against the content measured for its column.
+///
+/// `minmax(a, b)` is sized as `b` and then floored at `a`, which is the whole
+/// of what ja.wikipedia.org asks of it: `minmax(0, 1fr)` is a plain `1fr`, and
+/// `minmax(0, 59.25rem)` is a column that may not grow past its maximum.
+fn resolve_track_size(
+    track: &GridTrack,
+    min_content: f32,
+    max_content: f32,
+    has_fr: bool,
+) -> TrackSize {
+    match track {
+        GridTrack::Fixed(w) => TrackSize::Fixed(*w),
+        GridTrack::MinContent => TrackSize::Fixed(min_content.max(10.0)),
+        GridTrack::MaxContent => TrackSize::Fixed(max_content.max(10.0)),
+        GridTrack::FitContent(limit) => {
+            TrackSize::Fixed(max_content.min(*limit).max(min_content).max(10.0))
+        }
+        GridTrack::Auto => {
+            if has_fr {
+                TrackSize::Fixed(max_content.max(min_content).max(10.0))
+            } else {
+                TrackSize::Flexible(1.0)
+            }
+        }
+        GridTrack::Fr(f) => TrackSize::Flexible(*f),
+        GridTrack::MinMax(min, max) => {
+            match resolve_track_size(max, min_content, max_content, has_fr) {
+                // A flexible maximum makes the whole track flexible; the
+                // minimum is a floor the leftover share is held to later.
+                TrackSize::Flexible(f) => TrackSize::Flexible(f),
+                TrackSize::Fixed(w) => {
+                    let floor = match resolve_track_size(min, min_content, max_content, has_fr) {
+                        TrackSize::Fixed(m) => m,
+                        TrackSize::Flexible(_) => 0.0,
+                    };
+                    TrackSize::Fixed(w.max(floor))
+                }
+            }
+        }
+    }
+}
+
+/// Where one item sits in the grid: its first row and column, and how many of
+/// each it covers.
+#[derive(Clone, Copy)]
+struct GridPlacement {
+    row: usize,
+    col: usize,
+    row_span: usize,
+    col_span: usize,
+}
+
+/// Work out where each item goes.
+///
+/// An item that names an area is placed in it — that is the whole of Vector
+/// 2022's skeleton, which puts the sidebar beside the article rather than
+/// above it. Anything else falls back to filling cells in order, which is what
+/// this engine did for everything before.
+fn place_grid_items(parent: &LayoutNode, num_cols: usize) -> Vec<GridPlacement> {
+    let areas = &parent.grid_areas;
+    let mut next_auto = 0usize;
+    parent
+        .children
+        .iter()
+        .map(|child| {
+            let named = child.grid_area.as_ref().and_then(|name| {
+                let mut first: Option<(usize, usize)> = None;
+                let mut last = (0usize, 0usize);
+                for (r, row) in areas.iter().enumerate() {
+                    for (c, cell) in row.iter().enumerate() {
+                        if cell == name {
+                            first.get_or_insert((r, c));
+                            last = (r, c);
+                        }
+                    }
+                }
+                first.map(|(r, c)| GridPlacement {
+                    row: r,
+                    col: c,
+                    row_span: last.0 + 1 - r,
+                    col_span: last.1 + 1 - c,
+                })
+            });
+            named.unwrap_or_else(|| {
+                let slot = next_auto;
+                next_auto += 1;
+                GridPlacement {
+                    row: slot / num_cols.max(1),
+                    col: slot % num_cols.max(1),
+                    row_span: 1,
+                    col_span: 1,
+                }
+            })
+        })
+        .collect()
+}
+
+/// Move a box and everything under it down the page.
+///
+/// Grid rows cannot be sized until the items in them have been laid out, and
+/// laying an item out fixes the position of its whole subtree. So the items go
+/// down at a provisional place, are measured, and are then moved to the row
+/// they belong to. Line boxes are stored relative to their own box and come
+/// along without being touched.
+fn translate_subtree(node: &mut LayoutNode, dy: f32) {
+    if dy == 0.0 {
+        return;
+    }
+    node.rect.y += dy;
+    for child in node
+        .children
+        .iter_mut()
+        .chain(node.absolute_children.iter_mut())
+    {
+        translate_subtree(child, dy);
+    }
+}
+
 /// Layout grid children according to explicit column tracks.
 /// If no explicit columns are defined, falls back to block layout.
 fn compute_grid_children(
@@ -2490,8 +2637,17 @@ fn compute_grid_children(
         parent.grid_columns.clone()
     };
 
-    let num_cols = tracks.len();
+    // The named areas say how many columns there are when there are more of
+    // them than the track list mentions.
+    let area_cols = parent
+        .grid_areas
+        .iter()
+        .map(|row| row.len())
+        .max()
+        .unwrap_or(0);
+    let num_cols = tracks.len().max(area_cols).max(1);
     let child_count = parent.children.len();
+    let placements = place_grid_items(parent, num_cols);
 
     // Step 1: Compute column widths based on GridTrack types (Fixed, MinContent, MaxContent, FitContent, Auto, Fr)
     let mut col_widths: Vec<f32> = vec![0.0; num_cols];
@@ -2502,7 +2658,11 @@ fn compute_grid_children(
     let mut col_max_content = vec![0.0f32; num_cols];
 
     for idx in 0..child_count {
-        let col = idx % num_cols;
+        // An item covering several columns says nothing about any one of them.
+        if placements[idx].col_span != 1 {
+            continue;
+        }
+        let col = placements[idx].col.min(num_cols - 1);
         let (min_w, max_w) = measure_item_content_widths(&parent.children[idx], text_renderer);
         col_min_content[col] = col_min_content[col].max(min_w);
         col_max_content[col] = col_max_content[col].max(max_w);
@@ -2511,48 +2671,20 @@ fn compute_grid_children(
     let mut non_fr_total: f32 = 0.0;
     let mut fr_indices = Vec::new();
 
-    for (i, track) in tracks.iter().enumerate() {
-        match track {
-            GridTrack::Fixed(w) => {
-                col_widths[i] = *w;
-                non_fr_total += *w;
-            }
-            GridTrack::MinContent => {
-                let w = col_min_content[i].max(10.0);
+    // If there are fr tracks, `auto` takes its content size; otherwise it
+    // shares out the leftover space like `1fr`.
+    let has_fr = tracks.iter().any(track_carries_fr);
+    for i in 0..num_cols {
+        // More columns than tracks: the extra ones share what is left.
+        let track = tracks.get(i).unwrap_or(&GridTrack::Auto);
+        match resolve_track_size(track, col_min_content[i], col_max_content[i], has_fr) {
+            TrackSize::Fixed(w) => {
                 col_widths[i] = w;
                 non_fr_total += w;
             }
-            GridTrack::MaxContent => {
-                let w = col_max_content[i].max(10.0);
-                col_widths[i] = w;
-                non_fr_total += w;
-            }
-            GridTrack::FitContent(limit) => {
-                let w = col_max_content[i]
-                    .min(*limit)
-                    .max(col_min_content[i])
-                    .max(10.0);
-                col_widths[i] = w;
-                non_fr_total += w;
-            }
-            GridTrack::Auto => {
-                // If there are fr tracks, auto acts as max-content or content width; otherwise acts as 1fr
-                let has_fr = parent
-                    .grid_columns
-                    .iter()
-                    .any(|t| matches!(t, GridTrack::Fr(_)));
-                if has_fr {
-                    let w = col_max_content[i].max(col_min_content[i]).max(10.0);
-                    col_widths[i] = w;
-                    non_fr_total += w;
-                } else {
-                    fr_total += 1.0;
-                    fr_indices.push((i, 1.0f32));
-                }
-            }
-            GridTrack::Fr(f) => {
-                fr_total += *f;
-                fr_indices.push((i, *f));
+            TrackSize::Flexible(f) => {
+                fr_total += f;
+                fr_indices.push((i, f));
             }
         }
     }
@@ -2571,40 +2703,39 @@ fn compute_grid_children(
         .max(0.0);
     }
 
-    // Step 2: Determine row count based on child count
-    let num_rows = if child_count > 0 {
-        (child_count + num_cols - 1) / num_cols
-    } else {
-        0
-    };
+    // Step 2: how many rows there are — from the named areas when there are
+    // any, otherwise from how many cells the items filled.
+    let num_rows = placements
+        .iter()
+        .map(|p| p.row + p.row_span)
+        .max()
+        .unwrap_or(0)
+        .max(parent.grid_areas.len());
 
-    // Step 3: Initial row heights
-    let mut row_heights = vec![50.0f32; num_rows];
+    // Step 3: lay every item out at its column, all of them starting at the
+    // container's top edge, and see how tall each turns out.
+    //
+    // A row cannot be sized before the items in it are laid out, and laying an
+    // item out fixes its whole subtree's position — so they go down at a
+    // provisional place and are moved to their row afterwards. Sizing rows at
+    // a flat 50px, as this did, is why ja.wikipedia.org's empty sidebar column
+    // stood 50px tall and pushed the article down the page.
+    let mut item_heights = vec![0.0f32; child_count];
     for idx in 0..child_count {
-        let r = idx / num_cols;
-        let h = parent.children[idx].explicit_height.unwrap_or(20.0);
-        row_heights[r] = row_heights[r].max(h);
-    }
-
-    // Step 4: Position each child at its grid cell and layout children recursively
-    for idx in 0..child_count {
-        let col = idx % num_cols;
-        let row = idx / num_cols;
-
-        // Compute x position: sum of column widths + gaps up to this column
-        let mut x = parent_x;
-        for c in 0..col {
-            x += col_widths[c] + parent.grid_column_gap;
-        }
-
-        // Compute y position: sum of row heights + gaps up to this row
-        let mut y = parent_y;
-        for r in 0..row {
-            y += row_heights[r] + parent.grid_row_gap;
-        }
-
-        let cell_width = col_widths[col];
-        let cell_height = row_heights[row];
+        let place = placements[idx];
+        // Everything to the left of this item's first column, gaps included.
+        let x = parent_x
+            + col_widths
+                .iter()
+                .take(place.col.min(num_cols))
+                .map(|w| w + parent.grid_column_gap)
+                .sum::<f32>();
+        // The columns it covers, with the gaps between them but not after.
+        let spanned = (place.col + place.col_span).min(num_cols);
+        let cell_width = col_widths[place.col.min(num_cols)..spanned]
+            .iter()
+            .sum::<f32>()
+            + (spanned.saturating_sub(place.col + 1)) as f32 * parent.grid_column_gap;
 
         let parent_align = parent.text_align;
         let child = &mut parent.children[idx];
@@ -2620,7 +2751,6 @@ fn compute_grid_children(
             .unwrap_or(cell_width)
             .min(cell_width);
         let mut item_x = x + child.margin[3];
-
         if parent_align == crate::css::TextAlign::Center
             || (child.margin_auto[3] && child.margin_auto[1])
         {
@@ -2629,20 +2759,15 @@ fn compute_grid_children(
         }
 
         child.rect.x = item_x;
-        child.rect.y = y + child.margin[0];
+        child.rect.y = parent_y + child.margin[0];
         child.rect.width = item_w;
-        child.rect.height = cell_height;
+        // Zero unless the page said otherwise, so the item's own layout is
+        // what decides — the row is sized from the answer.
+        child.rect.height = child.explicit_height.unwrap_or(0.0);
 
-        // Recurse into children of this grid item
-        let inner_width = (item_w
-            - child.margin[3]
-            - child.margin[1]
-            - child.border[3]
-            - child.border[1]
-            - child.padding[3]
-            - child.padding[1])
-            .max(0.0);
-
+        let inner_width =
+            (item_w - child.border[3] - child.border[1] - child.padding[3] - child.padding[1])
+                .max(0.0);
         let inner_x = child.rect.x + child.padding[3] + child.border[3];
         let inner_y = child.rect.y + child.padding[0] + child.border[0];
 
@@ -2689,22 +2814,72 @@ fn compute_grid_children(
                 );
             }
         }
-
-        // Update row height dynamically if child expanded
-        let actual_child_h = child.rect.height + child.margin[0] + child.margin[2];
-        row_heights[row] = row_heights[row].max(actual_child_h);
+        clamp_height(child);
+        item_heights[idx] = child.rect.height + child.margin[0] + child.margin[2];
     }
 
-    // Step 5: Update parent rect to encompass all children
-    if num_cols > 0 && num_rows > 0 {
-        let total_width: f32 = col_widths.iter().sum::<f32>() + gap_total;
-        let mut total_height: f32 = 0.0;
-        for (i, &h) in row_heights.iter().enumerate() {
-            total_height += h;
-            if i < num_rows - 1 {
-                total_height += parent.grid_row_gap;
-            }
+    // Step 4: size the rows. An item in one row sets that row's height; an
+    // item across several only has to fit in the rows it covers.
+    let mut row_heights = vec![0.0f32; num_rows];
+    for idx in 0..child_count {
+        let place = placements[idx];
+        if place.row_span == 1 && place.row < num_rows {
+            row_heights[place.row] = row_heights[place.row].max(item_heights[idx]);
         }
+    }
+    for idx in 0..child_count {
+        let place = placements[idx];
+        if place.row_span <= 1 || place.row >= num_rows {
+            continue;
+        }
+        let last = (place.row + place.row_span - 1).min(num_rows - 1);
+        let covered: f32 = (place.row..=last).map(|r| row_heights[r]).sum::<f32>()
+            + (last - place.row) as f32 * parent.grid_row_gap;
+        if item_heights[idx] > covered {
+            row_heights[last] += item_heights[idx] - covered;
+        }
+    }
+    // A declared row track is a floor under whatever the content came to.
+    for (r, height) in row_heights.iter_mut().enumerate() {
+        if let Some(GridTrack::Fixed(h)) = parent.grid_rows.get(r) {
+            *height = height.max(*h);
+        }
+    }
+
+    // Step 5: move each item from the top edge down to its row, and let it
+    // fill the rows it covers so its background reaches the cell's edges.
+    let row_offset = |row: usize| -> f32 {
+        row_heights
+            .iter()
+            .take(row.min(num_rows))
+            .map(|h| h + parent.grid_row_gap)
+            .sum::<f32>()
+    };
+    for idx in 0..child_count {
+        let place = placements[idx];
+        let dy = row_offset(place.row);
+        let last = (place.row + place.row_span).min(num_rows);
+        let span_height: f32 = (place.row..last)
+            .map(|r| row_heights[r] + parent.grid_row_gap)
+            .sum::<f32>()
+            - if last > place.row {
+                parent.grid_row_gap
+            } else {
+                0.0
+            };
+        let child = &mut parent.children[idx];
+        translate_subtree(child, dy);
+        child.rect.height = child
+            .rect
+            .height
+            .max(span_height - child.margin[0] - child.margin[2]);
+    }
+
+    // Step 6: the container is as tall as its rows.
+    if num_rows > 0 {
+        let total_width: f32 = col_widths.iter().sum::<f32>() + gap_total;
+        let total_height: f32 = row_heights.iter().sum::<f32>()
+            + (num_rows as f32 - 1.0).max(0.0) * parent.grid_row_gap;
         parent.rect.width = parent.rect.width.max(total_width);
         parent.rect.height = parent.rect.height.max(total_height);
         clamp_height(parent);
@@ -10297,8 +10472,13 @@ mod tests {
         root.padding = [0.0; 4];
         root.grid_columns = vec![GridTrack::Fr(1.0), GridTrack::Fr(1.0)];
 
+        // Each item is given a height: a row is as tall as what is in it, and
+        // empty items would leave every row at zero — which is what CSS says,
+        // and would make "the second row is below the first" vacuous.
         for _ in 0..4 {
-            root.add_child(LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0)));
+            let mut child = LayoutNode::new(Rect::new(0.0, 0.0, 0.0, 0.0));
+            child.explicit_height = Some(40.0);
+            root.add_child(child);
         }
 
         test_compute_layout(&mut root, 600.0);
@@ -10308,7 +10488,12 @@ mod tests {
         assert!((root.children[1].rect.width - 300.0).abs() < 1.0);
 
         // First row children at y=0, second row below
-        assert!(root.children[2].rect.y > root.children[0].rect.y);
+        assert!(
+            root.children[2].rect.y >= root.children[0].rect.y + 40.0,
+            "the second row should start below a 40px first row, got {} and {}",
+            root.children[0].rect.y,
+            root.children[2].rect.y
+        );
         // Second row starts after first row height + gap
         assert!(
             (root.children[2].rect.x - root.children[0].rect.x).abs() < 1.0,
@@ -10983,6 +11168,127 @@ mod tests {
             .find(|r| r.text.contains("link"))
             .expect("the link run");
         assert_eq!(link.color, [51, 102, 204, 255]);
+    }
+
+    // ------ Grid: named areas, the `grid-template` shorthand, content rows ------
+
+    #[test]
+    fn named_areas_put_items_side_by_side() {
+        // Vector 2022's whole skeleton is this: a sidebar beside the article
+        // rather than above it. Without named areas every item auto-placed
+        // into a single column and the page grew a band of empty space for
+        // each one.
+        let root = laid_out(
+            "<body><div class='g'><div class='side'>side</div><div class='main'>main</div></div></body>",
+            ".g { display: grid; grid-template-columns: 200px 1fr; \
+                  grid-template-areas: 'side main'; } \
+             .side { grid-area: side; } .main { grid-area: main; }",
+            1000.0,
+        );
+        let side = first_box(&root, &|n| n.grid_area.as_deref() == Some("side")).expect("side");
+        let main = first_box(&root, &|n| n.grid_area.as_deref() == Some("main")).expect("main");
+        assert!(
+            (side.rect.y - main.rect.y).abs() < 0.01,
+            "both are in the same row: {} vs {}",
+            side.rect.y,
+            main.rect.y
+        );
+        assert!(
+            main.rect.x >= side.rect.right(),
+            "main sits to the right of side: {} vs {}",
+            main.rect.x,
+            side.rect.right()
+        );
+        assert_eq!(side.rect.width, 200.0);
+    }
+
+    #[test]
+    fn an_area_named_out_of_order_still_lands_in_its_row() {
+        // The markup order is not the placement order — the area names are.
+        let root = laid_out(
+            "<body><div class='g'><div class='b'>b</div><div class='a'>a</div></div></body>",
+            ".g { display: grid; grid-template-columns: 100px 100px; \
+                  grid-template-areas: 'a b'; } \
+             .a { grid-area: a; } .b { grid-area: b; }",
+            400.0,
+        );
+        let a = first_box(&root, &|n| n.grid_area.as_deref() == Some("a")).expect("a");
+        let b = first_box(&root, &|n| n.grid_area.as_deref() == Some("b")).expect("b");
+        assert!(
+            a.rect.x < b.rect.x,
+            "`a` is the first column whichever order the markup lists them: {} vs {}",
+            a.rect.x,
+            b.rect.x
+        );
+    }
+
+    #[test]
+    fn an_area_spanning_two_columns_covers_both() {
+        let root = laid_out(
+            "<body><div class='g'><div class='top'>top</div><div class='l'>l</div>\
+             <div class='r'>r</div></div></body>",
+            ".g { display: grid; grid-template-columns: 100px 100px; \
+                  grid-template-areas: 'top top' 'l r'; } \
+             .top { grid-area: top; } .l { grid-area: l; } .r { grid-area: r; }",
+            400.0,
+        );
+        let top = first_box(&root, &|n| n.grid_area.as_deref() == Some("top")).expect("top");
+        let l = first_box(&root, &|n| n.grid_area.as_deref() == Some("l")).expect("l");
+        assert_eq!(top.rect.width, 200.0, "the banner covers both columns");
+        assert!(l.rect.y > top.rect.y, "and the second row is below it");
+    }
+
+    #[test]
+    fn the_grid_template_shorthand_carries_rows_and_columns() {
+        let root = laid_out(
+            "<body><div class='g'><div class='a'>a</div><div class='b'>b</div></div></body>",
+            ".g { display: grid; grid-template: auto / 150px minmax(0, 1fr); } \
+             .a {} .b {}",
+            1000.0,
+        );
+        let g = first_box(&root, &|n| n.grid_columns.len() == 2).expect("the grid container");
+        assert_eq!(g.children[0].rect.width, 150.0);
+        assert!(
+            g.children[1].rect.width > 700.0,
+            "`minmax(0, 1fr)` is a plain fr and takes the rest, got {}",
+            g.children[1].rect.width
+        );
+    }
+
+    #[test]
+    fn a_minmax_column_does_not_grow_past_its_maximum() {
+        let root = laid_out(
+            "<body><div class='g'><div class='a'>a</div></div></body>",
+            ".g { display: grid; grid-template-columns: minmax(0, 300px); }",
+            1000.0,
+        );
+        let g = first_box(&root, &|n| n.grid_columns.len() == 1).expect("the grid container");
+        assert_eq!(g.children[0].rect.width, 300.0);
+    }
+
+    #[test]
+    fn an_empty_grid_row_takes_no_height() {
+        // Rows were sized at a flat 50px whatever was in them, so an empty
+        // column on ja.wikipedia.org stood 50px tall and pushed the article
+        // down the page.
+        let root = laid_out(
+            "<body><div class='g'><div class='e'></div><div class='t'>text</div></div></body>",
+            ".g { display: grid; grid-template-columns: 1fr; }",
+            400.0,
+        );
+        let g = first_box(&root, &|n| {
+            n.display == DisplayType::Grid && n.children.len() >= 2
+        })
+        .expect("the grid container");
+        assert_eq!(
+            g.children[0].rect.height, 0.0,
+            "an empty item is an empty row"
+        );
+        assert!(
+            g.children[1].rect.y < 1.0,
+            "and the row after it starts at the top, got {}",
+            g.children[1].rect.y
+        );
     }
 
     // ------ Anonymous boxes inherit from the parent they were invented for ------

@@ -1269,7 +1269,7 @@ pub enum FlexBasis {
 // ------ Grid Track Sizing ------
 
 /// The size of a single grid track (column or row).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GridTrack {
     /// Fixed pixel width/height, e.g. "150px"
     Fixed(f32),
@@ -1283,6 +1283,8 @@ pub enum GridTrack {
     MaxContent,
     /// Fit content with a maximum limit, i.e. "fit-content(200px)"
     FitContent(f32),
+    /// `minmax(<min>, <max>)` — sized as the max track, never below the min.
+    MinMax(Box<GridTrack>, Box<GridTrack>),
 }
 
 /// An intrinsic sizing keyword written where a length was expected.
@@ -1794,6 +1796,16 @@ pub struct ComputedValues {
     pub width_percent: Option<f32>,
     pub min_width_percent: Option<f32>,
     pub max_width_percent: Option<f32>,
+    /// The named grid areas a container declares, row by row. A `.` in the
+    /// source becomes an empty name, which no item can be placed in.
+    ///
+    /// Vector 2022's whole skeleton is built from these — the header, the
+    /// sidebar beside the article, the right-hand column — so without them
+    /// every one of those boxes stacked vertically instead of sitting side by
+    /// side, and the page grew a band of empty space for each.
+    pub grid_template_areas: Vec<Vec<String>>,
+    /// The area this item asks to be placed in, from `grid-area: <name>`.
+    pub grid_area: Option<String>,
     /// `width` written as an intrinsic keyword rather than a length.
     ///
     /// Like a percentage this cannot be resolved by the cascade — but unlike a
@@ -2634,6 +2646,8 @@ impl Default for ComputedValues {
             min_width_percent: None,
             max_width_percent: None,
             width_intrinsic: None,
+            grid_template_areas: Vec::new(),
+            grid_area: None,
             min_height: None,
             max_height: None,
             line_height: DEFAULT_LINE_HEIGHT,
@@ -3375,6 +3389,33 @@ impl ComputedValues {
             "grid-template-rows" => {
                 self.grid_template_rows = parse_grid_track_list(val);
             }
+            "grid-template-areas" => {
+                self.grid_template_areas = parse_grid_template_areas(val);
+            }
+            // `grid-template: <rows> / <columns>`, and the form that spells the
+            // areas out row by row with each row's size beside it.
+            "grid-template" | "grid" => {
+                let (rows, cols) = split_rows_from_columns(val);
+                if let Some(cols) = cols {
+                    self.grid_template_columns = parse_grid_track_list(cols);
+                }
+                let areas = parse_grid_template_areas(rows);
+                if areas.is_empty() {
+                    self.grid_template_rows = parse_grid_track_list(rows);
+                } else {
+                    self.grid_template_areas = areas;
+                }
+            }
+            // Only the named-area form. The numeric `row / col / row / col`
+            // form places by line number, which needs a line-based grid model
+            // this engine does not have yet.
+            "grid-area" => {
+                let name = val.trim().trim_matches('"').trim_matches('\'');
+                self.grid_area = (!name.is_empty()
+                    && !name.contains('/')
+                    && !name.chars().next().is_some_and(|c| c.is_ascii_digit()))
+                .then(|| name.to_string());
+            }
             "grid-column-gap" => {
                 self.grid_column_gap = parse_length(val).unwrap_or(0.0);
             }
@@ -3834,6 +3875,10 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "gap",
     "grid-column-gap",
     "grid-row-gap",
+    "grid",
+    "grid-area",
+    "grid-template",
+    "grid-template-areas",
     "grid-template-columns",
     "grid-template-rows",
     "height",
@@ -4601,6 +4646,20 @@ fn parse_single_grid_track(token: &str, ctx: LengthContext) -> Option<GridTrack>
     if token.eq_ignore_ascii_case("auto") {
         return Some(GridTrack::Auto);
     }
+    // `minmax(a, b)` sizes as `b` but never shrinks past `a`.
+    if let Some(args) = token
+        .strip_prefix("minmax(")
+        .or_else(|| token.strip_prefix("MINMAX("))
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let parts = split_top_level_commas(args);
+        let [lo, hi] = parts.as_slice() else {
+            return None;
+        };
+        let lo = parse_single_grid_track(lo.trim(), ctx)?;
+        let hi = parse_single_grid_track(hi.trim(), ctx)?;
+        return Some(GridTrack::MinMax(Box::new(lo), Box::new(hi)));
+    }
     if token.eq_ignore_ascii_case("min-content") {
         return Some(GridTrack::MinContent);
     }
@@ -4623,6 +4682,65 @@ fn parse_single_grid_track(token: &str, ctx: LengthContext) -> Option<GridTrack>
         return Some(GridTrack::Fixed(px));
     }
     None
+}
+
+/// Read `grid-template-areas` into a grid of names, row by row.
+///
+/// Each quoted string is one row, and the words in it name the column cells.
+/// A `.` is a cell no item may be placed in, which becomes an empty name.
+pub fn parse_grid_template_areas(value: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in value.chars() {
+        match quote {
+            Some(q) if ch == q => {
+                rows.push(
+                    current
+                        .split_whitespace()
+                        .map(|name| {
+                            if name == "." {
+                                String::new()
+                            } else {
+                                name.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                current.clear();
+                quote = None;
+            }
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None => {}
+        }
+    }
+    rows.retain(|r: &Vec<String>| !r.is_empty());
+    rows
+}
+
+/// Split a `grid-template` value at the `/` that separates rows from columns.
+///
+/// The slash inside `minmax(0, 1fr)` is not one — there is none — but a
+/// function's parentheses are skipped anyway so that stays true of
+/// `fit-content()` and anything else that grows a slash later.
+fn split_rows_from_columns(value: &str) -> (&str, Option<&str>) {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for (i, ch) in value.char_indices() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'') | (None, '"') => quote = Some(ch),
+            (None, '(') => depth += 1,
+            (None, ')') => depth = depth.saturating_sub(1),
+            (None, '/') if depth == 0 => {
+                return (value[..i].trim(), Some(value[i + 1..].trim()));
+            }
+            _ => {}
+        }
+    }
+    (value.trim(), None)
 }
 
 /// Parse a grid track list like "1fr 1fr 200px auto min-content repeat(3, 1fr)" into GridTrack enums.

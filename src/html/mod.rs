@@ -156,6 +156,13 @@ impl crate::layout::LayoutDomNode for DomNode {
         }
     }
 
+    fn is_rendered(&self) -> bool {
+        matches!(
+            self.node_type,
+            DomNodeType::Element { .. } | DomNodeType::Text(_)
+        )
+    }
+
     fn attributes(&self) -> Vec<(String, String)> {
         self.attrs
             .iter()

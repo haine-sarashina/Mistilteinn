@@ -495,6 +495,15 @@ pub trait LayoutDomNode {
     fn get_attr(&self, name: &str) -> Option<String>;
     fn children_ids(&self) -> Vec<u32>;
     fn text_content(&self) -> Option<&str>;
+    /// Whether this node generates a box at all.
+    ///
+    /// A comment and a doctype are neither an element nor text; they were
+    /// falling through as elements with an empty tag name and each getting a
+    /// box. `<div id="siteNotice"><!-- CentralNotice --></div>` is empty in
+    /// Chrome and 19px tall here, because the comment inside it made a line.
+    fn is_rendered(&self) -> bool {
+        true
+    }
     fn attributes(&self) -> Vec<(String, String)> {
         Vec::new()
     }
@@ -730,6 +739,10 @@ fn build_layout_children<N, F>(
 
     for &child_id in child_ids {
         if let Some(node) = get_node(child_id) {
+            // A comment or a doctype makes no box.
+            if !node.is_rendered() {
+                continue;
+            }
             let tag = node.tag_name().to_lowercase();
             // A text node has no style of its own — the box around it is what
             // says how its text looks. Falling back to the initial values made
@@ -2381,19 +2394,41 @@ fn compute_block_height_inner(
         };
     }
 
-    let mut height = 0.0;
+    // Children that stack add up; children that stand side by side take the
+    // tallest. A row of flex items was being summed as though each began a new
+    // line, which handed the flex layout a container far taller than its
+    // content — and the flex layout then stretched its one line to fill it.
+    // ja.wikipedia.org's header came out 141px instead of 96, with its logo
+    // and search box floating apart inside it.
+    let side_by_side = matches!(node.display, DisplayType::Flex | DisplayType::InlineFlex)
+        && matches!(
+            node.flex_direction,
+            FlexDirection::Row | FlexDirection::RowReverse
+        );
+
+    let mut height = 0.0f32;
     for child in &node.children {
-        if is_block_child(child) {
-            height += compute_block_height_inner(child, depth + 1, _text_renderer)
+        let outer = if is_block_child(child) {
+            compute_block_height_inner(child, depth + 1, _text_renderer)
                 + child.padding[0]
                 + child.padding[2]
                 + child.border[0]
-                + child.border[2];
+                + child.border[2]
         } else if is_inline_child(child) {
-            height += compute_inline_height(child);
+            compute_inline_height(child)
+        } else {
+            continue;
+        };
+        if side_by_side {
+            height = height.max(outer + child.margin[0] + child.margin[2]);
+        } else {
+            height += outer;
         }
     }
-    height + node.padding[0] + node.padding[2]
+    // The content height alone. Every caller adds this box's own padding and
+    // border on top — including the recursion above — and adding it here too
+    // counted the frame twice, the same way the width measure used to.
+    height
 }
 
 /// Compute the height of a block node (content + inner children).
@@ -5009,7 +5044,20 @@ pub fn break_into_lines(
             boxes.pop();
         }
 
-        if boxes.is_empty() {
+        // A line with nothing on it that takes room is a zero-height line box,
+        // and CSS says so explicitly: no text, no preserved white space, no
+        // inline box with a size of its own. Giving it the strut's height
+        // instead is what made `<div id="siteNotice"><!-- CentralNotice --></div>`
+        // and every other empty wrapper stand a line tall and push the page
+        // down. A forced break still counts — that is what `<br>` is for.
+        let carries_nothing = boxes.iter().all(|b| match b {
+            InlineBox::Text { text, .. } => text.trim().is_empty(),
+            InlineBox::Element { width, height, .. } => *width <= 0.0 && *height <= 0.0,
+            InlineBox::Whitespace { collapsible, width } => *collapsible || *width <= 0.0,
+            InlineBox::LineBreak => false,
+        });
+        if boxes.is_empty() || carries_nothing {
+            boxes.clear();
             *width = 0.0;
             *max_font_size = 0.0;
             return;
@@ -5178,8 +5226,14 @@ pub fn break_into_lines(
                 dom_node_id,
                 interaction_type,
             } => {
-                let est_width = (*width).max(1.0); // at least 1px for inline elements
-                let est_height = (*height).max(1.0);
+                // No floor here. An inline box with no size of its own adds
+                // nothing to the line, which is what lets a line carrying only
+                // empty inlines be dropped as CSS says it should. Rounding it
+                // up to a pixel made every empty `<span>` hold a line open.
+                // The floor that keeps a real element visible is applied where
+                // the element is positioned, further down.
+                let est_width = *width;
+                let est_height = *height;
 
                 if (current_line_width + est_width > available_width)
                     && !current_line_boxes.is_empty()
@@ -7458,12 +7512,15 @@ mod tests {
         let mut renderer = crate::render::text::TextRenderer::new();
         compute_layout(&mut root, 800.0, &mut renderer);
 
-        // float_node should be at top (0.0), height 40.0 (due to engine bug double counting padding), width 200.0
+        // The float sits at the top and is its own padding tall — 10px above
+        // and 10px below nothing. It used to come out 40 because the height
+        // measure added the box's padding and the caller added it again; the
+        // numbers here were written down as the bug rather than as the rule.
         assert_eq!(root.children[0].rect.y, 0.0);
-        assert_eq!(root.children[0].rect.height, 40.0);
+        assert_eq!(root.children[0].rect.height, 20.0);
 
-        // clear_node should clear the left float, so its y should be 40.0 (bottom of the float, due to padding double-addition bug in engine)
-        assert_eq!(root.children[1].rect.y, 40.0);
+        // And the box that clears it starts below it.
+        assert_eq!(root.children[1].rect.y, 20.0);
     }
 
     use super::*;
@@ -11168,6 +11225,125 @@ mod tests {
             .find(|r| r.text.contains("link"))
             .expect("the link run");
         assert_eq!(link.color, [51, 102, 204, 255]);
+    }
+
+    // ------ Estimating a box's height before it is laid out ------
+
+    #[test]
+    fn a_row_of_flex_items_is_as_tall_as_the_tallest() {
+        // The estimate that runs before flex layout summed the children as
+        // though each began a new line, so the flex code was handed a
+        // container far taller than its content — and then stretched its one
+        // line to fill it. ja.wikipedia.org's header came out 141px instead
+        // of 96, with the logo and search box floating apart inside it.
+        let root = laid_out(
+            "<body><header class='h'><div class='a'></div><div class='b'></div></header></body>",
+            "body { margin: 0 } \
+             .h { display: flex; align-items: center; padding-top: 8px; \
+                  padding-bottom: 8px; } \
+             .a { width: 100px; height: 67px; } .b { width: 200px; height: 80px; }",
+            800.0,
+        );
+        let header = first_box(&root, &|n| n.display == DisplayType::Flex).expect("the header");
+        assert_eq!(
+            header.rect.height, 96.0,
+            "the tallest item (80) plus the header's own 8px above and below"
+        );
+    }
+
+    #[test]
+    fn a_column_of_boxes_still_adds_up() {
+        // The control: boxes that stack are summed, which is the case the
+        // measure was written for.
+        let root = laid_out(
+            "<body><div class='c'><div class='a'></div><div class='b'></div></div></body>",
+            "body { margin: 0 } .a { height: 30px; } .b { height: 40px; }",
+            800.0,
+        );
+        let holder = first_box(&root, &|n| n.children.len() == 2).expect("the container");
+        assert_eq!(holder.rect.height, 70.0);
+    }
+
+    #[test]
+    fn an_empty_padded_box_is_its_padding_tall() {
+        // 10px above nothing and 10px below it. The measure returned its own
+        // padding and every caller added it again.
+        let root = laid_out(
+            "<body><div class='p'></div></body>",
+            "body { margin: 0 } .p { padding: 10px; }",
+            400.0,
+        );
+        let padded = first_box(&root, &|n| n.padding[0] == 10.0).expect("the padded box");
+        assert_eq!(padded.rect.height, 20.0);
+    }
+
+    // ------ What makes no box, and what makes no line ------
+
+    #[test]
+    fn a_comment_makes_no_box() {
+        // `<div id="siteNotice"><!-- CentralNotice --></div>` is empty in
+        // Chrome. The comment was falling through as an element with an empty
+        // tag name, getting a box, and standing a line tall.
+        let root = laid_out(
+            "<body><div class='c'><!-- nothing to see --></div></body>",
+            "body { margin: 0 } .c { }",
+            400.0,
+        );
+        let holder = first_box(&root, &|n| {
+            n.children.iter().any(|c| c.text.is_none()) || n.rect.height > 0.0
+        });
+        let empty = first_box(&root, &|n| n.dom_node_id.is_some() && n.children.is_empty());
+        let _ = holder;
+        assert!(empty.is_some(), "the div itself is still there");
+        assert_eq!(
+            empty.unwrap().rect.height,
+            0.0,
+            "and it holds nothing, so it is nothing tall"
+        );
+    }
+
+    #[test]
+    fn a_line_with_nothing_on_it_is_no_line() {
+        // CSS: a line box with no text, no preserved white space and no inline
+        // box of its own size is a zero-height line box.
+        let root = laid_out(
+            "<body><div class='e'><span></span></div><div class='after'>x</div></body>",
+            "body { margin: 0 } .e { } .after { }",
+            400.0,
+        );
+        let after = first_box(&root, &|n| {
+            n.children
+                .iter()
+                .any(|c| c.text.as_deref().map(str::trim) == Some("x"))
+        })
+        .expect("the box after the empty one");
+        assert_eq!(
+            after.rect.y, 0.0,
+            "an empty wrapper above it takes no room, got {}",
+            after.rect.y
+        );
+    }
+
+    #[test]
+    fn a_line_with_a_sized_inline_on_it_still_has_height() {
+        // The control: an inline box with a size of its own is content, and
+        // the line has to hold it.
+        let root = laid_out(
+            "<body><div class='e'><span class='i'></span></div><div class='after'>x</div></body>",
+            "body { margin: 0 } .i { display: inline-block; width: 20px; height: 20px; }",
+            400.0,
+        );
+        let after = first_box(&root, &|n| {
+            n.children
+                .iter()
+                .any(|c| c.text.as_deref().map(str::trim) == Some("x"))
+        })
+        .expect("the box after");
+        assert!(
+            after.rect.y >= 20.0,
+            "a 20px inline box keeps its line open, got {}",
+            after.rect.y
+        );
     }
 
     // ------ Grid: named areas, the `grid-template` shorthand, content rows ------

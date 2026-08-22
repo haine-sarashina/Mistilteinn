@@ -2949,7 +2949,7 @@ dependencies = [
 
 [[package]]
 name = "mistilteinn"
-version = "0.2.10"
+version = "0.3.0"
 dependencies = [
  "arboard",
  "boa_engine",

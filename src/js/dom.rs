@@ -282,7 +282,9 @@ pub fn init_dom_bindings_with_arena(context: &mut Context, arena: SharedArena) -
     let navigator = ObjectInitializer::new(context)
         .property(
             js_string!("userAgent"),
-            js_string!("Mistilteinn/0.2.10"),
+            // From the crate's own version, so it cannot drift out of step
+            // with it the way a written-out number does.
+            js_string!(concat!("Mistilteinn/", env!("CARGO_PKG_VERSION"))),
             boa_engine::property::Attribute::READONLY,
         )
         .build();

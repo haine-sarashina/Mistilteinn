@@ -1492,7 +1492,7 @@ pub fn compute_layout(
         - root.margin[1];
 
     let start_x = root.rect.x + root.padding[3] + root.border[3];
-    let start_y = root.rect.y;
+    let start_y = root.rect.y + root.padding[0] + root.border[0];
 
     let mut float_ctx = FloatContext::new();
 
@@ -1854,7 +1854,13 @@ fn compute_block_children(
     // Each run is laid out as an inline formatting context. Block children use
     // the traditional vertical stacking.
 
-    let mut y = parent_y + parent.padding[0] + parent.border[0]; // start after top padding and border
+    // `parent_y` is the box's content top — every caller works it out before
+    // calling, the same way `parent_x` is worked out. Adding the padding again
+    // here pushed the content down by it and left nothing below the last
+    // child, so a framed box's bottom padding was missing and its last line
+    // ran into the border. The welcome panel's "Help for Non-Japanese
+    // Speakers" was cut off along the bottom edge this way.
+    let mut y = parent_y;
     let children_count = parent.children.len();
     let mut i = 0;
 
@@ -2157,8 +2163,7 @@ fn compute_block_children(
 
     // Update parent height based on content extent
     // Only overwrite height/width if they haven't been set by a parent flexbox layout pass.
-    let start_y = parent_y + parent.padding[0] + parent.border[0];
-    let content_height = (y - start_y).max(0.0);
+    let content_height = (y - parent_y).max(0.0);
     let computed_total_height = content_height
         + parent.padding[0]
         + parent.border[0]
@@ -2420,7 +2425,16 @@ fn compute_block_height_inner(
         );
 
     let mut height = 0.0f32;
+    // Inline children share a line, so a run of them is as tall as the tallest
+    // — not as tall as all of them stacked. Summing gave `<div id="welcome">`
+    // the height of its `<a>` plus the text beside it, 69px for a 38px line,
+    // and this estimate is a floor the real layout only ever raises.
+    let mut inline_run = 0.0f32;
     for child in &node.children {
+        if is_inline_child(child) && !side_by_side {
+            inline_run = inline_run.max(compute_inline_height(child));
+            continue;
+        }
         let outer = if is_block_child(child) {
             compute_block_height_inner(child, depth + 1, _text_renderer)
                 + child.padding[0]
@@ -2435,9 +2449,12 @@ fn compute_block_height_inner(
         if side_by_side {
             height = height.max(outer + child.margin[0] + child.margin[2]);
         } else {
-            height += outer;
+            // A block ends whatever run of lines was being built.
+            height += inline_run + outer;
+            inline_run = 0.0;
         }
     }
+    height += inline_run;
     // The content height alone. Every caller adds this box's own padding and
     // border on top — including the recursion above — and adding it here too
     // counted the frame twice, the same way the width measure used to.
@@ -11364,6 +11381,53 @@ mod tests {
     }
 
     #[test]
+    fn a_run_of_inline_children_is_as_tall_as_the_tallest() {
+        // They share a line, so the estimate must not stack them. Summing gave
+        // `<div id="welcome">` the height of its `<a>` plus the text beside
+        // it — 69px for a 38px line — and this estimate is a floor the real
+        // layout only ever raises.
+        let root = laid_out(
+            "<body><div class='w'><a>link</a>and text beside it</div></body>",
+            "body { margin: 0 } .w { font-size: 20px; }",
+            800.0,
+        );
+        let holder = first_box(&root, &|n| n.line_boxes.is_some()).expect("the box");
+        let line = holder.line_boxes.as_ref().unwrap()[0].height;
+        assert!(
+            (holder.rect.height - line).abs() < 0.01,
+            "one line of content is one line tall: box {} vs line {line}",
+            holder.rect.height
+        );
+    }
+
+    #[test]
+    fn a_framed_box_keeps_its_padding_on_both_sides() {
+        // `parent_y` is a box's content top, worked out by the caller. Adding
+        // the padding again inside pushed the content down by it and left
+        // nothing below the last child, so the welcome panel's last line ran
+        // into its own bottom border.
+        let root = laid_out(
+            "<body><div class='f'><div class='a'></div></div></body>",
+            "body { margin: 0 } .f { padding: 8px; border: 1px solid #000; } \
+             .a { height: 20px; }",
+            400.0,
+        );
+        let framed = first_box(&root, &|n| n.padding[0] == 8.0).expect("the framed box");
+        let inner = framed.children.first().expect("the child");
+        assert_eq!(framed.rect.height, 38.0, "1 + 8 + 20 + 8 + 1");
+        assert_eq!(
+            inner.rect.y - framed.rect.y,
+            9.0,
+            "border then padding above"
+        );
+        assert_eq!(
+            framed.rect.bottom() - inner.rect.bottom(),
+            9.0,
+            "and the same below"
+        );
+    }
+
+    #[test]
     fn a_column_of_boxes_still_adds_up() {
         // The control: boxes that stack are summed, which is the case the
         // measure was written for.
@@ -11997,7 +12061,7 @@ fn compute_table_children(
                     compute_block_children(
                         row_node,
                         start_x,
-                        current_y,
+                        current_y + row_node.padding[0] + row_node.border[0],
                         c_inner_w,
                         depth + 1,
                         text_renderer,

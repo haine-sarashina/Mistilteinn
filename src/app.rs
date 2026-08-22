@@ -2218,7 +2218,7 @@ impl MistilteinnApp {
         for (src, image) in arrived {
             framed.image_cache.insert(src, image);
         }
-        for src in missing {
+        for (src, _, _) in missing {
             framed.note_image_failed(&src);
         }
         if !framed.image_cache.is_empty() {
@@ -2238,7 +2238,10 @@ impl MistilteinnApp {
     /// again. See [`crate::page::Page::note_image_failed`].
     async fn fetch_images(
         requests: Vec<(String, f32, f32)>,
-    ) -> (Vec<(String, crate::page::CachedImage)>, Vec<String>) {
+    ) -> (
+        Vec<(String, crate::page::CachedImage)>,
+        Vec<(String, f32, f32)>,
+    ) {
         use futures::StreamExt;
 
         let results =
@@ -2258,15 +2261,15 @@ impl MistilteinnApp {
                                 Ok((src, rgba, iw, ih))
                             } else {
                                 log::warn!("Failed to render SVG: {}", src);
-                                Err(src)
+                                Err((src, req_w, req_h))
                             }
                         } else {
-                            Err(src)
+                            Err((src, req_w, req_h))
                         }
                     }
                     Err(e) => {
-                        log::warn!("image fetch failed: {src} ({e:?})");
-                        Err(src)
+                        log::warn!("image fetch failed: {src} ({e})");
+                        Err((src, req_w, req_h))
                     }
                 }
             }))
@@ -2286,7 +2289,7 @@ impl MistilteinnApp {
                         height,
                     },
                 )),
-                Err(src) => missing.push(src),
+                Err(request) => missing.push(request),
             }
         }
         (arrived, missing)
@@ -2347,7 +2350,7 @@ impl MistilteinnApp {
         for (src, image) in arrived {
             page.image_cache.insert(src, image);
         }
-        for src in missing {
+        for (src, _, _) in missing {
             page.note_image_failed(&src);
         }
         if !anything_arrived {
@@ -2506,10 +2509,28 @@ impl MistilteinnApp {
         for (src, image) in arrived {
             new_page.image_cache.insert(src, image);
         }
-        // A picture that did not arrive gets one more chance on the next pass
-        // over the document, rather than being lost for the life of the page.
-        for src in missing {
-            new_page.note_image_failed(&src);
+
+        // Ask once more for whatever did not arrive. Nothing else would: the
+        // only later pass over the document is the one scrolling triggers, so
+        // a picture lost on a page the reader never scrolls is lost for good.
+        // A busy image host answering `429` to two of a page's twenty pictures
+        // is the ordinary case, and it left the article missing its logo.
+        let worth_retrying: Vec<(String, f32, f32)> = missing
+            .into_iter()
+            .filter(|(src, _, _)| new_page.note_image_failed(src))
+            .collect();
+        if !worth_retrying.is_empty() {
+            log::info!(
+                "retrying {} image(s) that did not arrive",
+                worth_retrying.len()
+            );
+            let (arrived, still_missing) = Self::fetch_images(worth_retrying).await;
+            for (src, image) in arrived {
+                new_page.image_cache.insert(src, image);
+            }
+            for (src, _, _) in still_missing {
+                new_page.note_image_failed(&src);
+            }
         }
 
         // The first layout ran before any of this page's assets existed: text

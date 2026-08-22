@@ -1606,10 +1606,28 @@ fn parse_url_token(s: &str) -> Option<String> {
     let inner = &s[4..s.len() - 1];
     let url = inner.trim().trim_matches(|c| c == '"' || c == '\'').trim();
     if url.is_empty() {
-        None
-    } else {
-        Some(url.to_string())
+        return None;
     }
+    // A CSS string may escape the quote that delimits it, and an inline SVG
+    // icon nearly always does — `url("data:image/svg+xml;utf8,<svg xmlns=\"…")`.
+    // Handing the backslashes on leaves the SVG unparseable, so the icon does
+    // not render at all.
+    if url.contains('\\') {
+        let mut out = String::with_capacity(url.len());
+        let mut chars = url.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some(escaped) => out.push(escaped),
+                    None => break,
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        return Some(out);
+    }
+    Some(url.to_string())
 }
 
 // ------ Cursor ------
@@ -6589,6 +6607,28 @@ mod tests {
     }
 
     // ------ visibility / spacing / text-transform ------
+
+    #[test]
+    fn a_url_token_unescapes_the_quotes_inside_it() {
+        // An inline SVG icon escapes the quote that delimits the CSS string.
+        // Handing the backslashes on leaves the SVG unparseable, so the icon
+        // does not render — ja.wikipedia.org's dropdown chevron, for one.
+        let raw = r#"url("data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\"/>")"#;
+        let got = parse_url_token(raw).expect("a url");
+        assert!(!got.contains('\\'), "no backslashes should survive: {got}");
+        assert!(
+            got.contains(r#"xmlns="http://www.w3.org/2000/svg""#),
+            "got {got}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_url_is_left_alone() {
+        assert_eq!(
+            parse_url_token("url('//example.com/a.png')").as_deref(),
+            Some("//example.com/a.png")
+        );
+    }
 
     #[test]
     fn visibility_keywords_parse() {

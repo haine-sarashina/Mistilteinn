@@ -10,6 +10,14 @@ pub enum NetworkError {
     Http(#[from] reqwest::Error),
     #[error("Timeout")]
     Timeout,
+    /// The server answered, but not with success.
+    ///
+    /// Separate from [`NetworkError::Timeout`] because the two call for
+    /// opposite responses and used to be reported as the same thing: a run of
+    /// `429 Too Many Requests` from an image host was logged as a timeout,
+    /// which reads as "the network is slow" rather than "we asked too fast".
+    #[error("HTTP {0}")]
+    Status(u16),
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
     /// The server's certificate could not be verified.
@@ -754,7 +762,12 @@ pub async fn fetch_image(url: &str) -> Result<Vec<u8>, NetworkError> {
         }
     }
 
-    for attempt in 0..3 {
+    // A rate limiter wants to be waited out, not hammered. 150ms and 300ms
+    // were nowhere near enough for Wikimedia's, which turned a page's pictures
+    // into a run of 429s that the caller then read as timeouts.
+    const BACKOFF_MS: [u64; 4] = [400, 1200, 2500, 0];
+    let mut last_status = None;
+    for (attempt, wait) in BACKOFF_MS.iter().enumerate() {
         let resp = get_with_cache(url, std::time::Duration::from_secs(15)).await;
         match resp {
             // `None` means the cached copy was still fresh; a 304 means it was
@@ -763,20 +776,30 @@ pub async fn fetch_image(url: &str) -> Result<Vec<u8>, NetworkError> {
                 return Ok(res.bytes);
             }
             Ok(res) if res.status.is_some_and(|s| s.as_u16() == 429) => {
-                tokio::time::sleep(std::time::Duration::from_millis(150 * (attempt + 1))).await;
+                last_status = res.status;
+                if *wait == 0 {
+                    break;
+                }
+                log::debug!("rate limited, waiting {wait}ms: {url}");
+                tokio::time::sleep(std::time::Duration::from_millis(*wait)).await;
             }
-            Ok(_) => {
+            // Any other answer is the server's final word.
+            Ok(res) => {
+                last_status = res.status;
                 break;
             }
             Err(e) => {
-                if attempt == 2 {
+                if attempt == BACKOFF_MS.len() - 1 {
                     return Err(e);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
     }
-    Err(NetworkError::Timeout)
+    Err(match last_status {
+        Some(status) => NetworkError::Status(status.as_u16()),
+        None => NetworkError::Timeout,
+    })
 }
 
 /// Fetch a single CSS file with a shorter timeout (10s) and the standard User-Agent.

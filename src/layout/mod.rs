@@ -1006,10 +1006,7 @@ fn build_layout_children<N, F>(
                         ) || layout_node.text.is_some())
                     {
                         if anon_block.is_none() {
-                            anon_block = Some(LayoutNode::new_with_display(
-                                Rect::new(0.0, 0.0, 0.0, 0.0),
-                                DisplayType::Block,
-                            ));
+                            anon_block = Some(anonymous_block(parent));
                         }
                         anon_block.as_mut().unwrap().add_child(layout_node);
                     } else {
@@ -1238,10 +1235,7 @@ fn build_layout_children<N, F>(
                         ) || layout_node.text.is_some())
                     {
                         if anon_block.is_none() {
-                            anon_block = Some(LayoutNode::new_with_display(
-                                Rect::new(0.0, 0.0, 0.0, 0.0),
-                                DisplayType::Block,
-                            ));
+                            anon_block = Some(anonymous_block(parent));
                         }
                         anon_block.as_mut().unwrap().add_child(layout_node);
                     } else {
@@ -5145,6 +5139,35 @@ pub fn break_into_lines(
 /// Only the properties that decide how text is drawn are carried across;
 /// everything else stays at its initial value, since a text node has no box of
 /// its own to apply them to.
+/// A block box the layout invented, with no element of its own behind it.
+///
+/// An anonymous box has no rules to match, so CSS gives it the inherited
+/// properties of its parent and the initial value of everything else.
+/// Building one from nothing left it at the initial value of *both*, which
+/// went wrong in two ways at once.
+///
+/// It came out `visible` inside a `visibility: hidden` subtree. The line boxes
+/// live on the anonymous block, and text is collected from whoever owns the
+/// line — so hiding the real parent hid nothing. ja.wikipedia.org's collapsed
+/// menus painted all their links across the article this way, which is what a
+/// screenshot beside Chrome showed.
+///
+/// And it came out at the default `line-height`, so text inside an anonymous
+/// box was set tighter than the page asked for while text beside it was not.
+fn anonymous_block(parent: &LayoutNode) -> LayoutNode {
+    let mut node = LayoutNode::new_with_display(Rect::new(0.0, 0.0, 0.0, 0.0), DisplayType::Block);
+    node.visibility = parent.visibility;
+    node.font_size = parent.font_size;
+    node.font_family = parent.font_family.clone();
+    node.line_height = parent.line_height;
+    node.color = parent.color;
+    node.text_style = parent.text_style;
+    node.text_align = parent.text_align;
+    node.direction = parent.direction;
+    node.cursor = parent.cursor;
+    node
+}
+
 fn inherited_text_style(parent: &LayoutNode) -> ComputedValues {
     ComputedValues {
         font_size: parent.font_size,
@@ -5195,6 +5218,8 @@ fn attach_generated_content<N: LayoutDomNode>(
         text_box.color = parent.color;
         text_box.font_size = parent.font_size;
         text_box.font_family = parent.font_family.clone();
+        text_box.line_height = parent.line_height;
+        text_box.visibility = parent.visibility;
         text_box.text_style = parent.text_style;
         text_box.dom_node_id = parent.dom_node_id;
         parent.children.insert(0, text_box);
@@ -10958,6 +10983,76 @@ mod tests {
             .find(|r| r.text.contains("link"))
             .expect("the link run");
         assert_eq!(link.color, [51, 102, 204, 255]);
+    }
+
+    // ------ Anonymous boxes inherit from the parent they were invented for ------
+
+    /// Text mixed with a block sibling: the loose text is wrapped in an
+    /// anonymous block, which is the box under test.
+    const MIXED: &str = "<body><div class='h'>loose text<div>a block</div></div></body>";
+
+    #[test]
+    fn an_anonymous_block_does_not_paint_inside_a_hidden_parent() {
+        // The line boxes live on the anonymous block, and text is collected
+        // from whoever owns the line — so an anonymous box built at the initial
+        // `visible` made `visibility: hidden` on its parent do nothing.
+        // ja.wikipedia.org's collapsed menus painted every link this way.
+        let root = laid_out(MIXED, ".h { visibility: hidden; }", 400.0);
+        let items = build_display_list_with_scroll(&root, (0.0, 0.0), (400.0, 800.0));
+        let painted: Vec<String> = items
+            .iter()
+            .filter_map(|i| match &i.item {
+                PaintItem::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            painted.is_empty(),
+            "nothing under a hidden parent should paint, got {painted:?}"
+        );
+    }
+
+    #[test]
+    fn a_visible_page_still_paints_its_anonymous_blocks() {
+        // The control: the same markup with nothing hidden must paint.
+        let root = laid_out(MIXED, "", 400.0);
+        let items = build_display_list_with_scroll(&root, (0.0, 0.0), (400.0, 800.0));
+        let painted = items
+            .iter()
+            .filter(|i| matches!(i.item, PaintItem::Text(_)))
+            .count();
+        assert!(painted >= 2, "both runs should paint, got {painted}");
+    }
+
+    #[test]
+    fn an_anonymous_block_takes_its_parents_line_height() {
+        // An anonymous box has no rules to match, so every inherited property
+        // is its parent's. Left at the initial value, text inside one was set
+        // tighter than the text beside it.
+        // Measured through the block sibling: it is stacked under the
+        // anonymous box, so a taller line there pushes it further down.
+        let top_of_block = |lh: &str| -> f32 {
+            let css = format!(".h {{ line-height: {lh}; }}");
+            let root = laid_out(MIXED, &css, 400.0);
+            first_box(&root, &|n| {
+                n.text.as_deref().map(str::trim) == Some("a block")
+            })
+            .or_else(|| {
+                first_box(&root, &|n| {
+                    n.children
+                        .iter()
+                        .any(|c| c.text.as_deref().map(str::trim) == Some("a block"))
+                })
+            })
+            .expect("the block sibling")
+            .rect
+            .y
+        };
+        let (a, b) = (top_of_block("1"), top_of_block("3"));
+        assert!(
+            b > a,
+            "the parent's line-height must reach the anonymous box: block at {a} vs {b}"
+        );
     }
 
     // ------ W3: what is hidden from a screen reader is not hidden from sight ------

@@ -307,6 +307,32 @@ const INHERITABLE_PROPERTIES: &[&str] = &[
     "cursor",
 ];
 
+impl ComputedValues {
+    /// Take a box out of the inline world when `float` or `position` already
+    /// has.
+    ///
+    /// CSS calls this blockification: a floated or absolutely positioned box
+    /// is block-level whatever `display` said, because there is no line for an
+    /// inline box to sit on once it has left the flow. (`fixed` would count
+    /// too; this engine does not model it separately yet.) `.mw-logo-container` is
+    /// a `<span>` with `float: left` holding two `display: block` images —
+    /// left inline, it gave them no block layout at all and both wordmarks
+    /// were painted at the same spot, one on top of the other.
+    fn blockify_if_out_of_flow(&mut self) {
+        let out_of_flow = self.float != FloatType::None || self.position == PositionType::Absolute;
+        if !out_of_flow {
+            return;
+        }
+        self.display = match self.display {
+            DisplayType::Inline | DisplayType::InlineBlock => DisplayType::Block,
+            DisplayType::InlineFlex => DisplayType::Flex,
+            DisplayType::InlineTable => DisplayType::Table,
+            // `none` stays none, and everything already block-level is fine.
+            other => other,
+        };
+    }
+}
+
 /// Check if a CSS property name is inheritable.
 fn is_inheritable(property: &str) -> bool {
     let lower = property.to_lowercase();
@@ -739,6 +765,7 @@ where
             }
         }
 
+        computed.blockify_if_out_of_flow();
         applied_decls_per_element.insert(node_id, all_applied);
         result.insert(node_id, computed);
     }
@@ -775,6 +802,9 @@ where
                     }
                 }
 
+                // This pass rebuilds from a fresh base, so anything Phase 1
+                // settled after the declarations had run has to run again.
+                inherited.blockify_if_out_of_flow();
                 result.insert(node_id, inherited);
             }
         }
@@ -4060,6 +4090,20 @@ impl Default for LengthContext {
 ///
 /// `s` is the text inside `calc(` … `)`.
 fn eval_calc(s: &str, ctx: LengthContext) -> Option<f32> {
+    // A `calc()` inside a `calc()` is legal and means exactly what a bare pair
+    // of parentheses means, so the keyword is dropped before tokenising.
+    // Leaving it in made the whole expression unreadable and the declaration
+    // was thrown away: the search field's
+    // `padding-left: calc(8px + 8px + calc(1rem + 4px))` came out 0, so the
+    // magnifier sat on top of the placeholder.
+    let unnested;
+    let s = if s.contains("calc(") {
+        unnested = s.replace("calc(", "(");
+        unnested.as_str()
+    } else {
+        s
+    };
+
     // Tokenise into numbers-with-units, operators and parentheses. CSS requires
     // whitespace around + and - (so `10px -5px` is two values, not a
     // subtraction), and that also keeps signed exponents unambiguous.
@@ -6679,6 +6723,14 @@ mod tests {
     fn calc_does_basic_arithmetic() {
         let ctx = LengthContext::default();
         assert_eq!(parse_length_ctx("calc(100px + 20px)", ctx), Some(120.0));
+        // A `calc()` inside a `calc()` is legal and means what a bare pair of
+        // parentheses means. Left unread, the whole declaration was thrown
+        // away: the search field's padding-left came out 0 and the magnifier
+        // sat on top of the placeholder.
+        assert_eq!(
+            parse_length_ctx("calc(8px + 8px + calc(16px + 4px))", ctx),
+            Some(36.0)
+        );
         assert_eq!(parse_length_ctx("calc(100px - 20px)", ctx), Some(80.0));
         assert_eq!(parse_length_ctx("calc(100px * 2)", ctx), Some(200.0));
         assert_eq!(parse_length_ctx("calc(100px / 4)", ctx), Some(25.0));

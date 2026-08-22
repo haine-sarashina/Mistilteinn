@@ -1251,12 +1251,25 @@ fn build_layout_children<N, F>(
                         continue;
                     }
 
-                    if is_parent_flex_or_grid
-                        && (matches!(
-                            layout_node.display,
-                            DisplayType::Inline | DisplayType::InlineBlock
-                        ) || layout_node.text.is_some())
-                    {
+                    // A flex or grid item is block-level whatever `display`
+                    // said — CSS blockifies it, because there is no line for
+                    // an inline box to sit on among flex items. Only bare text
+                    // gets an anonymous item wrapped around it.
+                    //
+                    // Wrapping an inline *element* instead left it inline
+                    // inside the wrapper, so its own block children were never
+                    // laid out as blocks: `.mw-logo-container` is a `<span>`
+                    // holding two `display: block` images, and both wordmarks
+                    // were painted at the same spot, one on top of the other.
+                    if is_parent_flex_or_grid && layout_node.text.is_none() {
+                        layout_node.display = match layout_node.display {
+                            DisplayType::Inline | DisplayType::InlineBlock => DisplayType::Block,
+                            DisplayType::InlineTable => DisplayType::Table,
+                            other => other,
+                        };
+                    }
+
+                    if is_parent_flex_or_grid && layout_node.text.is_some() {
                         if anon_block.is_none() {
                             anon_block = Some(anonymous_block(parent));
                         }
@@ -5906,7 +5919,16 @@ struct StackingLayers<'a> {
     block_backgrounds: Vec<DisplayItem>,
     /// Layer 4: non-positioned floats, each painted as a unit.
     floats: Vec<DisplayItem>,
-    /// Layer 5: in-flow inline content — text, replaced elements, inline boxes.
+    /// Layer 5a: the backgrounds and borders of in-flow inline boxes.
+    ///
+    /// Held apart from the text because of how inline layout stores it: a
+    /// container emits the whole of its line boxes at once, before the walk
+    /// reaches the inline boxes inside it. Appending an inline box's
+    /// background to the same list therefore put it *over* the words it is
+    /// meant to sit behind — ja.wikipedia.org's main-page headings came out as
+    /// empty pale boxes with the title hidden underneath.
+    inline_backgrounds: Vec<DisplayItem>,
+    /// Layer 5b: in-flow inline content — text, replaced elements.
     inline_content: Vec<DisplayItem>,
     /// Layer 6: positioned descendants that left z-index at `auto`.
     auto_positioned: Vec<PositionedBox<'a>>,
@@ -6253,6 +6275,7 @@ fn paint_stacking_context_inner(
     }
     out.extend(layers.block_backgrounds);
     out.extend(layers.floats);
+    out.extend(layers.inline_backgrounds);
     out.extend(layers.inline_content);
     for b in layers.auto_positioned {
         paint(b, out);
@@ -6284,7 +6307,22 @@ fn collect_into_layers<'a>(
     // A transformed or filtered box paints as a unit in the positioned layers,
     // as CSS says — and that is also the only path that applies either effect,
     // since it is the subtree walk that carries them.
-    if is_positioned(node) || !node.transform.is_none() || !node.filter.is_none() {
+    // An inline box whose text an ancestor's line boxes have already taken is
+    // a special case. CSS lifts a positioned inline box into its own layer
+    // *with its text*; here the text belongs to the container's lines and
+    // cannot come along, so lifting only the background paints it over the
+    // words it is supposed to sit behind. ja.wikipedia.org's main-page
+    // headings are exactly this — `position: relative` spans with a pale
+    // background — and came out as empty coloured boxes.
+    //
+    // Keeping such a box with its line is the closer of the two wrong
+    // answers, and is what CSS does for an unpositioned inline anyway.
+    let inline_text_lives_on_the_line =
+        text_already_painted && matches!(node.display, DisplayType::Inline);
+
+    if (is_positioned(node) || !node.transform.is_none() || !node.filter.is_none())
+        && !inline_text_lives_on_the_line
+    {
         // Painted later in its own layer; the clip it inherited travels with it.
         let z = if establishes_stacking_context(node) {
             node.z_index.unwrap_or(0)
@@ -6328,7 +6366,7 @@ fn collect_into_layers<'a>(
             filter: None,
         });
     if is_inline_level {
-        layers.inline_content.extend(decoration);
+        layers.inline_backgrounds.extend(decoration);
     } else {
         layers.block_backgrounds.extend(decoration);
     }
@@ -10886,6 +10924,8 @@ mod tests {
         let mut renderer = crate::render::text::TextRenderer::new();
         compute_layout(&mut root, page_width, &mut renderer);
         apply_relative_positioning(&mut root);
+        place_list_markers(&mut root);
+        place_inline_fragments(&mut root);
         let viewport = Rect::new(0.0, 0.0, page_width, 800.0);
         compute_absolute_positions(&mut root, viewport, &mut renderer);
         root
@@ -11225,6 +11265,78 @@ mod tests {
             .find(|r| r.text.contains("link"))
             .expect("the link run");
         assert_eq!(link.color, [51, 102, 204, 255]);
+    }
+
+    // ------ Blockification, and what paints under what ------
+
+    #[test]
+    fn an_inline_flex_item_is_blockified() {
+        // `.mw-logo-container` is a `<span>` holding two `display: block`
+        // images. Left inline as a flex item, it gave them no block layout and
+        // both wordmarks were painted at the same spot, one on the other.
+        let root = laid_out(
+            "<body><a class='logo'><span class='c'><i class='w'></i><i class='t'></i></span></a></body>",
+            "body { margin: 0 } .logo { display: flex; } .c { display: inline; } \
+             .w { display: block; width: 120px; height: 20px; } \
+             .t { display: block; width: 100px; height: 14px; }",
+            800.0,
+        );
+        // Matched on both axes: the span that holds them is 120 wide too.
+        let w = first_box(&root, &|n| n.rect.width == 120.0 && n.rect.height == 20.0)
+            .expect("the wordmark");
+        let t = first_box(&root, &|n| n.rect.width == 100.0 && n.rect.height == 14.0)
+            .expect("the tagline");
+        assert!(
+            t.rect.y >= w.rect.bottom(),
+            "the two stack: wordmark ends at {}, tagline starts at {}",
+            w.rect.bottom(),
+            t.rect.y
+        );
+    }
+
+    #[test]
+    fn a_floated_inline_is_blockified() {
+        let root = laid_out(
+            "<body><span class='f'>floated</span></body>",
+            "body { margin: 0 } .f { display: inline; float: left; }",
+            400.0,
+        );
+        let floated = first_box(&root, &|n| n.float == FloatType::Left).expect("the float");
+        assert_eq!(
+            floated.display,
+            DisplayType::Block,
+            "a float has no line to sit on, so it is block-level"
+        );
+    }
+
+    #[test]
+    fn an_inline_background_paints_under_the_words_on_its_line() {
+        // The container emits the whole of its line boxes at once, before the
+        // walk reaches the inline boxes inside it — so appending an inline
+        // box's background to the same list put it over the words it is meant
+        // to sit behind. ja.wikipedia.org's main-page headings came out as
+        // empty pale boxes.
+        let root = laid_out(
+            "<body><h2><span class='t'>heading</span></h2></body>",
+            "body { margin: 0 } .t { position: relative; background-color: #e0efff; }",
+            600.0,
+        );
+        let items = build_display_list_with_scroll(&root, (0.0, 0.0), (600.0, 400.0));
+        let first_text = items
+            .iter()
+            .position(|i| matches!(i.item, PaintItem::Text(_)))
+            .expect("the heading text");
+        let highlight = items
+            .iter()
+            .position(|i| match &i.item {
+                PaintItem::Decoration(d) => d.background_color == Some([224, 239, 255, 255]),
+                _ => false,
+            })
+            .expect("the span's background");
+        assert!(
+            highlight < first_text,
+            "the background goes down first: background at {highlight}, text at {first_text}"
+        );
     }
 
     // ------ Estimating a box's height before it is laid out ------
